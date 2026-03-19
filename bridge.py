@@ -209,6 +209,7 @@ def call_claude_streaming(prompt, cwd, continue_session=False,
                 # 实时流：提取 text_delta 用于显示
                 if etype == "stream_event":
                     inner = evt.get("event", {})
+                    inner_type = inner.get("type", "")
                     delta = inner.get("delta", {})
                     if delta.get("type") == "text_delta":
                         chunk = delta.get("text", "")
@@ -218,6 +219,13 @@ def call_claude_streaming(prompt, cwd, continue_session=False,
                                 lf.write(chunk)
                                 lf.flush()
                             add_event("agent_chunk", {"agent": "claude", "text": chunk})
+                    # content block 边界：插入换行，避免文本挤成一坨
+                    elif inner_type == "content_block_stop":
+                        stream_display.append("\n")
+                        with log_lock:
+                            lf.write("\n")
+                            lf.flush()
+                        add_event("agent_chunk", {"agent": "claude", "text": "\n"})
 
                 # 最终结果：干净的方案文本，这才是传给 Codex 的内容
                 elif etype == "result":
