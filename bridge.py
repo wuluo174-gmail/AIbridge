@@ -624,7 +624,9 @@ def last_complete_round(history):
 
 
 def is_approved(text):
-    return "APPROVED" in text.strip().split("\n")[0].upper()
+    """审查通过判定：第一行首个词必须是 APPROVED（与提示词协议一致）。"""
+    first_line = text.strip().split("\n")[0]
+    return bool(re.match(r'\s*APPROVED\b', first_line, re.IGNORECASE))
 
 
 def run_negotiation(sess, start_round=1):
@@ -633,12 +635,14 @@ def run_negotiation(sess, start_round=1):
     max_rounds = sess.max_rounds
 
     try:
-        sess.status = "running"
+        with sess.status_lock:
+            sess.status = "running"
         add_event(sess, "status_change", {"status": "running", "msg": "协商开始"})
 
         for rnd in range(start_round, max_rounds + 1):
             if sess.stop_flag.is_set():
-                sess.status = "idle"
+                with sess.status_lock:
+                    sess.status = "idle"
                 add_event(sess, "status_change", {"status": "stopped", "msg": "用户中止"})
                 return
 
@@ -697,16 +701,18 @@ def run_negotiation(sess, start_round=1):
 
             # ── C) 共识? ───────────────────────────────────
             if is_approved(review):
-                sess.consensus = True
-                sess.consensus_round = rnd
-                sess.status = "consensus"
+                with sess.status_lock:
+                    sess.consensus = True
+                    sess.consensus_round = rnd
+                    sess.status = "consensus"
                 add_event(sess, "consensus_reached", {
                     "round": rnd,
-                    "msg": f"Codex 在第 {rnd} 轮认可了方案，等待你确认执行。",
+                    "msg": f"Codex 在第 {rnd} 轮认可了方案，等待你确认执行或继续协商。",
                 })
                 return
 
-        sess.status = "max_rounds"
+        with sess.status_lock:
+            sess.status = "max_rounds"
         add_event(sess, "max_rounds_reached", {
             "round": max_rounds,
             "msg": f"已完成 {max_rounds} 轮协商（未获 APPROVED），可选择执行当前方案或继续协商。",
@@ -735,7 +741,8 @@ def run_negotiation(sess, start_round=1):
                     break
 
             # 4) 设状态并通知前端
-            sess.status = "max_rounds"
+            with sess.status_lock:
+                sess.status = "max_rounds"
             add_event(sess, "rollback", {
                 "round": lcr,
                 "max": lcr,
@@ -743,7 +750,8 @@ def run_negotiation(sess, start_round=1):
                 "msg": f"继续协商出错（{e}），已回退到第 {lcr} 轮状态，仍可执行或再次续接。",
             })
         else:
-            sess.status = "error"
+            with sess.status_lock:
+                sess.status = "error"
             sess.error = str(e)
             add_event(sess, "error", {"msg": str(e)})
 
@@ -1125,7 +1133,8 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
                     sess.active_proc.kill()
                 except Exception:
                     pass
-            sess.status = "idle"
+            with sess.status_lock:
+                sess.status = "idle"
             add_event(sess, "status_change", {"status": "stopped", "msg": "用户中止"})
             self._json({"ok": True})
         elif p.path == "/api/review_fix":
@@ -1170,8 +1179,10 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
                 "phase": "人工干预", "content": msg,
                 "timestamp": datetime.now().isoformat(),
             }
-            sess.history.append(entry)
-            add_event(sess, "agent_response", entry)
+            with sess.status_lock:
+                if sess.status == "consensus":
+                    return self._json({"error": "共识状态下请使用「继续协商」提交驳回理由"}, 400)
+                add_history_event(sess, sess.history, entry, "agent_response")
             self._json({"ok": True})
         elif p.path == "/api/continue":
             body = self._body()
@@ -1181,15 +1192,37 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
             extra = int(body.get("extra_rounds", 3))
             if extra < 1 or extra > 20:
                 return self._json({"error": "额外轮次须在 1-20 之间"}, 400)
+            # ── consensus 分支：先校验驳回理由，再迁移状态 ──
             with sess.status_lock:
-                if sess.status != "max_rounds":
-                    return self._json({"error": "只有在达到最大轮次后才能继续协商"}, 400)
+                cur = sess.status
+            if cur == "consensus":
+                reason = body.get("message", "").strip()
+                if not reason:
+                    return self._json({"error": "驳回共识时必须提供理由"}, 400)
+            elif cur != "max_rounds":
+                return self._json({"error": "只有在达到最大轮次或共识状态下才能继续协商"}, 400)
+            # 校验通过，一次性迁移状态（consensus 三元组原子写入）
+            with sess.status_lock:
+                if sess.status != cur:  # 防止校验期间状态被并发修改
+                    return self._json({"error": "状态已变更，请重试"}, 409)
                 sess.status = "running"
-            # 从 history 派生续接起点，不依赖可能不一致的 current_round
+                if cur == "consensus":
+                    sess.consensus = False
+                    sess.consensus_round = 0
+            if cur == "consensus":
+                entry = {
+                    "round": sess.current_round, "role": "user",
+                    "phase": "人工干预", "content": reason,
+                    "timestamp": datetime.now().isoformat(),
+                }
+                add_history_event(sess, sess.history, entry, "agent_response")
+            # 共用续接逻辑
             lcr = last_complete_round(sess.history)
             start_round = lcr + 1
             sess.max_rounds = lcr + extra
             sess.stop_flag.clear()
+            add_event(sess, "status_change", {"status": "running",
+                      "msg": "驳回共识，继续协商" if cur == "consensus" else "继续协商"})
             threading.Thread(
                 target=run_negotiation, args=(sess,),
                 kwargs={"start_round": start_round}, daemon=True
@@ -1614,12 +1647,21 @@ async function doExec(){
 async function doContinue(){
   if(!sid)return;
   const extra=parseInt(document.getElementById('inp_extra').value)||3;
-  const r=await api('POST','/api/continue',{session_id:sid,extra_rounds:extra});
+  const payload={session_id:sid,extra_rounds:extra};
+  const wasConsensus=st==='consensus';
+  if(wasConsensus){
+    const reason=document.getElementById('inp_inject').value.trim();
+    if(!reason){alert('请在输入框中填写驳回理由');return;}
+    payload.message=reason;
+  }
+  const r=await api('POST','/api/continue',payload);
   if(r.error){alert(r.error);return;}
+  if(wasConsensus)document.getElementById('inp_inject').value='';
   if(!poll)poll=setInterval(pollEvt,300);
 }
 async function doInject(){
   if(!sid)return;
+  if(st==='consensus'){alert('共识状态下请使用"继续协商"提交驳回理由');return;}
   const i=document.getElementById('inp_inject');
   if(!i.value.trim())return;
   await api('POST','/api/inject',{session_id:sid,message:i.value.trim()});
@@ -1850,10 +1892,11 @@ function updSt(s,r,m){
   document.getElementById('btn_go').disabled=!['idle','done','error'].includes(s);
   document.getElementById('btn_stop').disabled=!['running','executing','review_pending'].includes(s);
   document.getElementById('btn_exec').disabled=s!=='consensus'&&s!=='max_rounds';
-  const showCont=s==='max_rounds';
+  const showCont=s==='max_rounds'||s==='consensus';
   document.getElementById('btn_cont').style.display=showCont?'':'none';
   document.getElementById('btn_cont').disabled=!showCont;
   document.getElementById('inp_extra').style.display=showCont?'':'none';
+  document.querySelector('.btn-inj').disabled=s==='consensus';
   document.getElementById('btn_fix').disabled=s!=='review_fix';
   document.getElementById('btn_fix').style.display=s==='review_fix'?'':'none';
   document.getElementById('btn_skip').disabled=s!=='review_fix';
