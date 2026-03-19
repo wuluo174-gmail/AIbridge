@@ -3,7 +3,8 @@
   "claude_revise": "以上是你之前的方案（已在对话上下文中）。\n\n审查者给出了以下反馈，请认真思考每一条：\n1. 对每条反馈逐一回应：接纳 ✓ / 部分接纳 △ / 不接纳 ✗，说明理由\n2. 输出修订后的完整方案\n\n## 审查者反馈\n{codex_feedback}{inject_section}\n\n请修订方案。",
   "codex_first": "对于以下方案有什么看法？第一性原理阅读相关代码，不必逢迎讨好，实事求是分析，给出你的意见。\n\n如果方案已经足够好，没有需要修改的地方，以 APPROVED 开头回复并说明理由。\n否则逐条列出问题，标注严重程度：[严重] [中等] [建议]\n\n## 原始任务\n{task}\n\n## Claude 的方案\n{claude_plan}",
   "codex_review": "Claude 针对你上一轮的反馈做了修订（见下方）。\n继续第一性原理审查，不必逢迎讨好，实事求是：修订是否真正解决了你提出的问题？有无新问题？\n\n如果方案已经足够好，以 APPROVED 开头回复。否则继续逐条列出问题。\n\n## Claude 的修订方案\n{claude_revision}{inject_section}",
-  "execution": "以上方案已经过严格多轮审查并获得 APPROVED。\n请严格按照最终方案执行所有代码修改。完成后总结你执行的所有变更。\n\n原始任务: {task}",
+  "execution": "以上方案已经过严格多轮审查并获得 APPROVED。{plan_section}\n\n请严格按照方案执行所有代码修改。完成后总结你执行的所有变更。\n\n原始任务: {task}",
+  "execution_unapproved": "以上方案经过多轮协商但未获得审查者的明确认可，用户选择继续执行。{plan_section}\n\n请按照方案执行代码修改，对不确定的部分保持审慎。完成后总结你执行的所有变更。\n\n原始任务: {task}",
   "user_inject_label_claude": "用户补充的约束和意见（必须优先考虑）",
   "user_inject_label_codex": "用户补充的约束和意见（审查时必须考虑）"
 }

@@ -21,6 +21,7 @@ import threading
 import subprocess
 import sys
 import os
+import re
 import argparse
 import urllib.parse
 import shutil
@@ -50,6 +51,7 @@ LOG_DIR = Path("/tmp/bridge-logs")
 
 sessions = {}           # session_id → SessionState
 sessions_lock = threading.Lock()
+plan_file_lock = threading.Lock()   # 序列化 plan-mode Claude 调用（单 Bridge 进程内）
 
 
 class SessionState:
@@ -71,6 +73,8 @@ class SessionState:
         # 进程控制
         self.stop_flag = threading.Event()
         self.claude_has_session = False
+        self.claude_session_id = str(uuid.uuid4())   # 创建时生成，全程绑定
+        self.status_lock = threading.Lock()           # 状态转换专用锁
         self.codex_has_session = False
         self.active_proc = None
         # 日志目录（每会话独立）
@@ -119,6 +123,21 @@ def _find_new_plan_file(before_snapshot):
         return ""
 
 
+def _validate_plan_relevance(plan_content, task):
+    """检查 plan 内容是否与当前任务存在关键词关联。
+    防御外部 Claude 进程在持锁期间写入无关 plan 文件的边缘情况。
+    保护边界：关键词匹配是启发式的，不是完美隔离。
+    """
+    if not plan_content or not task:
+        return True  # 无内容或无任务时不拦截
+    # 取任务中的关键词（长度 >= 2 的中文/英文 token）
+    tokens = re.findall(r'[\u4e00-\u9fff]{2,}|[a-zA-Z_]\w{2,}', task)
+    if not tokens:
+        return True  # 无法提取关键词时不拦截
+    # 至少有一个关键词出现在 plan 内容中
+    return any(t in plan_content for t in tokens)
+
+
 # ═════════════════════════════════════════════════════════════════
 # CLI Wrappers — 流式输出，逐行写日志
 # ═════════════════════════════════════════════════════════════════
@@ -144,14 +163,18 @@ def _stderr_reader(proc, agent, log_file, log_lock, sess):
 
 
 def call_claude_streaming(prompt, cwd, sess, continue_session=False,
-                          bypass_permissions=False, log_tag="claude"):
+                          bypass_permissions=False, log_tag="claude",
+                          skip_plan_detection=False):
     """
     调用 Claude Code CLI，用 stream-json 逐 token 流式输出。
     协商阶段: --permission-mode plan / 执行阶段: --dangerously-skip-permissions
+    会话绑定: --session-id (首次) / --resume (续接)，替代不可靠的 -c
     """
     cmd = ["claude"]
     if continue_session:
-        cmd.append("-c")
+        cmd.extend(["--resume", sess.claude_session_id])
+    else:
+        cmd.extend(["--session-id", sess.claude_session_id])
     cmd.extend(["-p", "--verbose", "--output-format", "stream-json", "--include-partial-messages"])
     if bypass_permissions:
         cmd.append("--dangerously-skip-permissions")
@@ -162,10 +185,19 @@ def call_claude_streaming(prompt, cwd, sess, continue_session=False,
     log_file = sess.log_dir / f"{log_tag}.log"
     add_event(sess, "cli_start", {"agent": "claude", "round": sess.current_round})
 
-    # Plan 文件快照（Popen 前）
-    plan_snapshot = _snapshot_plan_files()
-
+    # plan_file_lock 序列化 plan-mode Claude 调用（单 Bridge 进程内），
+    # 保证快照差集结果归属当前会话。不保护外部 Claude 进程。
+    lock = plan_file_lock if not skip_plan_detection else None
+    if lock:
+        lock.acquire()
     try:
+        # 拿到锁后立即检查 stop_flag，防止等锁期间已被中止的会话继续启动
+        if sess.stop_flag.is_set():
+            return "(已中止)"
+
+        # Plan 文件快照（Popen 前）
+        plan_snapshot = _snapshot_plan_files() if not skip_plan_detection else None
+
         proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, cwd=cwd, bufsize=1,
@@ -226,9 +258,19 @@ def call_claude_streaming(prompt, cwd, sess, continue_session=False,
         if sess.stop_flag.is_set():
             return result_text or "".join(stream_display).strip() or "(已中止)"
 
-        # 优先级: plan 文件(快照差集) > result 事件 > stream 文本
-        plan_content = _find_new_plan_file(plan_snapshot)
-        output = plan_content or result_text or "".join(stream_display).strip()
+        # 输出优先级 + 内容关联校验
+        if not skip_plan_detection and plan_snapshot is not None:
+            plan_content = _find_new_plan_file(plan_snapshot)
+            if plan_content and _validate_plan_relevance(plan_content, sess.task):
+                output = plan_content
+            else:
+                if plan_content:
+                    add_event(sess, "warning", {
+                        "msg": "检测到 plan 文件内容与当前任务不相关，已忽略（可能来自外部 Claude 进程）"
+                    })
+                output = result_text or "".join(stream_display).strip()
+        else:
+            output = result_text or "".join(stream_display).strip()
 
         if not output:
             if proc.returncode != 0:
@@ -245,6 +287,9 @@ def call_claude_streaming(prompt, cwd, sess, continue_session=False,
         proc.kill()
         sess.active_proc = None
         raise RuntimeError("Claude CLI 超时")
+    finally:
+        if lock:
+            lock.release()
 
 
 def call_codex_streaming(prompt, cwd, sess, resume_last=False, log_tag="codex"):
@@ -396,10 +441,24 @@ def build_codex_review_prompt(claude_revision, user_injects=None):
     return tpl.format(claude_revision=claude_revision, inject_section=inject_section)
 
 
-def build_execution_prompt(task):
-    tpl = prompt_config.get("execution",
-        "以上方案已获得 APPROVED。请执行所有代码修改。\n\n原始任务: {task}")
-    return tpl.format(task=task)
+def build_execution_prompt(task, final_plan="", approved=True):
+    plan_section = ""
+    if final_plan:
+        plan_section = f"\n\n## 最终方案\n{final_plan}"
+
+    if approved:
+        tpl = prompt_config.get("execution",
+            "以上方案已经过严格多轮审查并获得 APPROVED。{plan_section}\n\n"
+            "请严格按照方案执行所有代码修改。完成后总结你执行的所有变更。\n\n原始任务: {task}")
+    else:
+        tpl = prompt_config.get("execution_unapproved",
+            "以上方案经过多轮协商但未获得审查者的明确认可，用户选择继续执行。{plan_section}\n\n"
+            "请按照方案执行代码修改，对不确定的部分保持审慎。完成后总结你执行的所有变更。\n\n原始任务: {task}")
+
+    try:
+        return tpl.format(task=task, plan_section=plan_section)
+    except KeyError:
+        return tpl.replace("{task}", task) + plan_section
 
 
 # ═════════════════════════════════════════════════════════════════
@@ -490,10 +549,10 @@ def run_negotiation(sess):
                 })
                 return
 
-        sess.status = "consensus"
+        sess.status = "max_rounds"
         add_event(sess, "max_rounds_reached", {
             "round": max_rounds,
-            "msg": f"已完成 {max_rounds} 轮协商，可选择执行当前方案。",
+            "msg": f"已完成 {max_rounds} 轮协商（未获 APPROVED），可选择执行当前方案。",
         })
 
     except Exception as e:
@@ -504,25 +563,35 @@ def run_negotiation(sess):
 
 def run_execution(sess):
     try:
-        sess.status = "executing"
+        # status 已在 /api/execute handler 中原子切换为 "executing"
         add_event(sess, "status_change", {"status": "executing", "msg": "Claude 正在执行..."})
 
-        prompt = build_execution_prompt(sess.task)
+        # 从历史中提取最终 Claude 方案，注入执行提示词增强鲁棒性
+        final_plan = ""
+        for h in reversed(sess.history):
+            if h["role"] == "claude":
+                final_plan = h["content"]
+                break
+
+        prompt = build_execution_prompt(sess.task, final_plan, approved=sess.consensus)
 
         result = call_claude_streaming(
             prompt, sess.project_path, sess,
-            continue_session=sess.claude_has_session,
+            continue_session=True,          # --resume UUID，续接同一会话
             bypass_permissions=True,
-            log_tag="claude",
+            log_tag="claude_exec",          # 独立日志文件
+            skip_plan_detection=True,       # 执行阶段不查 plan 文件，不加锁
         )
 
         sess.execution_result = result
-        sess.status = "done"
+        with sess.status_lock:
+            sess.status = "done"
         add_event(sess, "execution_done", {"result": result})
 
     except Exception as e:
-        sess.status = "error"
-        sess.error = str(e)
+        with sess.status_lock:
+            sess.status = "error"
+            sess.error = str(e)
         add_event(sess, "error", {"msg": str(e)})
 
 
@@ -626,8 +695,11 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
             sess = get_session(body.get("session_id"))
             if not sess:
                 return self._json({"error": "会话不存在"}, 404)
-            if sess.status != "consensus":
-                return self._json({"error": "当前不在共识状态"}, 400)
+            # 原子 CAS：只有从 consensus/max_rounds 状态才能切到 executing
+            with sess.status_lock:
+                if sess.status not in ("consensus", "max_rounds"):
+                    return self._json({"error": "当前不在可执行状态"}, 400)
+                sess.status = "executing"
             threading.Thread(target=run_execution, args=(sess,), daemon=True).start()
             self._json({"ok": True})
         elif p.path == "/api/stop":
@@ -717,6 +789,7 @@ body{font-family:'SF Mono','Fira Code','Menlo',monospace;background:var(--bg);co
 .pill-executing{background:rgba(210,153,34,.2);color:var(--user)}
 .pill-done{background:rgba(63,185,80,.3);color:var(--approve)}
 .pill-error{background:rgba(248,81,73,.2);color:var(--danger)}
+.pill-max_rounds{background:rgba(230,126,34,.2);color:#e67e22}
 .round-info{font-size:12px;color:var(--dim)}
 
 /* ── 双面板 ── */
@@ -851,9 +924,14 @@ body{font-family:'SF Mono','Fira Code','Menlo',monospace;background:var(--bg);co
         <textarea id="cfg_codex_review" rows="6"></textarea>
       </div>
       <div class="cfg-field">
-        <label>执行提示词</label>
-        <div class="cfg-hint">变量: {task} — 达成共识后 Claude 执行方案</div>
+        <label>执行提示词 (APPROVED)</label>
+        <div class="cfg-hint">变量: {task} {plan_section} — Codex APPROVED 后 Claude 执行方案</div>
         <textarea id="cfg_execution" rows="4"></textarea>
+      </div>
+      <div class="cfg-field">
+        <label>执行提示词 (未 APPROVED)</label>
+        <div class="cfg-hint">变量: {task} {plan_section} — 达到最大轮次但未 APPROVED 时执行</div>
+        <textarea id="cfg_execution_unapproved" rows="4"></textarea>
       </div>
       <div class="cfg-field">
         <label>用户干预标签 (Claude)</label>
@@ -910,7 +988,10 @@ async function doStop(){
 async function doExec(){
   if(!sid)return;
   if(!confirm('确认执行？Claude 将用 --dangerously-skip-permissions'))return;
-  await api('POST','/api/execute',{session_id:sid});
+  try{
+    const r=await api('POST','/api/execute',{session_id:sid});
+    if(r.error){alert('执行启动失败: '+r.error);return;}
+  }catch(e){alert('执行请求失败: '+e.message);}
 }
 async function doInject(){
   if(!sid)return;
@@ -990,6 +1071,9 @@ function handle(e){
       appendLog('claude','<span class="err">\n❌ '+esc(e.data.msg)+'</span>\n');
       appendLog('codex','<span class="err">\n❌ '+esc(e.data.msg)+'</span>\n');
       break;
+    case 'warning':
+      appendLog('claude','<span class="sys">\n⚠ '+esc(e.data.msg)+'</span>\n');
+      break;
     case 'status_change':
       if(e.data.status==='stopped'){
         appendLog('claude','<span class="sys">\n⏹ 已中止</span>\n');
@@ -1023,18 +1107,18 @@ function updSt(s,r,m){
   if(s===st)return; st=s;
   const p=document.getElementById('pill');
   p.className='pill pill-'+s;
-  p.textContent={idle:'IDLE',running:'NEGOTIATING',consensus:'CONSENSUS',executing:'EXECUTING',done:'DONE',error:'ERROR'}[s]||s;
+  p.textContent={idle:'IDLE',running:'NEGOTIATING',consensus:'CONSENSUS',max_rounds:'MAX ROUNDS',executing:'EXECUTING',done:'DONE',error:'ERROR'}[s]||s;
   document.getElementById('rinfo').textContent=s==='idle'?'':'R'+r+'/'+m;
   document.getElementById('btn_go').disabled=!['idle','done','error'].includes(s);
   document.getElementById('btn_stop').disabled=s!=='running'&&s!=='executing';
-  document.getElementById('btn_exec').disabled=s!=='consensus';
+  document.getElementById('btn_exec').disabled=s!=='consensus'&&s!=='max_rounds';
   if(['idle','done','error'].includes(s)&&poll){clearInterval(poll);poll=null;}
 }
 
 function esc(s){return(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
 
 // ── 提示词配置 ──
-const cfgKeys=['claude_first','claude_revise','codex_first','codex_review','execution','user_inject_label_claude','user_inject_label_codex'];
+const cfgKeys=['claude_first','claude_revise','codex_first','codex_review','execution','execution_unapproved','user_inject_label_claude','user_inject_label_codex'];
 
 async function openCfg(){
   const data=await api('GET','/api/prompts');
