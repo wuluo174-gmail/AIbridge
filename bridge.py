@@ -59,6 +59,8 @@ def save_recent_paths(paths):
 
 prompt_config = load_prompts()
 
+STREAM_DEBUG = os.environ.get("BRIDGE_DEBUG_STREAM") == "1"
+
 # ═════════════════════════════════════════════════════════════════
 # Session State — 每个协商会话独立
 # ═════════════════════════════════════════════════════════════════
@@ -95,6 +97,13 @@ class SessionState:
         # 日志目录（每会话独立）
         self.log_dir = LOG_DIR / session_id
         self.log_dir.mkdir(parents=True, exist_ok=True)
+        # 执行后审查（Issue 4）
+        self.review_round = 0
+        self.max_review_rounds = 3
+        self.review_history = []
+        self.exec_baseline_ref = None
+        self.exec_baseline_untracked = set()
+        self.is_git_repo = False
 
 
 def get_session(sid):
@@ -108,6 +117,16 @@ def add_event(sess, etype, data):
         sess.events.append({
             "id": len(sess.events), "type": etype,
             "data": data, "ts": datetime.now().isoformat(),
+        })
+
+
+def add_history_event(sess, history_list, entry, event_type):
+    """原子地追加历史记录并发送事件（统一快照锁）。"""
+    with sess.event_lock:
+        history_list.append(entry)
+        sess.events.append({
+            "id": len(sess.events), "type": event_type,
+            "data": entry, "ts": datetime.now().isoformat(),
         })
 
 
@@ -257,11 +276,28 @@ def call_claude_streaming(prompt, cwd, sess, continue_session=False,
                                 lf.flush()
                             add_event(sess, "agent_chunk", {"agent": "claude", "text": chunk})
                     elif inner_type == "content_block_stop":
-                        stream_display.append("\n")
-                        with log_lock:
-                            lf.write("\n")
-                            lf.flush()
-                        add_event(sess, "agent_chunk", {"agent": "claude", "text": "\n"})
+                        # 只有当 stream_display 末尾不是换行时才追加，防止连续空行
+                        if stream_display and not stream_display[-1].endswith("\n"):
+                            stream_display.append("\n")
+                            with log_lock:
+                                lf.write("\n")
+                                lf.flush()
+                            add_event(sess, "agent_chunk", {"agent": "claude", "text": "\n"})
+                    else:
+                        # 受控调试采样：记录未识别事件供后续分析
+                        if STREAM_DEBUG:
+                            _sc = getattr(sess, '_sample_counts', None)
+                            if _sc is None:
+                                _sc = {}
+                                sess._sample_counts = _sc
+                            ek = inner_type or etype
+                            cnt = _sc.get(ek, 0)
+                            if cnt < 5:
+                                _sc[ek] = cnt + 1
+                                sample = json.dumps(evt, ensure_ascii=False)[:500]
+                                with log_lock:
+                                    lf.write(f"[SAMPLE] {sample}\n")
+                                    lf.flush()
 
                 elif etype == "result":
                     result_text = evt.get("result", "")
@@ -365,13 +401,14 @@ def call_codex_streaming(prompt, cwd, sess, resume_last=False, log_tag="codex"):
                 elif etype == "item.started" and item_type == "command_execution":
                     cmd_str = item.get("command", "")
                     if cmd_str:
-                        add_event(sess, "agent_chunk", {"agent": "codex", "text": f"$ {cmd_str}\n"})
+                        add_event(sess, "agent_chunk", {"agent": "codex", "text": f"$ {cmd_str}\n", "chunk_type": "command"})
 
                 elif etype == "item.completed" and item_type == "command_execution":
                     cmd_output = item.get("aggregated_output", "")
                     if cmd_output:
                         display = cmd_output if len(cmd_output) <= 2000 else cmd_output[:2000] + "\n...(truncated)\n"
-                        add_event(sess, "agent_chunk", {"agent": "codex", "text": display})
+                        add_event(sess, "agent_chunk", {"agent": "codex", "text": display, "chunk_type": "command_output"})
+                        add_event(sess, "chunk_boundary", {"agent": "codex", "boundary_type": "command_output"})
 
         proc.wait()
         stderr_t.join(timeout=5)
@@ -477,6 +514,99 @@ def build_execution_prompt(task, final_plan="", approved=True):
 
 
 # ═════════════════════════════════════════════════════════════════
+# Git Tools for Execution Grounding (Issue 4)
+# ═════════════════════════════════════════════════════════════════
+
+
+def _is_git_repo(cwd):
+    try:
+        r = subprocess.run(["git", "rev-parse", "--is-inside-work-tree"],
+                     capture_output=True, text=True, cwd=cwd, timeout=5)
+        return r.returncode == 0 and r.stdout.strip() == "true"
+    except Exception:
+        return False
+
+
+def capture_baseline_ref(cwd):
+    try:
+        r = subprocess.run(["git", "stash", "create"], capture_output=True, text=True, cwd=cwd, timeout=10)
+        ref = r.stdout.strip()
+        if ref:
+            return ref
+        r2 = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True, cwd=cwd, timeout=5)
+        return r2.stdout.strip() if r2.returncode == 0 else None
+    except Exception:
+        return None
+
+
+def capture_baseline_untracked(cwd):
+    try:
+        r = subprocess.run(["git", "ls-files", "--others", "--exclude-standard"],
+                     capture_output=True, text=True, cwd=cwd, timeout=5)
+        return set(r.stdout.strip().splitlines()) if r.returncode == 0 else set()
+    except Exception:
+        return set()
+
+
+def capture_execution_diff(cwd, baseline_ref, baseline_untracked=None):
+    if not baseline_ref:
+        return None
+    try:
+        r = subprocess.run(["git", "diff", baseline_ref],
+                     capture_output=True, text=True, cwd=cwd, timeout=15)
+        if r.returncode != 0:
+            return None
+        diff = r.stdout.strip()
+
+        r2 = subprocess.run(["git", "ls-files", "--others", "--exclude-standard"],
+                      capture_output=True, text=True, cwd=cwd, timeout=5)
+        current_untracked = set(r2.stdout.strip().splitlines()) if r2.returncode == 0 else set()
+        new_untracked = current_untracked - (baseline_untracked or set())
+
+        parts = []
+        if diff:
+            parts.append(diff)
+        if new_untracked:
+            parts.append("\n### 本次执行新增的文件 (untracked)\n" + "\n".join(sorted(new_untracked)))
+
+        result = "\n".join(parts) if parts else "(无变更)"
+        if len(result) > 15000:
+            result = result[:15000] + "\n...(diff 过大，已截断)"
+        return result
+    except Exception:
+        return None
+
+
+def _build_diff_section(cwd, baseline_ref, is_git_repo, baseline_untracked=None):
+    if not is_git_repo:
+        return "（注意：本项目不在 git 仓库中，无法提供 diff。请自行读取相关文件验证实际变更。）\n\n"
+    diff = capture_execution_diff(cwd, baseline_ref, baseline_untracked)
+    if diff is None:
+        return "（获取 diff 失败，请自行读取相关文件验证。）\n\n"
+    return f"## 本次执行的代码变更 (git diff)\n```\n{diff}\n```\n\n"
+
+
+def build_codex_post_review_prompt(sess, task, approved_plan, execution_result):
+    diff_section = _build_diff_section(
+        sess.project_path, sess.exec_baseline_ref, sess.is_git_repo, sess.exec_baseline_untracked)
+    tpl = prompt_config.get("codex_post_review", "请审查执行结果...")
+    return tpl.format(task=task, approved_plan=approved_plan,
+                      execution_result=execution_result, diff_section=diff_section)
+
+
+def build_claude_post_fix_prompt(review_feedback):
+    tpl = prompt_config.get("claude_post_fix", "请修复以下问题...")
+    return tpl.format(review_feedback=review_feedback)
+
+
+def build_codex_post_review_followup_prompt(sess, fix_result):
+    diff_section = _build_diff_section(
+        sess.project_path, sess.exec_baseline_ref, sess.is_git_repo, sess.exec_baseline_untracked)
+    tpl = prompt_config.get("codex_post_review_followup", "请重新审查...")
+    return tpl.format(fix_result=fix_result, diff_section=diff_section)
+
+
+# ═════════════════════════════════════════════════════════════════
 # Orchestration Engine
 # ═════════════════════════════════════════════════════════════════
 def last_complete_round(history):
@@ -539,8 +669,7 @@ def run_negotiation(sess, start_round=1):
                 "round": rnd, "role": "claude", "phase": "方案",
                 "content": plan, "timestamp": datetime.now().isoformat(),
             }
-            sess.history.append(entry_c)
-            add_event(sess, "agent_response", entry_c)
+            add_history_event(sess, sess.history, entry_c, "agent_response")
 
             if sess.stop_flag.is_set():
                 return
@@ -564,8 +693,7 @@ def run_negotiation(sess, start_round=1):
                 "round": rnd, "role": "codex", "phase": "审查",
                 "content": review, "timestamp": datetime.now().isoformat(),
             }
-            sess.history.append(entry_x)
-            add_event(sess, "agent_response", entry_x)
+            add_history_event(sess, sess.history, entry_x, "agent_response")
 
             # ── C) 共识? ───────────────────────────────────
             if is_approved(review):
@@ -622,10 +750,14 @@ def run_negotiation(sess, start_round=1):
 
 def run_execution(sess):
     try:
-        # status 已在 /api/execute handler 中原子切换为 "executing"
         add_event(sess, "status_change", {"status": "executing", "msg": "Claude 正在执行..."})
 
-        # 从历史中提取最终 Claude 方案，注入执行提示词增强鲁棒性
+        # 记录执行前基线（tracked ref + untracked 文件快照）
+        sess.is_git_repo = _is_git_repo(sess.project_path)
+        if sess.is_git_repo:
+            sess.exec_baseline_ref = capture_baseline_ref(sess.project_path)
+            sess.exec_baseline_untracked = capture_baseline_untracked(sess.project_path)
+
         final_plan = ""
         for h in reversed(sess.history):
             if h["role"] == "claude":
@@ -636,22 +768,140 @@ def run_execution(sess):
 
         result = call_claude_streaming(
             prompt, sess.project_path, sess,
-            continue_session=True,          # --resume UUID，续接同一会话
+            continue_session=True,
             bypass_permissions=True,
-            log_tag="claude_exec",          # 独立日志文件
-            skip_plan_detection=True,       # 执行阶段不查 plan 文件，不加锁
+            log_tag="claude_exec",
+            skip_plan_detection=True,
         )
 
         sess.execution_result = result
-        with sess.status_lock:
-            sess.status = "done"
         add_event(sess, "execution_done", {"result": result})
+
+        # 自动触发第一轮 Codex 评审（只读，不修复）
+        if sess.stop_flag.is_set():
+            with sess.status_lock:
+                sess.status = "done"
+            return
+
+        run_first_review(sess, final_plan)
 
     except Exception as e:
         with sess.status_lock:
             sess.status = "error"
             sess.error = str(e)
         add_event(sess, "error", {"msg": str(e)})
+
+
+def run_first_review(sess, approved_plan):
+    """执行完成后自动发起一轮 Codex 评审。只评审不修复。"""
+    try:
+        with sess.status_lock:
+            sess.status = "review_pending"
+        sess.review_round = 1
+        add_event(sess, "status_change", {"status": "review_pending", "msg": "Codex 正在评审执行结果..."})
+        add_event(sess, "review_start", {"round": 1, "max": sess.max_review_rounds})
+        add_event(sess, "agent_thinking", {"agent": "codex", "round": 1})
+
+        prompt = build_codex_post_review_prompt(sess, sess.task, approved_plan, sess.execution_result)
+
+        review = call_codex_streaming(
+            prompt, sess.project_path, sess,
+            resume_last=sess.codex_has_session, log_tag="codex_review_1")
+        sess.codex_has_session = True
+
+        # stop guard
+        if sess.stop_flag.is_set():
+            return
+
+        entry = {"round": 1, "role": "codex", "phase": "执行审查",
+                 "content": review, "timestamp": datetime.now().isoformat()}
+        add_history_event(sess, sess.review_history, entry, "review_response")
+
+        if "任务收口成功" in (review or "").split("\n")[0]:
+            with sess.status_lock:
+                sess.status = "done"
+            add_event(sess, "review_done", {"round": 1, "msg": "Codex 确认任务收口成功。", "success": True})
+        else:
+            with sess.status_lock:
+                sess.status = "review_fix"
+            add_event(sess, "review_needs_fix", {"round": 1, "msg": "Codex 发现问题，等待你确认是否修复。", "review": review})
+
+    except Exception as e:
+        with sess.status_lock:
+            sess.status = "error"
+            sess.error = str(e)
+        add_event(sess, "error", {"msg": f"评审阶段出错: {e}"})
+
+
+def run_review_fix_cycle(sess):
+    """用户确认后：Claude 修复 → Codex 再评审。单轮。"""
+    try:
+        rr = sess.review_round + 1
+        if rr > sess.max_review_rounds:
+            with sess.status_lock:
+                sess.status = "done"
+            add_event(sess, "review_done", {"round": rr - 1, "msg": f"已达最大审查轮次 ({sess.max_review_rounds})。", "success": False})
+            return
+
+        sess.review_round = rr
+        with sess.status_lock:
+            sess.status = "review_pending"
+        add_event(sess, "status_change", {"status": "review_pending", "msg": f"审查修复轮 {rr}..."})
+        add_event(sess, "review_round_start", {"round": rr, "max": sess.max_review_rounds})
+
+        if sess.stop_flag.is_set():
+            return
+
+        # A) Claude 修复
+        add_event(sess, "agent_thinking", {"agent": "claude", "round": rr})
+        last_review = sess.review_history[-1]["content"] if sess.review_history else ""
+        fix_result = call_claude_streaming(
+            build_claude_post_fix_prompt(last_review), sess.project_path, sess,
+            continue_session=True, bypass_permissions=True,
+            log_tag=f"claude_fix_{rr}", skip_plan_detection=True)
+
+        # stop guard
+        if sess.stop_flag.is_set():
+            return
+
+        fix_entry = {"round": rr, "role": "claude", "phase": "修复",
+                     "content": fix_result, "timestamp": datetime.now().isoformat()}
+        add_history_event(sess, sess.review_history, fix_entry, "review_response")
+        sess.execution_result = fix_result
+
+        if sess.stop_flag.is_set():
+            return
+
+        # B) Codex 再评审
+        add_event(sess, "agent_thinking", {"agent": "codex", "round": rr})
+        review = call_codex_streaming(
+            build_codex_post_review_followup_prompt(sess, fix_result),
+            sess.project_path, sess,
+            resume_last=sess.codex_has_session, log_tag=f"codex_review_{rr}")
+        sess.codex_has_session = True
+
+        # stop guard
+        if sess.stop_flag.is_set():
+            return
+
+        review_entry = {"round": rr, "role": "codex", "phase": "执行审查",
+                        "content": review, "timestamp": datetime.now().isoformat()}
+        add_history_event(sess, sess.review_history, review_entry, "review_response")
+
+        if "任务收口成功" in (review or "").split("\n")[0]:
+            with sess.status_lock:
+                sess.status = "done"
+            add_event(sess, "review_done", {"round": rr, "msg": f"Codex 在第 {rr} 轮确认任务收口成功。", "success": True})
+        else:
+            with sess.status_lock:
+                sess.status = "review_fix"
+            add_event(sess, "review_needs_fix", {"round": rr, "msg": "Codex 仍发现问题，等待你确认是否继续修复。", "review": review})
+
+    except Exception as e:
+        with sess.status_lock:
+            sess.status = "error"
+            sess.error = str(e)
+        add_event(sess, "error", {"msg": f"修复阶段出错: {e}"})
 
 
 # ═════════════════════════════════════════════════════════════════
@@ -730,15 +980,35 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
         elif p.path == "/api/history":
             sess = self._get_session_from_qs(qs)
             if not sess:
-                return self._json({"entries": [], "execution_result": None})
-            entries = [
-                {"round": h["round"], "role": h["role"], "phase": h["phase"],
-                 "content": h["content"]}
-                for h in sess.history if h["role"] in ("claude", "codex")
-            ]
+                return self._json({"entries": [], "execution_result": None,
+                                   "review_entries": [], "review_round": 0,
+                                   "review_status": None, "event_cursor": 0})
+            # 原子快照：event_lock 下同时取 history/review_history/events
+            with sess.event_lock:
+                entries = [
+                    {"round": h["round"], "role": h["role"], "phase": h["phase"],
+                     "content": h["content"]}
+                    for h in sess.history if h["role"] in ("claude", "codex")
+                ]
+                review_entries = [
+                    {"round": h["round"], "role": h["role"], "phase": h["phase"],
+                     "content": h["content"]}
+                    for h in sess.review_history
+                ]
+                execution_result = sess.execution_result
+                review_round = sess.review_round
+                current_status = sess.status
+                event_cursor = len(sess.events)
+            review_status = None
+            if current_status.startswith("review_") or review_round > 0:
+                review_status = {"round": review_round, "status": current_status}
             self._json({
                 "entries": entries,
-                "execution_result": sess.execution_result,
+                "execution_result": execution_result,
+                "review_entries": review_entries,
+                "review_round": review_round,
+                "review_status": review_status,
+                "event_cursor": event_cursor,
             })
         elif p.path == "/api/browse":
             raw = qs.get("path", [""])[0].strip()
@@ -858,6 +1128,29 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
             sess.status = "idle"
             add_event(sess, "status_change", {"status": "stopped", "msg": "用户中止"})
             self._json({"ok": True})
+        elif p.path == "/api/review_fix":
+            body = self._body()
+            sess = get_session(body.get("session_id"))
+            if not sess:
+                return self._json({"error": "会话不存在"}, 404)
+            with sess.status_lock:
+                if sess.status != "review_fix":
+                    return self._json({"error": "当前不在待修复状态"}, 400)
+                sess.status = "review_pending"
+            sess.stop_flag.clear()
+            threading.Thread(target=run_review_fix_cycle, args=(sess,), daemon=True).start()
+            self._json({"ok": True})
+        elif p.path == "/api/review_skip":
+            body = self._body()
+            sess = get_session(body.get("session_id"))
+            if not sess:
+                return self._json({"error": "会话不存在"}, 404)
+            with sess.status_lock:
+                if sess.status != "review_fix":
+                    return self._json({"error": "当前不在待修复状态"}, 400)
+                sess.status = "done"
+            add_event(sess, "review_done", {"round": sess.review_round, "msg": "用户跳过修复，任务结束。", "success": False})
+            self._json({"ok": True})
         elif p.path == "/api/prompts":
             global prompt_config
             body = self._body()
@@ -976,9 +1269,19 @@ body{font-family:'SF Mono','Fira Code','Menlo',monospace;background:var(--bg);co
 .tab-pane.active{display:block}
 .mcp-line{color:#484f58;font-size:11px}
 .term{flex:1;overflow-y:auto;padding:12px 14px;font-size:13px;line-height:1.6;white-space:pre-wrap;word-wrap:break-word;color:#c9d1d9}
-.term .sys{color:var(--dim);font-style:italic}
-.term .err{color:var(--danger)}
-.term .ok{color:var(--approve);font-weight:700}
+.term .sys,.sys{color:var(--dim);font-style:italic}
+.term .err,.err{color:var(--danger)}
+.term .ok,.ok{color:var(--approve);font-weight:700}
+.log-sep{display:block;margin:6px 0;padding:2px 0}
+.done-badge{background:rgba(63,185,80,.2);color:var(--approve);font-size:11px;padding:2px 8px;border-radius:10px;font-weight:600;font-family:-apple-system,sans-serif;margin-left:8px}
+.chunk-cmd{color:#79c0ff}
+.chunk-fold{display:block;margin:4px 0;border-left:2px solid var(--border);padding-left:8px}
+.chunk-fold summary{cursor:pointer;color:var(--dim);font-size:12px;font-weight:600;user-select:none}
+.chunk-fold .fold-body{font-size:12px;color:#8b949e;max-height:300px;overflow-y:auto;white-space:pre-wrap;word-wrap:break-word}
+.pill-review_pending{background:rgba(124,92,252,.2);color:var(--claude)}
+.pill-review_fix{background:rgba(210,153,34,.2);color:var(--user)}
+.btn-fix{background:var(--claude);color:#fff}
+.btn-skip{background:var(--border);color:var(--dim)}
 
 /* ── 注入栏 ── */
 .inject{background:var(--surface);border-top:1px solid var(--border);padding:8px 16px;display:flex;gap:8px;flex-shrink:0}
@@ -1062,6 +1365,8 @@ body{font-family:'SF Mono','Fira Code','Menlo',monospace;background:var(--bg);co
   <button class="btn btn-stop" id="btn_stop" onclick="doStop()" disabled>⏹ 中止</button>
   <button class="btn btn-exec" id="btn_exec" onclick="doExec()" disabled>⚡ 执行</button>
   <button class="btn btn-cont" id="btn_cont" onclick="doContinue()" disabled style="display:none">继续协商</button>
+  <button class="btn btn-fix" id="btn_fix" onclick="doReviewFix()" disabled style="display:none">🔧 确认修复</button>
+  <button class="btn btn-skip" id="btn_skip" onclick="doReviewSkip()" disabled style="display:none">⏭ 跳过修复</button>
   <input type="number" id="inp_extra" value="3" min="1" max="20" title="额外轮次" style="display:none;width:50px;text-align:center;background:var(--bg);border:1px solid var(--border);border-radius:4px;color:var(--text);padding:6px;font-size:13px">
   <button class="btn btn-cfg" onclick="openCfg()">⚙ 提示词</button>
   <div class="status-bar">
@@ -1153,6 +1458,21 @@ body{font-family:'SF Mono','Fira Code','Menlo',monospace;background:var(--bg);co
         <label>执行提示词 (未 APPROVED)</label>
         <div class="cfg-hint">变量: {task} {plan_section} — 达到最大轮次但未 APPROVED 时执行</div>
         <textarea id="cfg_execution_unapproved" rows="4"></textarea>
+      </div>
+      <div class="cfg-field">
+        <label>执行后审查提示词 (Codex)</label>
+        <div class="cfg-hint">变量: {task} {approved_plan} {execution_result} {diff_section}</div>
+        <textarea id="cfg_codex_post_review" rows="6"></textarea>
+      </div>
+      <div class="cfg-field">
+        <label>修复提示词 (Claude)</label>
+        <div class="cfg-hint">变量: {review_feedback}</div>
+        <textarea id="cfg_claude_post_fix" rows="4"></textarea>
+      </div>
+      <div class="cfg-field">
+        <label>再审查提示词 (Codex)</label>
+        <div class="cfg-hint">变量: {fix_result} {diff_section}</div>
+        <textarea id="cfg_codex_post_review_followup" rows="4"></textarea>
       </div>
       <div class="cfg-field">
         <label>用户干预标签 (Claude)</label>
@@ -1305,6 +1625,15 @@ async function doInject(){
   await api('POST','/api/inject',{session_id:sid,message:i.value.trim()});
   i.value='';
 }
+async function doReviewFix(){
+  if(!sid)return;
+  if(!confirm('确认修复？Claude 将继续用 --dangerously-skip-permissions'))return;
+  await api('POST','/api/review_fix',{session_id:sid});
+}
+async function doReviewSkip(){
+  if(!sid)return;
+  await api('POST','/api/review_skip',{session_id:sid});
+}
 
 // ── Polling ──
 async function pollEvt(){
@@ -1318,56 +1647,98 @@ async function pollEvt(){
   }catch(e){}
 }
 
+// ── Issue 2: 折叠区管理 ──
+var activeFold={claude:null,codex:null};
+var foldSeq=0;
+function openCollapsible(agent,type){
+  var el=document.getElementById('log_'+agent);
+  var fid='fold_'+(++foldSeq);
+  var label={command_output:'命令输出',tool_result:'工具输出'}[type]||'输出';
+  el.insertAdjacentHTML('beforeend','<details class="chunk-fold" id="'+fid+'" data-ctype="'+type+'" open><summary>'+label+'</summary><div class="fold-body"></div></details>');
+  activeFold[agent]=fid;
+  el.scrollTop=el.scrollHeight;
+}
+function appendOrGrowCollapsible(agent,type,html){
+  if(activeFold[agent]){
+    var fold=document.getElementById(activeFold[agent]);
+    if(fold&&fold.dataset.ctype===type){
+      fold.querySelector('.fold-body').insertAdjacentHTML('beforeend',html);
+      fold.parentElement.scrollTop=fold.parentElement.scrollHeight;
+      return;
+    }
+  }
+  openCollapsible(agent,type);
+  var fold=document.getElementById(activeFold[agent]);
+  fold.querySelector('.fold-body').insertAdjacentHTML('beforeend',html);
+}
+
 function handle(e){
   switch(e.type){
     case 'round_start':
-      const hdr='\n══════ 第 '+e.data.round+' / '+e.data.max+' 轮 ══════\n';
-      appendLog('claude','<span class="sys">'+hdr+'</span>');
-      appendLog('codex','<span class="sys">'+hdr+'</span>');
+      var hdr='══════ 第 '+e.data.round+' / '+e.data.max+' 轮 ══════';
+      appendLog('claude','<div class="log-sep sys">'+hdr+'</div>');
+      appendLog('codex','<div class="log-sep sys">'+hdr+'</div>');
       break;
     case 'agent_thinking':
-      const who=e.data.agent;
+      var who=e.data.agent;
       switchTab(who,'log');
-      appendLog(who,'<span class="sys">'+(who==='claude'?'[Claude 分析中...]':'[Codex 审查中...]')+'</span>\n');
+      appendLog(who,'<div class="log-sep sys">'+(who==='claude'?'[Claude 分析中...]':'[Codex 审查中...]')+'</div>');
       break;
-    case 'agent_chunk':
-      appendLog(e.data.agent, esc(e.data.text));
+    case 'agent_chunk':{
+      var ct=e.data.chunk_type||'text';
+      var ag=e.data.agent;
+      var txt=esc(e.data.text);
+      if(ct==='command'){
+        appendLog(ag,'<span class="chunk-cmd">'+txt+'</span>');
+      }else if(ct==='command_output'){
+        appendOrGrowCollapsible(ag,ct,txt);
+      }else{
+        appendLog(ag,txt);
+      }
       break;
+    }
+    case 'chunk_boundary':{
+      var ag2=e.data.agent;
+      if(activeFold[ag2]){
+        var fold=document.getElementById(activeFold[ag2]);
+        if(fold)fold.removeAttribute('open');
+        activeFold[ag2]=null;
+      }
+      break;
+    }
     case 'agent_stderr':
       if(e.data.is_mcp){
-        appendLog(e.data.agent,'<span class="mcp-line">[MCP] '+esc(e.data.text)+'</span>\n');
+        appendLog(e.data.agent,'<span class="mcp-line">[MCP] '+esc(e.data.text)+'</span>');
       }
       break;
     case 'agent_result':
-      // 内容已通过 agent_chunk 写入日志区，agent_response 写入版本视图。
-      // 此事件是后端对完整结果的冗余重发，前端无需处理。
       break;
     case 'agent_response':{
       var role=e.data.role;
       if(role==='user'){
-        appendLog('claude','<span class="sys">[你] '+esc(e.data.content)+'</span>\n');
-        appendLog('codex','<span class="sys">[你] '+esc(e.data.content)+'</span>\n');
+        appendLog('claude','<div class="log-sep sys">[你] '+esc(e.data.content)+'</div>');
+        appendLog('codex','<div class="log-sep sys">[你] '+esc(e.data.content)+'</div>');
         break;
       }
-      var ag=role==='claude'?'claude':'codex';
-      appendLog(ag,'\n<span class="sys">── '+e.data.phase+' 完成 (R'+e.data.round+') ──</span>\n');
+      var ag3=role==='claude'?'claude':'codex';
+      appendLog(ag3,'<div class="log-sep sys">── '+e.data.phase+' 完成 (R'+e.data.round+') ──</div>');
       if(e.data.content){
-        if(!versions[ag].some(function(v){return v.round===e.data.round;})){
-          versions[ag].push({round:e.data.round,phase:e.data.phase,content:e.data.content});
+        if(!versions[ag3].some(function(v){return v.round===e.data.round;})){
+          versions[ag3].push({round:e.data.round,phase:e.data.phase,content:e.data.content});
         }
-        activeVer[ag]=-1;
+        activeVer[ag3]=-1;
         showExecResult=false;
-        renderVersionedResult(ag);
+        renderVersionedResult(ag3);
       }
-      switchTab(ag,'result');
+      switchTab(ag3,'result');
       if(role==='claude'){
-        var h='\n<span class="sys">── Claude R'+e.data.round+' 方案已发送给 Codex ──</span>\n';
+        var h='<div class="log-sep sys">── Claude R'+e.data.round+' 方案已发送给 Codex ──</div>';
         if(e.data.content){
           h+='<details class="plan-preview"><summary>查看发送给 Codex 的方案内容</summary><div class="plan-body">'+esc(e.data.content)+'</div></details>';
         }
         appendLog('codex',h);
       }else if(role==='codex'){
-        var h2='\n<span class="sys">── Codex R'+e.data.round+' 审查意见已发送给 Claude ──</span>\n';
+        var h2='<div class="log-sep sys">── Codex R'+e.data.round+' 审查意见已发送给 Claude ──</div>';
         if(e.data.content){
           h2+='<details class="plan-preview"><summary>查看发送给 Claude 的审查意见</summary><div class="plan-body">'+esc(e.data.content)+'</div></details>';
         }
@@ -1376,27 +1747,29 @@ function handle(e){
       break;
     }
     case 'consensus_reached':
-      const ok='\n✓ '+e.data.msg+'\n';
-      appendLog('claude','<span class="ok">'+ok+'</span>');
-      appendLog('codex','<span class="ok">'+ok+'</span>');
+      appendLog('claude','<div class="log-sep ok">✓ '+e.data.msg+'</div>');
+      appendLog('codex','<div class="log-sep ok">✓ '+e.data.msg+'</div>');
       break;
     case 'max_rounds_reached':
-      appendLog('claude','<span class="sys">\n⚠ '+e.data.msg+'</span>\n');
-      appendLog('codex','<span class="sys">\n⚠ '+e.data.msg+'</span>\n');
+      appendLog('claude','<div class="log-sep sys">⚠ '+e.data.msg+'</div>');
+      appendLog('codex','<div class="log-sep sys">⚠ '+e.data.msg+'</div>');
       break;
     case 'execution_done':
-      appendLog('claude','\n<span class="ok">══════ 执行完成 ══════</span>\n');
+      appendLog('claude','<div class="log-sep ok">══════ 执行完成 ══════</div>');
       executionResult=e.data.result;
       showExecResult=true;
       renderVersionedResult('claude');
-      switchTab('claude','result');
+      var head=document.querySelector('.dot-claude').parentElement;
+      if(head&&!head.querySelector('.done-badge')){
+        head.insertAdjacentHTML('beforeend','<span class="done-badge">✓ 执行完毕</span>');
+      }
       break;
     case 'error':
-      appendLog('claude','<span class="err">\n❌ '+esc(e.data.msg)+'</span>\n');
-      appendLog('codex','<span class="err">\n❌ '+esc(e.data.msg)+'</span>\n');
+      appendLog('claude','<div class="log-sep err">❌ '+esc(e.data.msg)+'</div>');
+      appendLog('codex','<div class="log-sep err">❌ '+esc(e.data.msg)+'</div>');
       break;
     case 'warning':
-      appendLog('claude','<span class="sys">\n⚠ '+esc(e.data.msg)+'</span>\n');
+      appendLog('claude','<div class="log-sep sys">⚠ '+esc(e.data.msg)+'</div>');
       break;
     case 'rollback':
       versions.claude=versions.claude.filter(function(v){return v.round<=e.data.round;});
@@ -1405,14 +1778,51 @@ function handle(e){
       activeVer.codex=-1;
       renderVersionedResult('claude');
       renderVersionedResult('codex');
-      appendLog('claude','<span class="sys">\n⚠ '+esc(e.data.msg)+'</span>\n');
-      appendLog('codex','<span class="sys">\n⚠ '+esc(e.data.msg)+'</span>\n');
+      appendLog('claude','<div class="log-sep sys">⚠ '+esc(e.data.msg)+'</div>');
+      appendLog('codex','<div class="log-sep sys">⚠ '+esc(e.data.msg)+'</div>');
       break;
     case 'status_change':
       if(e.data.status==='stopped'){
-        appendLog('claude','<span class="sys">\n⏹ 已中止</span>\n');
-        appendLog('codex','<span class="sys">\n⏹ 已中止</span>\n');
+        appendLog('claude','<div class="log-sep sys">⏹ 已中止</div>');
+        appendLog('codex','<div class="log-sep sys">⏹ 已中止</div>');
       }
+      break;
+    // ── Issue 4: 审查循环事件 ──
+    case 'review_response':{
+      var rrole=e.data.role;
+      var rag=rrole==='claude'?'claude':'codex';
+      appendLog(rag,'<div class="log-sep sys">── '+e.data.phase+' (审查轮 '+e.data.round+') ──</div>');
+      if(rrole==='codex'&&e.data.content){
+        appendLog('codex','<details class="plan-preview" open><summary>Codex 审查意见</summary><div class="plan-body">'+esc(e.data.content)+'</div></details>');
+        appendLog('claude','<details class="plan-preview"><summary>查看 Codex 审查意见</summary><div class="plan-body">'+esc(e.data.content)+'</div></details>');
+      }else if(rrole==='claude'&&e.data.content){
+        appendLog('claude','<details class="plan-preview" open><summary>Claude 修复总结</summary><div class="plan-body">'+esc(e.data.content)+'</div></details>');
+        appendLog('codex','<details class="plan-preview"><summary>查看 Claude 修复总结</summary><div class="plan-body">'+esc(e.data.content)+'</div></details>');
+      }
+      break;
+    }
+    case 'review_start':
+      appendLog('claude','<div class="log-sep ok">══════ 执行后审查开始 ══════</div>');
+      appendLog('codex','<div class="log-sep ok">══════ 执行后审查开始 ══════</div>');
+      break;
+    case 'review_round_start':
+      appendLog('claude','<div class="log-sep sys">══════ 审查修复轮 '+e.data.round+' / '+e.data.max+' ══════</div>');
+      appendLog('codex','<div class="log-sep sys">══════ 审查修复轮 '+e.data.round+' / '+e.data.max+' ══════</div>');
+      break;
+    case 'review_needs_fix':
+      appendLog('claude','<div class="log-sep sys">⚠ '+esc(e.data.msg)+'</div>');
+      appendLog('codex','<div class="log-sep sys">⚠ '+esc(e.data.msg)+'</div>');
+      break;
+    case 'review_done':
+      if(e.data.success){
+        appendLog('claude','<div class="log-sep ok">══════ 任务收口成功 ══════</div>');
+        appendLog('codex','<div class="log-sep ok">══════ 任务收口成功 ══════</div>');
+      }else{
+        appendLog('claude','<div class="log-sep sys">⚠ '+esc(e.data.msg)+'</div>');
+        appendLog('codex','<div class="log-sep sys">⚠ '+esc(e.data.msg)+'</div>');
+      }
+      var badge=document.querySelector('.done-badge');
+      if(badge)badge.textContent=e.data.success?'✓ 收口成功':'⚠ 审查完成';
       break;
   }
 }
@@ -1436,21 +1846,25 @@ function updSt(s,r,m){
   if(s===st)return; st=s;
   const p=document.getElementById('pill');
   p.className='pill pill-'+s;
-  p.textContent={idle:'IDLE',running:'NEGOTIATING',consensus:'CONSENSUS',max_rounds:'MAX ROUNDS',executing:'EXECUTING',done:'DONE',error:'ERROR'}[s]||s;
+  p.textContent={idle:'IDLE',running:'NEGOTIATING',consensus:'CONSENSUS',max_rounds:'MAX ROUNDS',executing:'EXECUTING',review_pending:'REVIEWING',review_fix:'NEEDS FIX',done:'DONE',error:'ERROR'}[s]||s;
   document.getElementById('btn_go').disabled=!['idle','done','error'].includes(s);
-  document.getElementById('btn_stop').disabled=s!=='running'&&s!=='executing';
+  document.getElementById('btn_stop').disabled=!['running','executing','review_pending'].includes(s);
   document.getElementById('btn_exec').disabled=s!=='consensus'&&s!=='max_rounds';
   const showCont=s==='max_rounds';
   document.getElementById('btn_cont').style.display=showCont?'':'none';
   document.getElementById('btn_cont').disabled=!showCont;
   document.getElementById('inp_extra').style.display=showCont?'':'none';
+  document.getElementById('btn_fix').disabled=s!=='review_fix';
+  document.getElementById('btn_fix').style.display=s==='review_fix'?'':'none';
+  document.getElementById('btn_skip').disabled=s!=='review_fix';
+  document.getElementById('btn_skip').style.display=s==='review_fix'?'':'none';
   if(['idle','done','error'].includes(s)&&poll){clearInterval(poll);poll=null;}
 }
 
 function esc(s){return(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
 
 // ── 提示词配置 ──
-const cfgKeys=['claude_first','claude_revise','codex_first','codex_review','execution','execution_unapproved','user_inject_label_claude','user_inject_label_codex'];
+const cfgKeys=['claude_first','claude_revise','codex_first','codex_review','execution','execution_unapproved','codex_post_review','claude_post_fix','codex_post_review_followup','user_inject_label_claude','user_inject_label_codex'];
 
 async function openCfg(){
   const data=await api('GET','/api/prompts');
@@ -1624,8 +2038,50 @@ async function browseDir(path){
         showExecResult=true;
         renderVersionedResult('claude');
       }
+      // ── 恢复审查上下文 ──
+      if(r.review_status){
+        var rs=r.review_status;
+        appendLog('claude','<div class="log-sep ok">══════ 执行后审查开始 ══════</div>');
+        appendLog('codex','<div class="log-sep ok">══════ 执行后审查开始 ══════</div>');
+        if(r.review_entries&&r.review_entries.length){
+          r.review_entries.forEach(function(h){
+            var ag=h.role==='claude'?'claude':'codex';
+            appendLog(ag,'<div class="log-sep sys">── '+h.phase+' (审查轮 '+h.round+') ──</div>');
+            if(h.content){
+              var label=h.role==='codex'?'Codex 审查意见':'Claude 修复总结';
+              appendLog(ag,'<details class="plan-preview"><summary>'+label+'</summary><div class="plan-body">'+esc(h.content)+'</div></details>');
+              var other=ag==='claude'?'codex':'claude';
+              appendLog(other,'<details class="plan-preview"><summary>查看'+label+'</summary><div class="plan-body">'+esc(h.content)+'</div></details>');
+            }
+          });
+        }
+        if(rs.status==='done'){
+          var lastCodex=null;
+          if(r.review_entries){for(var i=r.review_entries.length-1;i>=0;i--){if(r.review_entries[i].role==='codex'){lastCodex=r.review_entries[i];break;}}}
+          var success=lastCodex&&lastCodex.content&&lastCodex.content.split('\\n')[0].indexOf('任务收口成功')>=0;
+          if(success){
+            appendLog('claude','<div class="log-sep ok">══════ 任务收口成功 ══════</div>');
+            appendLog('codex','<div class="log-sep ok">══════ 任务收口成功 ══════</div>');
+          }else{
+            appendLog('claude','<div class="log-sep sys">⚠ 审查完成（未达成收口确认）</div>');
+            appendLog('codex','<div class="log-sep sys">⚠ 审查完成（未达成收口确认）</div>');
+          }
+          var head=document.querySelector('.dot-claude');
+          if(head)head=head.parentElement;
+          if(head&&!head.querySelector('.done-badge')){
+            head.insertAdjacentHTML('beforeend','<span class="done-badge">'+(success?'✓ 收口成功':'⚠ 审查完成')+'</span>');
+          }
+        }else if(rs.status==='review_fix'){
+          appendLog('claude','<div class="log-sep sys">⚠ Codex 发现问题，等待你确认是否修复。</div>');
+          appendLog('codex','<div class="log-sep sys">⚠ Codex 发现问题，等待你确认是否修复。</div>');
+        }else if(rs.status==='review_pending'){
+          appendLog('codex','<div class="log-sep sys">[Codex 评审中...]</div>');
+        }
+      }
+      // 用 event_cursor 跳过已恢复事件
+      if(r.event_cursor!=null){cursor=r.event_cursor;}
+      if(!poll)poll=setInterval(pollEvt,300);
     });
-    poll=setInterval(pollEvt,300);
   }
 })();
 </script>

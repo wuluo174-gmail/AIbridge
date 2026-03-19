@@ -5,6 +5,9 @@
   "codex_review": "Claude 针对你上一轮的反馈做了修订（见下方）。\n继续第一性原理审查，不必逢迎讨好，实事求是：修订是否真正解决了你提出的问题？有无新问题？\n\n如果方案已经足够好，以 APPROVED 开头回复。否则继续逐条列出问题。\n\n## Claude 的修订方案\n{claude_revision}{inject_section}",
   "execution": "以上方案已经过严格多轮审查并获得 APPROVED。{plan_section}\n\n请严格按照方案执行所有代码修改。完成后总结你执行的所有变更。\n\n原始任务: {task}",
   "execution_unapproved": "以上方案经过多轮协商但未获得审查者的明确认可，用户选择继续执行。{plan_section}\n\n请按照方案执行代码修改，对不确定的部分保持审慎。完成后总结你执行的所有变更。\n\n原始任务: {task}",
+  "codex_post_review": "Claude 已按照方案执行了代码修改。\n\n重要：不要仅依赖 Claude 的执行总结，请自行读取相关文件验证实际变更。\n\n审查要点：\n1. 完整性：方案中所有修改是否都已实施？\n2. 一致性：实际修改与方案是否一致，有无偏离（漂移）？\n3. 遗漏：边界情况、错误处理、测试是否到位？\n4. 质量：代码风格、命名是否达标？\n\n如果一切到位，以「任务收口成功」开头回复并说明理由。\n否则逐条列出问题，标注 [必须修复] [建议修复]。\n\n## 原始任务\n{task}\n\n## 审批通过的方案\n{approved_plan}\n\n{diff_section}## Claude 的执行总结\n{execution_result}",
+  "claude_post_fix": "执行后审查发现以下问题，请逐一修复：\n\n## 审查反馈\n{review_feedback}\n\n请修复上述问题，完成后总结你做的所有修改。",
+  "codex_post_review_followup": "Claude 针对上一轮审查反馈做了修复。请自行读取相关文件验证：\n- 之前提出的问题是否已解决？\n- 修复过程中是否引入新问题？\n\n如果一切到位，以「任务收口成功」开头回复。否则继续列出问题。\n\n{diff_section}## Claude 的修复总结\n{fix_result}",
   "user_inject_label_claude": "用户补充的约束和意见（必须优先考虑）",
   "user_inject_label_codex": "用户补充的约束和意见（审查时必须考虑）"
 }
