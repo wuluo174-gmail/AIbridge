@@ -464,11 +464,25 @@ def build_execution_prompt(task, final_plan="", approved=True):
 # ═════════════════════════════════════════════════════════════════
 # Orchestration Engine
 # ═════════════════════════════════════════════════════════════════
+def last_complete_round(history):
+    """返回 history 中最后一个完整轮次号（同时有 claude 和 codex 记录）。无则返回 0。"""
+    has_claude = set()
+    has_codex = set()
+    for h in history:
+        r = h.get("round", 0)
+        if h["role"] == "claude":
+            has_claude.add(r)
+        elif h["role"] == "codex":
+            has_codex.add(r)
+    complete = has_claude & has_codex
+    return max(complete) if complete else 0
+
+
 def is_approved(text):
     return "APPROVED" in text.strip().split("\n")[0].upper()
 
 
-def run_negotiation(sess):
+def run_negotiation(sess, start_round=1):
     task = sess.task
     cwd = sess.project_path
     max_rounds = sess.max_rounds
@@ -477,7 +491,7 @@ def run_negotiation(sess):
         sess.status = "running"
         add_event(sess, "status_change", {"status": "running", "msg": "协商开始"})
 
-        for rnd in range(1, max_rounds + 1):
+        for rnd in range(start_round, max_rounds + 1):
             if sess.stop_flag.is_set():
                 sess.status = "idle"
                 add_event(sess, "status_change", {"status": "stopped", "msg": "用户中止"})
@@ -489,7 +503,7 @@ def run_negotiation(sess):
             # ── A) Claude 出方案 / 修订 ─────────────────────
             add_event(sess, "agent_thinking", {"agent": "claude", "round": rnd})
 
-            if rnd == 1:
+            if rnd == 1 and start_round == 1:
                 prompt_c = build_claude_first_prompt(task, cwd)
             else:
                 last_codex = ""
@@ -519,7 +533,7 @@ def run_negotiation(sess):
             # ── B) Codex 审查 ───────────────────────────────
             add_event(sess, "agent_thinking", {"agent": "codex", "round": rnd})
 
-            if rnd == 1:
+            if rnd == 1 and start_round == 1:
                 prompt_x = build_codex_first_prompt(task, plan)
             else:
                 user_injects_x = collect_user_injects(sess.history)
@@ -552,13 +566,43 @@ def run_negotiation(sess):
         sess.status = "max_rounds"
         add_event(sess, "max_rounds_reached", {
             "round": max_rounds,
-            "msg": f"已完成 {max_rounds} 轮协商（未获 APPROVED），可选择执行当前方案。",
+            "msg": f"已完成 {max_rounds} 轮协商（未获 APPROVED），可选择执行当前方案或继续协商。",
         })
 
     except Exception as e:
-        sess.status = "error"
-        sess.error = str(e)
-        add_event(sess, "error", {"msg": str(e)})
+        if start_round > 1:
+            # ── 续接失败：彻底回退到最后完整轮次 ──
+            lcr = last_complete_round(sess.history)
+
+            # 1) 裁剪 history：移除不完整轮次条目，保留 user 注入
+            sess.history = [
+                h for h in sess.history
+                if h["role"] == "user" or h.get("round", 0) <= lcr
+            ]
+
+            # 2) 归位 current_round 和 max_rounds
+            sess.current_round = lcr
+            sess.max_rounds = lcr
+
+            # 3) 找到最后完整轮次的 Claude 方案，用于恢复前端
+            restored_plan = ""
+            for h in reversed(sess.history):
+                if h["role"] == "claude" and h.get("round") == lcr:
+                    restored_plan = h["content"]
+                    break
+
+            # 4) 设状态并通知前端
+            sess.status = "max_rounds"
+            add_event(sess, "rollback", {
+                "round": lcr,
+                "max": lcr,
+                "plan": restored_plan,
+                "msg": f"继续协商出错（{e}），已回退到第 {lcr} 轮状态，仍可执行或再次续接。",
+            })
+        else:
+            sess.status = "error"
+            sess.error = str(e)
+            add_event(sess, "error", {"msg": str(e)})
 
 
 def run_execution(sess):
@@ -738,6 +782,28 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
             sess.history.append(entry)
             add_event(sess, "agent_response", entry)
             self._json({"ok": True})
+        elif p.path == "/api/continue":
+            body = self._body()
+            sess = get_session(body.get("session_id"))
+            if not sess:
+                return self._json({"error": "会话不存在"}, 404)
+            extra = int(body.get("extra_rounds", 3))
+            if extra < 1 or extra > 20:
+                return self._json({"error": "额外轮次须在 1-20 之间"}, 400)
+            with sess.status_lock:
+                if sess.status != "max_rounds":
+                    return self._json({"error": "只有在达到最大轮次后才能继续协商"}, 400)
+                sess.status = "running"
+            # 从 history 派生续接起点，不依赖可能不一致的 current_round
+            lcr = last_complete_round(sess.history)
+            start_round = lcr + 1
+            sess.max_rounds = lcr + extra
+            sess.stop_flag.clear()
+            threading.Thread(
+                target=run_negotiation, args=(sess,),
+                kwargs={"start_round": start_round}, daemon=True
+            ).start()
+            self._json({"ok": True})
         else:
             self.send_error(404)
 
@@ -780,6 +846,11 @@ body{font-family:'SF Mono','Fira Code','Menlo',monospace;background:var(--bg);co
 .btn-go{background:var(--claude);color:#fff}
 .btn-stop{background:var(--danger);color:#fff}
 .btn-exec{background:var(--approve);color:#000}
+.btn-cont{background:#e67e22;color:#fff}
+.plan-preview{margin:4px 0 8px 0}
+.plan-preview summary{cursor:pointer;color:var(--claude);font-size:12px;font-weight:600;user-select:none}
+.plan-preview summary:hover{text-decoration:underline}
+.plan-preview .plan-body{margin-top:6px;padding:8px 12px;background:rgba(124,92,252,.06);border-left:3px solid var(--claude);border-radius:0 4px 4px 0;font-size:12px;line-height:1.5;max-height:400px;overflow-y:auto;color:#c9d1d9;white-space:pre-wrap;word-wrap:break-word}
 
 .status-bar{display:flex;align-items:center;gap:12px;margin-left:auto;font-family:-apple-system,sans-serif}
 .pill{font-size:11px;padding:2px 8px;border-radius:10px;font-weight:600;text-transform:uppercase}
@@ -852,6 +923,8 @@ body{font-family:'SF Mono','Fira Code','Menlo',monospace;background:var(--bg);co
   <button class="btn btn-go" id="btn_go" onclick="doStart()">▶ 开始</button>
   <button class="btn btn-stop" id="btn_stop" onclick="doStop()" disabled>⏹ 中止</button>
   <button class="btn btn-exec" id="btn_exec" onclick="doExec()" disabled>⚡ 执行</button>
+  <button class="btn btn-cont" id="btn_cont" onclick="doContinue()" disabled style="display:none">继续协商</button>
+  <input type="number" id="inp_extra" value="3" min="1" max="20" title="额外轮次" style="display:none;width:50px;text-align:center;background:var(--bg);border:1px solid var(--border);border-radius:4px;color:var(--text);padding:6px;font-size:13px">
   <button class="btn btn-cfg" onclick="openCfg()">⚙ 提示词</button>
   <div class="status-bar">
     <span class="pill pill-idle" id="pill">IDLE</span>
@@ -993,13 +1066,18 @@ async function doExec(){
     if(r.error){alert('执行启动失败: '+r.error);return;}
   }catch(e){alert('执行请求失败: '+e.message);}
 }
+async function doContinue(){
+  if(!sid)return;
+  const extra=parseInt(document.getElementById('inp_extra').value)||3;
+  const r=await api('POST','/api/continue',{session_id:sid,extra_rounds:extra});
+  if(r.error){alert(r.error);return;}
+  if(!poll)poll=setInterval(pollEvt,300);
+}
 async function doInject(){
   if(!sid)return;
   const i=document.getElementById('inp_inject');
   if(!i.value.trim())return;
   await api('POST','/api/inject',{session_id:sid,message:i.value.trim()});
-  appendLog('claude','<span class="sys">[你] '+esc(i.value.trim())+'</span>\n');
-  appendLog('codex','<span class="sys">[你] '+esc(i.value.trim())+'</span>\n');
   i.value='';
 }
 
@@ -1039,20 +1117,35 @@ function handle(e){
       appendResult(e.data.agent, esc(e.data.text));
       switchTab(e.data.agent,'result');
       break;
-    case 'agent_response':
-      const ag=e.data.role==='claude'?'claude':'codex';
+    case 'agent_response':{
+      const role=e.data.role;
+      if(role==='user'){
+        appendLog('claude','<span class="sys">[你] '+esc(e.data.content)+'</span>\n');
+        appendLog('codex','<span class="sys">[你] '+esc(e.data.content)+'</span>\n');
+        break;
+      }
+      const ag=role==='claude'?'claude':'codex';
       appendLog(ag,'\n<span class="sys">── '+e.data.phase+' 完成 (R'+e.data.round+') ──</span>\n');
       if(e.data.content){
         const rel=document.getElementById('result_'+ag);
         if(rel) rel.innerHTML='<span class="ok">── R'+e.data.round+' '+e.data.phase+' ──</span>\n'+esc(e.data.content);
       }
       switchTab(ag,'result');
-      if(e.data.role==='claude'){
-        appendLog('codex','\n<span class="sys">── Claude R'+e.data.round+' 方案已发送给 Codex ──</span>\n');
-      }else{
-        appendLog('claude','\n<span class="sys">── Codex R'+e.data.round+' 审查意见已发送给 Claude ──</span>\n');
+      if(role==='claude'){
+        let h='\n<span class="sys">── Claude R'+e.data.round+' 方案已发送给 Codex ──</span>\n';
+        if(e.data.content){
+          h+='<details class="plan-preview"><summary>查看发送给 Codex 的方案内容</summary><div class="plan-body">'+esc(e.data.content)+'</div></details>';
+        }
+        appendLog('codex',h);
+      }else if(role==='codex'){
+        let h='\n<span class="sys">── Codex R'+e.data.round+' 审查意见已发送给 Claude ──</span>\n';
+        if(e.data.content){
+          h+='<details class="plan-preview"><summary>查看发送给 Claude 的审查意见</summary><div class="plan-body">'+esc(e.data.content)+'</div></details>';
+        }
+        appendLog('claude',h);
       }
       break;
+    }
     case 'consensus_reached':
       const ok='\n✓ '+e.data.msg+'\n';
       appendLog('claude','<span class="ok">'+ok+'</span>');
@@ -1074,6 +1167,14 @@ function handle(e){
     case 'warning':
       appendLog('claude','<span class="sys">\n⚠ '+esc(e.data.msg)+'</span>\n');
       break;
+    case 'rollback':
+      if(e.data.plan){
+        const rc=document.getElementById('result_claude');
+        if(rc) rc.innerHTML='<span class="ok">── R'+e.data.round+' 方案 (已回退) ──</span>\n'+esc(e.data.plan);
+      }
+      appendLog('claude','<span class="sys">\n⚠ '+esc(e.data.msg)+'</span>\n');
+      appendLog('codex','<span class="sys">\n⚠ '+esc(e.data.msg)+'</span>\n');
+      break;
     case 'status_change':
       if(e.data.status==='stopped'){
         appendLog('claude','<span class="sys">\n⏹ 已中止</span>\n');
@@ -1092,26 +1193,30 @@ function switchTab(agent, tab){
 function appendLog(agent, html){
   const el=document.getElementById('log_'+agent);
   if(!el)return;
-  el.innerHTML+=html;
+  el.insertAdjacentHTML('beforeend',html);
   el.scrollTop=el.scrollHeight;
 }
 
 function appendResult(agent, html){
   const el=document.getElementById('result_'+agent);
   if(!el)return;
-  el.innerHTML+=html;
+  el.insertAdjacentHTML('beforeend',html);
   el.scrollTop=el.scrollHeight;
 }
 
 function updSt(s,r,m){
+  document.getElementById('rinfo').textContent=s==='idle'?'':'R'+r+'/'+m;
   if(s===st)return; st=s;
   const p=document.getElementById('pill');
   p.className='pill pill-'+s;
   p.textContent={idle:'IDLE',running:'NEGOTIATING',consensus:'CONSENSUS',max_rounds:'MAX ROUNDS',executing:'EXECUTING',done:'DONE',error:'ERROR'}[s]||s;
-  document.getElementById('rinfo').textContent=s==='idle'?'':'R'+r+'/'+m;
   document.getElementById('btn_go').disabled=!['idle','done','error'].includes(s);
   document.getElementById('btn_stop').disabled=s!=='running'&&s!=='executing';
   document.getElementById('btn_exec').disabled=s!=='consensus'&&s!=='max_rounds';
+  const showCont=s==='max_rounds';
+  document.getElementById('btn_cont').style.display=showCont?'':'none';
+  document.getElementById('btn_cont').disabled=!showCont;
+  document.getElementById('inp_extra').style.display=showCont?'':'none';
   if(['idle','done','error'].includes(s)&&poll){clearInterval(poll);poll=null;}
 }
 
