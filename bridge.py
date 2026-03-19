@@ -33,6 +33,7 @@ from pathlib import Path
 # Prompt Configuration (全局共享)
 # ═════════════════════════════════════════════════════════════════
 PROMPTS_FILE = Path(__file__).parent / "prompts.json"
+RECENT_PATHS_FILE = Path(__file__).parent / "recent_paths.json"
 
 def load_prompts():
     if PROMPTS_FILE.exists():
@@ -41,6 +42,20 @@ def load_prompts():
 
 def save_prompts(data):
     PROMPTS_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+def load_recent_paths():
+    if RECENT_PATHS_FILE.exists():
+        try:
+            return json.loads(RECENT_PATHS_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            return []
+    return []
+
+def save_recent_paths(paths):
+    try:
+        RECENT_PATHS_FILE.write_text(json.dumps(paths, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass  # 最近使用是附加 UX，写失败不阻断主流程
 
 prompt_config = load_prompts()
 
@@ -712,6 +727,80 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
                     "max_rounds": s.max_rounds,
                 } for s in sessions.values()]
             self._json({"sessions": listing})
+        elif p.path == "/api/history":
+            sess = self._get_session_from_qs(qs)
+            if not sess:
+                return self._json({"entries": [], "execution_result": None})
+            entries = [
+                {"round": h["round"], "role": h["role"], "phase": h["phase"],
+                 "content": h["content"]}
+                for h in sess.history if h["role"] in ("claude", "codex")
+            ]
+            self._json({
+                "entries": entries,
+                "execution_result": sess.execution_result,
+            })
+        elif p.path == "/api/browse":
+            raw = qs.get("path", [""])[0].strip()
+            target = Path(raw).expanduser().resolve() if raw else Path.home()
+            if not target.is_dir():
+                return self._json({"error": f"非目录: {target}"}, 400)
+            parent = str(target.parent) if target != target.parent else None
+            # os.scandir 流式收集（is_dir 使用 d_type 缓存，无额外 stat）
+            # 注：仍需遍历整个目录以获取完整排序结果，对极大目录（万级条目）
+            # 的扫描成本是 O(n)，但内存开销很低（仅存 name+path 元组）
+            raw_dirs = []
+            truncated = False
+            try:
+                with os.scandir(str(target)) as it:
+                    for entry in it:
+                        if not entry.is_dir(follow_symlinks=True):
+                            continue
+                        if entry.name.startswith('.'):
+                            continue
+                        raw_dirs.append((entry.name, entry.path))
+            except PermissionError:
+                return self._json({"error": f"权限不足: {target}"}, 403)
+            raw_dirs.sort(key=lambda x: x[0])
+            if len(raw_dirs) > 200:
+                raw_dirs = raw_dirs[:200]
+                truncated = True
+            dirs = [{"name": name, "path": path,
+                     "is_git": os.path.isdir(os.path.join(path, ".git"))}
+                    for name, path in raw_dirs]
+            self._json({"current": str(target), "parent": parent, "dirs": dirs,
+                        "is_git": (target / ".git").is_dir(), "truncated": truncated})
+        elif p.path == "/api/complete":
+            prefix = qs.get("prefix", [""])[0].strip()
+            if not prefix:
+                return self._json({"suggestions": []})
+            target = Path(prefix).expanduser()
+            if target.is_dir() and prefix.endswith(os.sep):
+                parent_dir, match = str(target), ""
+            else:
+                parent_dir, match = str(target.parent), target.name.lower()
+            suggestions = []
+            if os.path.isdir(parent_dir):
+                raw_dirs = []
+                try:
+                    with os.scandir(parent_dir) as it:
+                        for entry in it:
+                            if not entry.is_dir(follow_symlinks=True):
+                                continue
+                            if match and not entry.name.lower().startswith(match):
+                                continue
+                            if entry.name.startswith('.') and not match.startswith('.'):
+                                continue
+                            raw_dirs.append((entry.name, entry.path))
+                except PermissionError:
+                    pass
+                raw_dirs.sort(key=lambda x: x[0])
+                for name, path in raw_dirs[:15]:
+                    suggestions.append({"name": name, "path": path,
+                                        "is_git": os.path.isdir(os.path.join(path, ".git"))})
+            self._json({"suggestions": suggestions})
+        elif p.path == "/api/recent_paths":
+            self._json({"paths": load_recent_paths()})
         elif p.path == "/api/prompts":
             self._json(prompt_config)
         else:
@@ -722,16 +811,25 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
         if p.path == "/api/start":
             body = self._body()
             task = body.get("task", "").strip()
-            project = body.get("project_path", "").strip()
+            project_raw = body.get("project_path", "").strip()
             rounds = int(body.get("max_rounds", 5))
             if not task:
                 return self._json({"error": "请输入任务描述"}, 400)
-            if not project or not os.path.isdir(project):
-                return self._json({"error": f"项目路径无效: {project}"}, 400)
+            if not project_raw:
+                return self._json({"error": "请输入项目路径"}, 400)
+            project = str(Path(project_raw).expanduser().resolve())
+            if not os.path.isdir(project):
+                return self._json({"error": f"项目路径无效: {project_raw}"}, 400)
             sid = uuid.uuid4().hex[:8]
             sess = SessionState(sid, task, project, rounds)
             with sessions_lock:
                 sessions[sid] = sess
+            # 记录最近使用（附加 UX，失败不影响主流程）
+            recent = load_recent_paths()
+            if project in recent:
+                recent.remove(project)
+            recent.insert(0, project)
+            save_recent_paths(recent[:10])
             threading.Thread(target=run_negotiation, args=(sess,), daemon=True).start()
             self._json({"ok": True, "session_id": sid})
         elif p.path == "/api/execute":
@@ -835,7 +933,7 @@ body{font-family:'SF Mono','Fira Code','Menlo',monospace;background:var(--bg);co
 .controls label{font-size:11px;color:var(--dim);font-weight:600;text-transform:uppercase;letter-spacing:.5px;font-family:-apple-system,sans-serif}
 .controls input,.controls textarea{background:var(--bg);border:1px solid var(--border);border-radius:4px;color:var(--text);padding:6px 10px;font-size:13px;font-family:inherit;outline:none}
 .controls input:focus,.controls textarea:focus{border-color:var(--claude)}
-.controls .f-path{flex:0 0 260px}
+.controls .f-path{flex:0 0 320px}
 .controls .f-task{flex:1 1 300px}
 .controls .f-task textarea{min-height:80px;max-height:200px;resize:vertical}
 .controls .f-rounds{flex:0 0 60px}
@@ -911,13 +1009,53 @@ body{font-family:'SF Mono','Fira Code','Menlo',monospace;background:var(--bg);co
 .btn-cancel{background:var(--border);color:var(--text)}
 
 ::-webkit-scrollbar{width:5px}::-webkit-scrollbar-track{background:transparent}::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
+
+/* ── 版本历史 ── */
+.result-wrap{display:flex;flex-direction:column;height:100%}
+.ver-bar{display:flex;gap:2px;padding:4px 14px;border-bottom:1px solid var(--border);flex-wrap:wrap;flex-shrink:0}
+.ver-bar:empty{display:none}
+.ver-content{flex:1;overflow-y:auto;min-height:0;padding:12px 14px;font-size:13px;line-height:1.6;white-space:pre-wrap;word-wrap:break-word;color:#c9d1d9}
+.ver-tab{background:transparent;border:1px solid var(--border);border-radius:4px;color:var(--dim);padding:2px 8px;font-size:11px;cursor:pointer;font-family:-apple-system,sans-serif;font-weight:600;transition:all .15s}
+.ver-tab:hover{border-color:var(--text);color:var(--text)}
+.ver-tab.active{background:var(--claude);color:#fff;border-color:var(--claude)}
+.ver-tab.vt-exec{border-color:var(--approve)}
+.ver-tab.vt-exec.active{background:var(--approve);color:#000;border-color:var(--approve)}
+
+/* ── 路径选择器 ── */
+.path-wrap{position:relative;display:flex;gap:0}
+.path-wrap input{flex:1;border-radius:4px 0 0 4px}
+.btn-browse{background:var(--border);color:var(--text);border:1px solid var(--border);border-left:none;border-radius:0 4px 4px 0;padding:6px 8px;font-size:14px;cursor:pointer}
+.btn-browse:hover{background:var(--claude);color:#fff}
+.path-dropdown{display:none;position:absolute;top:100%;left:0;right:0;background:var(--surface);border:1px solid var(--border);border-top:none;border-radius:0 0 4px 4px;max-height:220px;overflow-y:auto;z-index:50}
+.path-dropdown.open{display:block}
+.pd-item{padding:6px 10px;cursor:pointer;font-size:12px;display:flex;align-items:center;gap:6px}
+.pd-item:hover{background:var(--border)}
+.pd-git{color:var(--approve);font-size:10px;font-weight:600}
+.pd-section{padding:4px 10px;font-size:10px;color:var(--dim);text-transform:uppercase;font-weight:600}
+.browse-bar{display:flex;gap:6px;padding:10px 14px;border-bottom:1px solid var(--border)}
+.browse-bar input{flex:1;background:var(--bg);border:1px solid var(--border);border-radius:4px;color:var(--text);padding:6px 10px;font-size:12px;font-family:inherit;outline:none}
+.browse-item{padding:8px 14px;cursor:pointer;font-size:13px;display:flex;align-items:center;gap:8px;border-bottom:1px solid rgba(255,255,255,.03)}
+.browse-item:hover{background:rgba(124,92,252,.08)}
+.browse-item.selected{background:rgba(124,92,252,.15);border-left:3px solid var(--claude)}
+.browse-item.bi-parent{color:var(--dim);font-style:italic}
+.bi-icon{font-size:14px;flex-shrink:0}
+.bi-name{flex:1}
+.bi-git{color:var(--approve);font-size:10px;font-weight:600}
+
 </style>
 </head>
 <body>
 
 <!-- 控制栏 -->
 <div class="controls">
-  <div class="field f-path"><label>项目路径</label><input type="text" id="inp_path"></div>
+  <div class="field f-path">
+    <label>项目路径</label>
+    <div class="path-wrap">
+      <input type="text" id="inp_path" autocomplete="off" placeholder="输入路径或点击浏览...">
+      <button class="btn btn-browse" id="btn_browse" title="浏览文件夹">📂</button>
+      <div class="path-dropdown" id="pathDropdown"></div>
+    </div>
+  </div>
   <div class="field f-task"><label>任务描述</label><textarea id="inp_task" rows="3" placeholder="描述任务..."></textarea></div>
   <div class="field f-rounds"><label>轮次</label><input type="number" id="inp_rounds" value="5" min="1" max="20"></div>
   <button class="btn btn-go" id="btn_go" onclick="doStart()">▶ 开始</button>
@@ -944,7 +1082,12 @@ body{font-family:'SF Mono','Fira Code','Menlo',monospace;background:var(--bg);co
     </div>
     <div class="tab-body">
       <div class="term tab-pane active" id="log_claude"></div>
-      <div class="term tab-pane" id="result_claude"></div>
+      <div class="tab-pane" id="result_claude_wrap">
+        <div class="result-wrap">
+          <div class="ver-bar" id="ver_bar_claude"></div>
+          <div class="ver-content" id="result_claude"></div>
+        </div>
+      </div>
     </div>
   </div>
   <div class="panel">
@@ -957,7 +1100,12 @@ body{font-family:'SF Mono','Fira Code','Menlo',monospace;background:var(--bg);co
     </div>
     <div class="tab-body">
       <div class="term tab-pane active" id="log_codex"></div>
-      <div class="term tab-pane" id="result_codex"></div>
+      <div class="tab-pane" id="result_codex_wrap">
+        <div class="result-wrap">
+          <div class="ver-bar" id="ver_bar_codex"></div>
+          <div class="ver-content" id="result_codex"></div>
+        </div>
+      </div>
     </div>
   </div>
 </div>
@@ -1024,8 +1172,80 @@ body{font-family:'SF Mono','Fira Code','Menlo',monospace;background:var(--bg);co
   </div>
 </div>
 
+<!-- 文件夹浏览弹窗 -->
+<div class="modal-mask" id="browseModal">
+  <div class="modal">
+    <div class="modal-hdr">
+      <span>选择项目文件夹</span>
+      <button class="close" id="browse_close">&times;</button>
+    </div>
+    <div class="modal-body" style="padding:0">
+      <div class="browse-bar">
+        <input type="text" id="browse_path_input" placeholder="输入路径直接跳转...">
+        <button class="btn" id="browse_go_btn">前往</button>
+      </div>
+      <div id="browse_list" style="overflow-y:auto;max-height:55vh"></div>
+    </div>
+    <div class="modal-foot">
+      <div id="browse_current" style="flex:1;font-size:12px;color:var(--dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></div>
+      <button class="btn btn-cancel" id="browse_cancel">取消</button>
+      <button class="btn btn-save" id="browse_select">选择此文件夹</button>
+    </div>
+  </div>
+</div>
+
 <script>
 let sid=null,cursor=0,poll=null,st='idle';
+
+// 版本缓存 — 纯前端状态，从事件流派生
+var versions = {claude: [], codex: []};
+var activeVer = {claude: -1, codex: -1}; // -1 = 跟随最新
+var executionResult = null;
+var showExecResult = false;
+
+function renderVersionedResult(agent) {
+  var bar = document.getElementById('ver_bar_' + agent);
+  var el = document.getElementById('result_' + agent);
+  if (!bar || !el) return;
+  var vers = versions[agent];
+  if (!vers.length && !(agent === 'claude' && executionResult != null)) {
+    bar.innerHTML = '';
+    el.innerHTML = '';
+    return;
+  }
+  var idx = activeVer[agent] < 0 ? vers.length - 1 : Math.min(activeVer[agent], vers.length - 1);
+  var tabs = '';
+  vers.forEach(function(ver, i) {
+    var cls = (!showExecResult || agent !== 'claude') && i === idx ? 'ver-tab active' : 'ver-tab';
+    tabs += '<button class="' + cls + '" data-ver-agent="' + agent + '" data-ver-idx="' + i + '">v' + (i+1) + ' (R' + ver.round + ')</button>';
+  });
+  if (agent === 'claude' && executionResult != null) {
+    tabs += '<button class="ver-tab vt-exec' + (showExecResult ? ' active' : '') + '" data-ver-agent="claude" data-ver-idx="-2">执行结果</button>';
+  }
+  bar.innerHTML = tabs;
+  if (agent === 'claude' && showExecResult && executionResult != null) {
+    el.innerHTML = '<span class="ok">── 执行结果 ──</span>\n' + esc(executionResult);
+  } else if (vers.length) {
+    var v = vers[idx];
+    el.innerHTML = '<span class="ok">── R' + v.round + ' ' + v.phase + ' ──</span>\n' + esc(v.content);
+  }
+  el.scrollTop = el.scrollHeight;
+}
+
+// 事件委托：版本标签点击
+document.addEventListener('click', function(e) {
+  var btn = e.target.closest('[data-ver-agent]');
+  if (!btn) return;
+  var agent = btn.dataset.verAgent;
+  var idx = parseInt(btn.dataset.verIdx);
+  if (idx === -2) {
+    showExecResult = true;
+  } else {
+    showExecResult = false;
+    activeVer[agent] = idx;
+  }
+  renderVersionedResult(agent);
+});
 
 async function api(m,u,b){
   const o={method:m,headers:{'Content-Type':'application/json'}};
@@ -1045,9 +1265,14 @@ async function doStart(){
   const u=new URL(location);u.searchParams.set('sid',sid);
   if(u.searchParams.has('project'))u.searchParams.delete('project');
   history.replaceState(null,'',u);
-  ['claude','codex'].forEach(a=>{
+  versions = {claude: [], codex: []};
+  activeVer = {claude: -1, codex: -1};
+  executionResult = null;
+  showExecResult = false;
+  ['claude','codex'].forEach(function(a){
     document.getElementById('log_'+a).innerHTML='';
     document.getElementById('result_'+a).innerHTML='';
+    document.getElementById('ver_bar_'+a).innerHTML='';
     switchTab(a,'log');
   });
   cursor=0; st='idle';
@@ -1114,35 +1339,39 @@ function handle(e){
       }
       break;
     case 'agent_result':
-      appendResult(e.data.agent, esc(e.data.text));
-      switchTab(e.data.agent,'result');
+      // 内容已通过 agent_chunk 写入日志区，agent_response 写入版本视图。
+      // 此事件是后端对完整结果的冗余重发，前端无需处理。
       break;
     case 'agent_response':{
-      const role=e.data.role;
+      var role=e.data.role;
       if(role==='user'){
         appendLog('claude','<span class="sys">[你] '+esc(e.data.content)+'</span>\n');
         appendLog('codex','<span class="sys">[你] '+esc(e.data.content)+'</span>\n');
         break;
       }
-      const ag=role==='claude'?'claude':'codex';
+      var ag=role==='claude'?'claude':'codex';
       appendLog(ag,'\n<span class="sys">── '+e.data.phase+' 完成 (R'+e.data.round+') ──</span>\n');
       if(e.data.content){
-        const rel=document.getElementById('result_'+ag);
-        if(rel) rel.innerHTML='<span class="ok">── R'+e.data.round+' '+e.data.phase+' ──</span>\n'+esc(e.data.content);
+        if(!versions[ag].some(function(v){return v.round===e.data.round;})){
+          versions[ag].push({round:e.data.round,phase:e.data.phase,content:e.data.content});
+        }
+        activeVer[ag]=-1;
+        showExecResult=false;
+        renderVersionedResult(ag);
       }
       switchTab(ag,'result');
       if(role==='claude'){
-        let h='\n<span class="sys">── Claude R'+e.data.round+' 方案已发送给 Codex ──</span>\n';
+        var h='\n<span class="sys">── Claude R'+e.data.round+' 方案已发送给 Codex ──</span>\n';
         if(e.data.content){
           h+='<details class="plan-preview"><summary>查看发送给 Codex 的方案内容</summary><div class="plan-body">'+esc(e.data.content)+'</div></details>';
         }
         appendLog('codex',h);
       }else if(role==='codex'){
-        let h='\n<span class="sys">── Codex R'+e.data.round+' 审查意见已发送给 Claude ──</span>\n';
+        var h2='\n<span class="sys">── Codex R'+e.data.round+' 审查意见已发送给 Claude ──</span>\n';
         if(e.data.content){
-          h+='<details class="plan-preview"><summary>查看发送给 Claude 的审查意见</summary><div class="plan-body">'+esc(e.data.content)+'</div></details>';
+          h2+='<details class="plan-preview"><summary>查看发送给 Claude 的审查意见</summary><div class="plan-body">'+esc(e.data.content)+'</div></details>';
         }
-        appendLog('claude',h);
+        appendLog('claude',h2);
       }
       break;
     }
@@ -1157,7 +1386,9 @@ function handle(e){
       break;
     case 'execution_done':
       appendLog('claude','\n<span class="ok">══════ 执行完成 ══════</span>\n');
-      appendResult('claude', esc(e.data.result));
+      executionResult=e.data.result;
+      showExecResult=true;
+      renderVersionedResult('claude');
       switchTab('claude','result');
       break;
     case 'error':
@@ -1168,10 +1399,12 @@ function handle(e){
       appendLog('claude','<span class="sys">\n⚠ '+esc(e.data.msg)+'</span>\n');
       break;
     case 'rollback':
-      if(e.data.plan){
-        const rc=document.getElementById('result_claude');
-        if(rc) rc.innerHTML='<span class="ok">── R'+e.data.round+' 方案 (已回退) ──</span>\n'+esc(e.data.plan);
-      }
+      versions.claude=versions.claude.filter(function(v){return v.round<=e.data.round;});
+      versions.codex=versions.codex.filter(function(v){return v.round<=e.data.round;});
+      activeVer.claude=-1;
+      activeVer.codex=-1;
+      renderVersionedResult('claude');
+      renderVersionedResult('codex');
       appendLog('claude','<span class="sys">\n⚠ '+esc(e.data.msg)+'</span>\n');
       appendLog('codex','<span class="sys">\n⚠ '+esc(e.data.msg)+'</span>\n');
       break;
@@ -1185,9 +1418,9 @@ function handle(e){
 }
 
 function switchTab(agent, tab){
-  document.querySelectorAll('.tab[data-agent="'+agent+'"]').forEach(t=>t.classList.toggle('active',t.dataset.tab===tab));
+  document.querySelectorAll('.tab[data-agent="'+agent+'"]').forEach(function(t){t.classList.toggle('active',t.dataset.tab===tab)});
   document.getElementById('log_'+agent).classList.toggle('active',tab==='log');
-  document.getElementById('result_'+agent).classList.toggle('active',tab==='result');
+  document.getElementById('result_'+agent+'_wrap').classList.toggle('active',tab==='result');
 }
 
 function appendLog(agent, html){
@@ -1197,12 +1430,6 @@ function appendLog(agent, html){
   el.scrollTop=el.scrollHeight;
 }
 
-function appendResult(agent, html){
-  const el=document.getElementById('result_'+agent);
-  if(!el)return;
-  el.insertAdjacentHTML('beforeend',html);
-  el.scrollTop=el.scrollHeight;
-}
 
 function updSt(s,r,m){
   document.getElementById('rinfo').textContent=s==='idle'?'':'R'+r+'/'+m;
@@ -1245,13 +1472,159 @@ async function saveCfg(){
   if(r.ok){closeCfg();}else{alert(r.error||'保存失败');}
 }
 
+// ── 路径自动补全 ──
+var acTimer=null;
+var inp_path=document.getElementById('inp_path');
+
+inp_path.addEventListener('input',function(){
+  clearTimeout(acTimer);
+  acTimer=setTimeout(doAutoComplete,200);
+});
+inp_path.addEventListener('focus',showRecentIfEmpty);
+inp_path.addEventListener('blur',function(){
+  setTimeout(function(){document.getElementById('pathDropdown').classList.remove('open');},200);
+});
+
+async function showRecentIfEmpty(){
+  if(inp_path.value.trim())return;
+  var r=await api('GET','/api/recent_paths');
+  var dd=document.getElementById('pathDropdown');
+  if(!r.paths||!r.paths.length){dd.classList.remove('open');return;}
+  var html='<div class="pd-section">最近使用</div>';
+  r.paths.forEach(function(p){
+    html+='<div class="pd-item" data-pick-path="'+escAttr(p)+'">'+esc(p)+'</div>';
+  });
+  dd.innerHTML=html;
+  dd.classList.add('open');
+}
+
+async function doAutoComplete(){
+  var prefix=inp_path.value.trim();
+  if(!prefix){showRecentIfEmpty();return;}
+  var r=await api('GET','/api/complete?prefix='+encodeURIComponent(prefix));
+  var dd=document.getElementById('pathDropdown');
+  if(!r.suggestions||!r.suggestions.length){dd.classList.remove('open');return;}
+  var html='';
+  r.suggestions.forEach(function(s){
+    html+='<div class="pd-item" data-pick-path="'+escAttr(s.path)+'">'+
+      esc(s.name)+(s.is_git?' <span class="pd-git">GIT</span>':'')+'</div>';
+  });
+  dd.innerHTML=html;
+  dd.classList.add('open');
+}
+
+document.getElementById('pathDropdown').addEventListener('mousedown',function(e){
+  var item=e.target.closest('[data-pick-path]');
+  if(!item)return;
+  e.preventDefault();
+  inp_path.value=item.dataset.pickPath;
+  document.getElementById('pathDropdown').classList.remove('open');
+});
+
+function escAttr(s){
+  return(s||'').replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+// ── 文件夹浏览器 ──
+var browseCurrent='';
+
+document.getElementById('btn_browse').addEventListener('click',function(){
+  document.getElementById('browseModal').classList.add('open');
+  browseDir(inp_path.value.trim()||'');
+});
+document.getElementById('browse_close').addEventListener('click',closeBrowse);
+document.getElementById('browse_cancel').addEventListener('click',closeBrowse);
+document.getElementById('browse_select').addEventListener('click',function(){
+  inp_path.value=browseCurrent;
+  closeBrowse();
+});
+document.getElementById('browse_go_btn').addEventListener('click',function(){
+  var p=document.getElementById('browse_path_input').value.trim();
+  if(p)browseDir(p);
+});
+document.getElementById('browse_path_input').addEventListener('keydown',function(e){
+  if(e.key==='Enter'){
+    var p=this.value.trim();
+    if(p)browseDir(p);
+  }
+});
+
+function closeBrowse(){
+  document.getElementById('browseModal').classList.remove('open');
+}
+
+async function browseDir(path){
+  var r=await api('GET','/api/browse?path='+encodeURIComponent(path));
+  if(r.error){alert(r.error);return;}
+  browseCurrent=r.current;
+  document.getElementById('browse_path_input').value=r.current;
+  document.getElementById('browse_current').textContent=
+    r.current+(r.is_git?'  (git repo)':'')+(r.truncated?'  [仅显示前200项]':'');
+  var html='';
+  if(r.parent){
+    html+='<div class="browse-item bi-parent" data-browse-path="'+escAttr(r.parent)+'" data-browse-action="navigate">'+
+      '<span class="bi-icon">⬆</span><span class="bi-name">..</span></div>';
+  }
+  r.dirs.forEach(function(d){
+    html+='<div class="browse-item" data-browse-path="'+escAttr(d.path)+'">'+
+      '<span class="bi-icon">📁</span><span class="bi-name">'+esc(d.name)+'</span>'+
+      (d.is_git?'<span class="bi-git">GIT</span>':'')+'</div>';
+  });
+  if(!r.dirs.length&&r.parent){
+    html+='<div style="padding:20px;text-align:center;color:var(--dim)">没有子文件夹</div>';
+  }
+  document.getElementById('browse_list').innerHTML=html;
+}
+
+(function(){
+  var list=document.getElementById('browse_list');
+  var clickTimer=null;
+  list.addEventListener('click',function(e){
+    var item=e.target.closest('[data-browse-path]');
+    if(!item)return;
+    var path=item.dataset.browsePath;
+    if(item.dataset.browseAction==='navigate'){browseDir(path);return;}
+    clearTimeout(clickTimer);
+    clickTimer=setTimeout(function(){
+      list.querySelectorAll('.browse-item.selected').forEach(function(el){el.classList.remove('selected');});
+      item.classList.add('selected');
+      browseCurrent=path;
+      document.getElementById('browse_current').textContent=path;
+    },200);
+  });
+  list.addEventListener('dblclick',function(e){
+    var item=e.target.closest('[data-browse-path]');
+    if(!item)return;
+    clearTimeout(clickTimer);
+    browseDir(item.dataset.browsePath);
+  });
+})();
+
 // ── 初始化：从 URL 恢复会话 ──
 (function(){
-  const p=new URLSearchParams(location.search);
+  var p=new URLSearchParams(location.search);
   if(p.get('project'))document.getElementById('inp_path').value=p.get('project');
   if(p.get('sid')){
     sid=p.get('sid');
     cursor=0; st='idle';
+    api('GET','/api/history?sid='+sid).then(function(r){
+      if(r.entries){
+        r.entries.forEach(function(h){
+          var ag=h.role;
+          if(!versions[ag].some(function(v){return v.round===h.round;})){
+            versions[ag].push({round:h.round,phase:h.phase,content:h.content});
+          }
+        });
+        ['claude','codex'].forEach(function(ag){
+          if(versions[ag].length){activeVer[ag]=-1;renderVersionedResult(ag);}
+        });
+      }
+      if(r.execution_result!=null){
+        executionResult=r.execution_result;
+        showExecResult=true;
+        renderVersionedResult('claude');
+      }
+    });
     poll=setInterval(pollEvt,300);
   }
 })();
