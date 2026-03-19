@@ -29,6 +29,23 @@ from datetime import datetime
 from pathlib import Path
 
 # ═════════════════════════════════════════════════════════════════
+# Prompt Configuration
+# ═════════════════════════════════════════════════════════════════
+PROMPTS_FILE = Path(__file__).parent / "prompts.json"
+
+def load_prompts():
+    """从 prompts.json 加载提示词配置。"""
+    if PROMPTS_FILE.exists():
+        return json.loads(PROMPTS_FILE.read_text(encoding="utf-8"))
+    return {}
+
+def save_prompts(data):
+    """保存提示词配置到 prompts.json。"""
+    PROMPTS_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+prompt_config = load_prompts()
+
+# ═════════════════════════════════════════════════════════════════
 # Global State
 # ═════════════════════════════════════════════════════════════════
 LOG_DIR = Path("/tmp/bridge-logs")
@@ -271,21 +288,9 @@ def detect_claude_md(cwd):
 def build_claude_first_prompt(task, cwd):
     """第 1 轮：Claude 初始方案。带 CLAUDE.md 上下文。"""
     claude_md = detect_claude_md(cwd)
-
-    return f"""{claude_md}
-
-请结合项目开发规范（如有 CLAUDE.md 请遵守）和以下核心三问来分析任务：
-1. 数据从哪里来？
-2. 数据到哪里去？
-3. 中间经历了什么变换？
-
-本项目仍处于开发阶段，没有历史用户数据。
-不要做最小可行修复，要从数据结构、设计架构、数据全生命周期等根本基础层面起步分析，从根因着手。
-
-## 任务
-{task}
-
-请输出你的方案，包含：问题根因分析、设计思路、详细实施步骤（具体到文件和改动）、风险点、验证方法。"""
+    tpl = prompt_config.get("claude_first", "## 任务\n{task}")
+    body = tpl.format(task=task)
+    return f"{claude_md}\n\n{body}"
 
 
 def collect_user_injects(history):
@@ -305,35 +310,19 @@ def build_claude_revise_prompt(codex_feedback, user_injects=None):
     inject_section = ""
     if user_injects:
         joined = "\n".join(f"- {m}" for m in user_injects)
-        inject_section = f"""
+        label = prompt_config.get("user_inject_label_claude", "用户补充的约束和意见（必须优先考虑）")
+        inject_section = f"\n\n## {label}\n{joined}"
 
-## 用户补充的约束和意见（必须优先考虑）
-{joined}"""
-
-    return f"""以上是你之前的方案（已在对话上下文中）。
-
-审查者给出了以下反馈，请认真思考每一条：
-1. 对每条反馈逐一回应：接纳 ✓ / 部分接纳 △ / 不接纳 ✗，说明理由
-2. 输出修订后的完整方案
-
-## 审查者反馈
-{codex_feedback}{inject_section}
-
-请修订方案。"""
+    tpl = prompt_config.get("claude_revise",
+        "以上是你之前的方案。\n\n## 审查者反馈\n{codex_feedback}{inject_section}\n\n请修订方案。")
+    return tpl.format(codex_feedback=codex_feedback, inject_section=inject_section)
 
 
 def build_codex_first_prompt(task, claude_plan):
     """第 1 轮：Codex 首次审查。传任务 + Claude 方案。"""
-    return f"""对于以下方案有什么看法？第一性原理阅读相关代码，不必逢迎讨好，实事求是分析，给出你的意见。
-
-如果方案已经足够好，没有需要修改的地方，以 APPROVED 开头回复并说明理由。
-否则逐条列出问题，标注严重程度：[严重] [中等] [建议]
-
-## 原始任务
-{task}
-
-## Claude 的方案
-{claude_plan}"""
+    tpl = prompt_config.get("codex_first",
+        "对于以下方案有什么看法？\n\n## 原始任务\n{task}\n\n## Claude 的方案\n{claude_plan}")
+    return tpl.format(task=task, claude_plan=claude_plan)
 
 
 def build_codex_review_prompt(claude_revision, user_injects=None):
@@ -341,26 +330,19 @@ def build_codex_review_prompt(claude_revision, user_injects=None):
     inject_section = ""
     if user_injects:
         joined = "\n".join(f"- {m}" for m in user_injects)
-        inject_section = f"""
+        label = prompt_config.get("user_inject_label_codex", "用户补充的约束和意见（审查时必须考虑）")
+        inject_section = f"\n\n## {label}\n{joined}"
 
-## 用户补充的约束和意见（审查时必须考虑）
-{joined}"""
-
-    return f"""Claude 针对你上一轮的反馈做了修订（见下方）。
-继续第一性原理审查，不必逢迎讨好，实事求是：修订是否真正解决了你提出的问题？有无新问题？
-
-如果方案已经足够好，以 APPROVED 开头回复。否则继续逐条列出问题。
-
-## Claude 的修订方案
-{claude_revision}{inject_section}"""
+    tpl = prompt_config.get("codex_review",
+        "Claude 修订了方案。\n\n## Claude 的修订方案\n{claude_revision}{inject_section}")
+    return tpl.format(claude_revision=claude_revision, inject_section=inject_section)
 
 
 def build_execution_prompt(task):
     """最终执行：续接 Claude 对话，方案已在上下文中。"""
-    return f"""以上方案已经过严格多轮审查并获得 APPROVED。
-请严格按照最终方案执行所有代码修改。完成后总结你执行的所有变更。
-
-原始任务: {task}"""
+    tpl = prompt_config.get("execution",
+        "以上方案已获得 APPROVED。请执行所有代码修改。\n\n原始任务: {task}")
+    return tpl.format(task=task)
 
 
 # ═════════════════════════════════════════════════════════════════
@@ -582,6 +564,8 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
                 "history_len": len(state["history"]),
                 "error": state["error"],
             })
+        elif p.path == "/api/prompts":
+            self._json(prompt_config)
         else:
             self.send_error(404)
 
@@ -617,6 +601,12 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
                     pass
             state["status"] = "idle"
             add_event("status_change", {"status": "stopped", "msg": "用户中止"})
+            self._json({"ok": True})
+        elif p.path == "/api/prompts":
+            global prompt_config
+            body = self._body()
+            prompt_config.update(body)
+            save_prompts(prompt_config)
             self._json({"ok": True})
         elif p.path == "/api/inject":
             body = self._body()
@@ -704,6 +694,27 @@ body{font-family:'SF Mono','Fira Code','Menlo',monospace;background:var(--bg);co
 .inject input::placeholder{color:var(--dim)}
 .btn-inj{background:var(--user);color:#000}
 
+/* ── 设置按钮 ── */
+.btn-cfg{background:transparent;color:var(--dim);border:1px solid var(--border);font-size:13px;padding:6px 10px}
+.btn-cfg:hover{color:var(--text);border-color:var(--text)}
+
+/* ── 设置弹窗 ── */
+.modal-mask{display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:100;justify-content:center;align-items:center}
+.modal-mask.open{display:flex}
+.modal{background:var(--surface);border:1px solid var(--border);border-radius:8px;width:760px;max-width:92vw;max-height:88vh;display:flex;flex-direction:column}
+.modal-hdr{display:flex;justify-content:space-between;align-items:center;padding:14px 18px;border-bottom:1px solid var(--border);font-family:-apple-system,sans-serif;font-weight:700;font-size:15px}
+.modal-hdr .close{cursor:pointer;color:var(--dim);font-size:20px;background:none;border:none}
+.modal-hdr .close:hover{color:var(--text)}
+.modal-body{flex:1;overflow-y:auto;padding:18px}
+.modal-body .cfg-field{margin-bottom:16px}
+.modal-body .cfg-field label{display:block;font-size:12px;color:var(--dim);font-weight:600;text-transform:uppercase;letter-spacing:.4px;margin-bottom:4px;font-family:-apple-system,sans-serif}
+.modal-body .cfg-field .cfg-hint{font-size:11px;color:var(--dim);margin-bottom:4px;font-family:-apple-system,sans-serif}
+.modal-body textarea{width:100%;background:var(--bg);border:1px solid var(--border);border-radius:4px;color:var(--text);padding:8px 10px;font-size:12px;font-family:inherit;outline:none;resize:vertical;min-height:90px;line-height:1.5}
+.modal-body textarea:focus{border-color:var(--claude)}
+.modal-foot{padding:12px 18px;border-top:1px solid var(--border);display:flex;justify-content:flex-end;gap:8px}
+.btn-save{background:var(--claude);color:#fff}
+.btn-cancel{background:var(--border);color:var(--text)}
+
 ::-webkit-scrollbar{width:5px}::-webkit-scrollbar-track{background:transparent}::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
 </style>
 </head>
@@ -717,6 +728,7 @@ body{font-family:'SF Mono','Fira Code','Menlo',monospace;background:var(--bg);co
   <button class="btn btn-go" id="btn_go" onclick="doStart()">▶ 开始</button>
   <button class="btn btn-stop" id="btn_stop" onclick="doStop()" disabled>⏹ 中止</button>
   <button class="btn btn-exec" id="btn_exec" onclick="doExec()" disabled>⚡ 执行</button>
+  <button class="btn btn-cfg" onclick="openCfg()">⚙ 提示词</button>
   <div class="status-bar">
     <span class="pill pill-idle" id="pill">IDLE</span>
     <span class="round-info" id="rinfo"></span>
@@ -739,6 +751,57 @@ body{font-family:'SF Mono','Fira Code','Menlo',monospace;background:var(--bg);co
 <div class="inject">
   <input type="text" id="inp_inject" placeholder="协商中插入你的意见..." onkeydown="if(event.key==='Enter')doInject()">
   <button class="btn btn-inj" onclick="doInject()">发送</button>
+</div>
+
+<!-- 提示词配置弹窗 -->
+<div class="modal-mask" id="cfgModal">
+  <div class="modal">
+    <div class="modal-hdr">
+      <span>提示词配置</span>
+      <button class="close" onclick="closeCfg()">&times;</button>
+    </div>
+    <div class="modal-body">
+      <div class="cfg-field">
+        <label>Claude 初始方案提示词</label>
+        <div class="cfg-hint">变量: {task} — 第1轮，Claude 根据此提示生成方案</div>
+        <textarea id="cfg_claude_first" rows="6"></textarea>
+      </div>
+      <div class="cfg-field">
+        <label>Claude 修订提示词</label>
+        <div class="cfg-hint">变量: {codex_feedback} {inject_section} — 第2+轮，Claude 根据反馈修订</div>
+        <textarea id="cfg_claude_revise" rows="6"></textarea>
+      </div>
+      <div class="cfg-field">
+        <label>Codex 首次审查提示词</label>
+        <div class="cfg-hint">变量: {task} {claude_plan} — 第1轮，Codex 审查方案</div>
+        <textarea id="cfg_codex_first" rows="6"></textarea>
+      </div>
+      <div class="cfg-field">
+        <label>Codex 继续审查提示词</label>
+        <div class="cfg-hint">变量: {claude_revision} {inject_section} — 第2+轮，Codex 继续审查</div>
+        <textarea id="cfg_codex_review" rows="6"></textarea>
+      </div>
+      <div class="cfg-field">
+        <label>执行提示词</label>
+        <div class="cfg-hint">变量: {task} — 达成共识后 Claude 执行方案</div>
+        <textarea id="cfg_execution" rows="4"></textarea>
+      </div>
+      <div class="cfg-field">
+        <label>用户干预标签 (Claude)</label>
+        <div class="cfg-hint">注入用户意见时在 Claude 提示中显示的标题</div>
+        <textarea id="cfg_user_inject_label_claude" rows="1"></textarea>
+      </div>
+      <div class="cfg-field">
+        <label>用户干预标签 (Codex)</label>
+        <div class="cfg-hint">注入用户意见时在 Codex 提示中显示的标题</div>
+        <textarea id="cfg_user_inject_label_codex" rows="1"></textarea>
+      </div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn btn-cancel" onclick="closeCfg()">取消</button>
+      <button class="btn btn-save" onclick="saveCfg()">保存</button>
+    </div>
+  </div>
 </div>
 
 <script>
@@ -859,6 +922,29 @@ function updSt(s,r,m){
 }
 
 function esc(s){return(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+
+// ── 提示词配置 ──
+const cfgKeys=['claude_first','claude_revise','codex_first','codex_review','execution','user_inject_label_claude','user_inject_label_codex'];
+
+async function openCfg(){
+  const data=await api('GET','/api/prompts');
+  cfgKeys.forEach(k=>{
+    const el=document.getElementById('cfg_'+k);
+    if(el)el.value=data[k]||'';
+  });
+  document.getElementById('cfgModal').classList.add('open');
+}
+function closeCfg(){document.getElementById('cfgModal').classList.remove('open');}
+
+async function saveCfg(){
+  const body={};
+  cfgKeys.forEach(k=>{
+    const el=document.getElementById('cfg_'+k);
+    if(el)body[k]=el.value;
+  });
+  const r=await api('POST','/api/prompts',body);
+  if(r.ok){closeCfg();}else{alert(r.error||'保存失败');}
+}
 
 (function(){const p=new URLSearchParams(location.search);if(p.get('project'))document.getElementById('inp_path').value=p.get('project');})();
 </script>
