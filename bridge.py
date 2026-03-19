@@ -103,6 +103,27 @@ def reset_state():
 _last_plan_mtime = 0  # 上次读到的 plan 文件修改时间
 
 
+def _stderr_reader(proc, agent, log_file, log_lock):
+    """后台线程：逐行读取 stderr，推送到过程日志，防止 pipe buffer 填满导致死锁。"""
+    MCP_NOISE = ("mcp:", "mcp_", "starting mcp", "mcp server", "mcp startup",
+                 "mcp client", "handshaking", "initialize response")
+    try:
+        for line in proc.stderr:
+            stripped = line.rstrip('\n')
+            if not stripped:
+                continue
+            with log_lock:
+                log_file.write(f"[stderr] {line}")
+                log_file.flush()
+            is_mcp = any(p in stripped.lower() for p in MCP_NOISE)
+            if is_mcp:
+                add_event("agent_stderr", {"agent": agent, "text": stripped, "is_mcp": True})
+            else:
+                add_event("agent_chunk", {"agent": agent, "text": stripped + "\n"})
+    except ValueError:
+        pass  # pipe closed
+
+
 def _read_latest_plan_file():
     """
     读取 ~/.claude/plans/ 下最新的 .md 文件。
@@ -168,6 +189,12 @@ def call_claude_streaming(prompt, cwd, continue_session=False,
             lf.write(header)
             lf.flush()
 
+            # 并发读取 stderr，防止 pipe buffer 填满导致死锁
+            log_lock = threading.Lock()
+            stderr_t = threading.Thread(
+                target=_stderr_reader, args=(proc, "claude", lf, log_lock), daemon=True)
+            stderr_t.start()
+
             for line in proc.stdout:
                 line = line.strip()
                 if not line:
@@ -187,8 +214,9 @@ def call_claude_streaming(prompt, cwd, continue_session=False,
                         chunk = delta.get("text", "")
                         if chunk:
                             stream_display.append(chunk)
-                            lf.write(chunk)
-                            lf.flush()
+                            with log_lock:
+                                lf.write(chunk)
+                                lf.flush()
                             add_event("agent_chunk", {"agent": "claude", "text": chunk})
 
                 # 最终结果：干净的方案文本，这才是传给 Codex 的内容
@@ -196,6 +224,7 @@ def call_claude_streaming(prompt, cwd, continue_session=False,
                     result_text = evt.get("result", "")
 
         proc.wait()
+        stderr_t.join(timeout=5)
         active_proc = None
 
         if stop_flag.is_set():
@@ -206,9 +235,12 @@ def call_claude_streaming(prompt, cwd, continue_session=False,
         output = plan_content or result_text or "".join(stream_display).strip()
 
         if not output:
-            stderr_out = proc.stderr.read().strip() if proc.stderr else ""
             if proc.returncode != 0:
-                raise RuntimeError(f"Claude CLI 错误 (code {proc.returncode}): {stderr_out[:500]}")
+                raise RuntimeError(f"Claude CLI 错误 (code {proc.returncode})")
+
+        # 推送最终结果到「结果」Tab
+        if output:
+            add_event("agent_result", {"agent": "claude", "text": output})
 
         return output
 
@@ -222,14 +254,17 @@ def call_claude_streaming(prompt, cwd, continue_session=False,
 
 def call_codex_streaming(prompt, cwd, resume_last=False, log_tag="codex"):
     """
-    调用 Codex CLI，实时逐行输出到日志文件。
-    codex exec 非交互模式本身就不写文件（无 TTY 则 approval 自动降级为 never）。
+    调用 Codex CLI (--json JSONL 模式)，实时解析事件流。
+    事件类型:
+      - item.completed + type=agent_message → AI 回复文本（过程 + 结果）
+      - item.started/completed + type=command_execution → 命令执行（过程日志）
+      - turn.completed → 轮次结束
     """
     cmd = ["codex"]
     if resume_last:
-        cmd.extend(["exec", "resume", "--last", prompt])
+        cmd.extend(["exec", "--json", "resume", "--last", prompt])
     else:
-        cmd.extend(["exec", prompt])
+        cmd.extend(["exec", "--json", prompt])
 
     global active_proc
     log_file = LOG_DIR / f"{log_tag}.log"
@@ -242,27 +277,76 @@ def call_codex_streaming(prompt, cwd, resume_last=False, log_tag="codex"):
         )
         active_proc = proc
 
-        lines = []
+        agent_messages = []  # 收集所有 agent_message 文本
         with open(log_file, "a", encoding="utf-8") as lf:
             header = f"\n{'═'*60}\n[Round {state['current_round']}] Codex — {datetime.now().strftime('%H:%M:%S')}\n{'═'*60}\n"
             lf.write(header)
             lf.flush()
 
+            # 并发读取 stderr，防止 pipe buffer 填满导致死锁
+            log_lock = threading.Lock()
+            stderr_t = threading.Thread(
+                target=_stderr_reader, args=(proc, "codex", lf, log_lock), daemon=True)
+            stderr_t.start()
+
             for line in proc.stdout:
-                lf.write(line)
-                lf.flush()
-                lines.append(line)
-                add_event("agent_chunk", {"agent": "codex", "text": line})
+                raw = line.strip()
+                if not raw:
+                    continue
+                with log_lock:
+                    lf.write(line)
+                    lf.flush()
+
+                try:
+                    evt = json.loads(raw)
+                except json.JSONDecodeError:
+                    # 非 JSON 行直接作为过程日志
+                    add_event("agent_chunk", {"agent": "codex", "text": line})
+                    continue
+
+                etype = evt.get("type", "")
+                item = evt.get("item", {})
+                item_type = item.get("type", "")
+
+                if etype == "item.completed" and item_type == "agent_message":
+                    # AI 回复文本 — 既显示在过程日志，也收集为结果
+                    text = item.get("text", "")
+                    if text:
+                        agent_messages.append(text)
+                        add_event("agent_chunk", {"agent": "codex", "text": text + "\n"})
+
+                elif etype == "item.started" and item_type == "command_execution":
+                    # 命令开始执行 — 过程日志
+                    cmd_str = item.get("command", "")
+                    if cmd_str:
+                        add_event("agent_chunk", {"agent": "codex", "text": f"$ {cmd_str}\n"})
+
+                elif etype == "item.completed" and item_type == "command_execution":
+                    # 命令执行完成 — 过程日志显示输出
+                    output = item.get("aggregated_output", "")
+                    if output:
+                        # 截断过长的命令输出
+                        display = output if len(output) <= 2000 else output[:2000] + "\n...(truncated)\n"
+                        add_event("agent_chunk", {"agent": "codex", "text": display})
 
         proc.wait()
+        stderr_t.join(timeout=5)
         active_proc = None
-        output = "".join(lines).strip()
+
+        # 最终结果 = 最后一条 agent_message（通常是结论/审查意见）
+        result_text = agent_messages[-1] if agent_messages else ""
+        output = result_text
 
         if stop_flag.is_set():
             return output or "(已中止)"
 
         if proc.returncode != 0 and not output:
             raise RuntimeError(f"Codex CLI 错误 (code {proc.returncode})")
+
+        # 推送最终结果到「结果」Tab
+        if output:
+            add_event("agent_result", {"agent": "codex", "text": output})
+
         return output
 
     except FileNotFoundError:
@@ -682,6 +766,13 @@ body{font-family:'SF Mono','Fira Code','Menlo',monospace;background:var(--bg);co
 .panel-head{background:var(--surface);padding:8px 14px;font-size:13px;font-weight:700;border-bottom:1px solid var(--border);flex-shrink:0;display:flex;align-items:center;gap:8px;font-family:-apple-system,sans-serif}
 .panel-head .dot{width:10px;height:10px;border-radius:50%}
 .dot-claude{background:var(--claude)} .dot-codex{background:var(--codex)}
+.tab-group{margin-left:auto;display:flex;gap:2px}
+.tab{background:transparent;border:1px solid var(--border);border-radius:4px;color:var(--dim);padding:2px 10px;font-size:11px;cursor:pointer;font-family:-apple-system,sans-serif;font-weight:600}
+.tab.active{background:var(--border);color:var(--text)}
+.tab-body{flex:1;position:relative;overflow:hidden}
+.tab-pane{position:absolute;inset:0;overflow-y:auto;padding:12px 14px;font-size:13px;line-height:1.6;white-space:pre-wrap;word-wrap:break-word;color:#c9d1d9;display:none}
+.tab-pane.active{display:block}
+.mcp-line{color:#484f58;font-size:11px}
 .term{flex:1;overflow-y:auto;padding:12px 14px;font-size:13px;line-height:1.6;white-space:pre-wrap;word-wrap:break-word;color:#c9d1d9}
 .term .sys{color:var(--dim);font-style:italic}
 .term .err{color:var(--danger)}
@@ -738,12 +829,30 @@ body{font-family:'SF Mono','Fira Code','Menlo',monospace;background:var(--bg);co
 <!-- 双终端面板 -->
 <div class="panels">
   <div class="panel">
-    <div class="panel-head"><span class="dot dot-claude"></span> Claude Code</div>
-    <div class="term" id="term_claude"></div>
+    <div class="panel-head">
+      <span class="dot dot-claude"></span> Claude Code
+      <div class="tab-group">
+        <button class="tab active" data-agent="claude" data-tab="log" onclick="switchTab('claude','log')">过程</button>
+        <button class="tab" data-agent="claude" data-tab="result" onclick="switchTab('claude','result')">结果</button>
+      </div>
+    </div>
+    <div class="tab-body">
+      <div class="term tab-pane active" id="log_claude"></div>
+      <div class="term tab-pane" id="result_claude"></div>
+    </div>
   </div>
   <div class="panel">
-    <div class="panel-head"><span class="dot dot-codex"></span> Codex</div>
-    <div class="term" id="term_codex"></div>
+    <div class="panel-head">
+      <span class="dot dot-codex"></span> Codex
+      <div class="tab-group">
+        <button class="tab active" data-agent="codex" data-tab="log" onclick="switchTab('codex','log')">过程</button>
+        <button class="tab" data-agent="codex" data-tab="result" onclick="switchTab('codex','result')">结果</button>
+      </div>
+    </div>
+    <div class="tab-body">
+      <div class="term tab-pane active" id="log_codex"></div>
+      <div class="term tab-pane" id="result_codex"></div>
+    </div>
   </div>
 </div>
 
@@ -820,8 +929,11 @@ async function doStart(){
   if(!path||!task){alert('请填写项目路径和任务描述');return;}
   const r=await api('POST','/api/start',{project_path:path,task,max_rounds:rounds});
   if(r.error){alert(r.error);return;}
-  document.getElementById('term_claude').innerHTML='';
-  document.getElementById('term_codex').innerHTML='';
+  ['claude','codex'].forEach(a=>{
+    document.getElementById('log_'+a).innerHTML='';
+    document.getElementById('result_'+a).innerHTML='';
+    switchTab(a,'log');
+  });
   cursor=0;
   if(poll)clearInterval(poll);
   poll=setInterval(pollEvt,300);
@@ -836,8 +948,8 @@ async function doInject(){
   if(!i.value.trim())return;
   await api('POST','/api/inject',{message:i.value.trim()});
   // Show in both panels
-  appendTerm('claude','<span class="sys">[你] '+esc(i.value.trim())+'</span>\n');
-  appendTerm('codex','<span class="sys">[你] '+esc(i.value.trim())+'</span>\n');
+  appendLog('claude','<span class="sys">[你] '+esc(i.value.trim())+'</span>\n');
+  appendLog('codex','<span class="sys">[你] '+esc(i.value.trim())+'</span>\n');
   i.value='';
 }
 
@@ -856,54 +968,84 @@ function handle(e){
   switch(e.type){
     case 'round_start':
       const hdr='\n══════ 第 '+e.data.round+' / '+e.data.max+' 轮 ══════\n';
-      appendTerm('claude','<span class="sys">'+hdr+'</span>');
-      appendTerm('codex','<span class="sys">'+hdr+'</span>');
+      appendLog('claude','<span class="sys">'+hdr+'</span>');
+      appendLog('codex','<span class="sys">'+hdr+'</span>');
       break;
     case 'agent_thinking':
       const who=e.data.agent;
-      appendTerm(who,'<span class="sys">'+(who==='claude'?'[Claude 分析中...]':'[Codex 审查中...]')+'</span>\n');
+      switchTab(who,'log');
+      appendLog(who,'<span class="sys">'+(who==='claude'?'[Claude 分析中...]':'[Codex 审查中...]')+'</span>\n');
       break;
     case 'agent_chunk':
-      appendTerm(e.data.agent, esc(e.data.text));
+      appendLog(e.data.agent, esc(e.data.text));
+      break;
+    case 'agent_stderr':
+      if(e.data.is_mcp){
+        appendLog(e.data.agent,'<span class="mcp-line">[MCP] '+esc(e.data.text)+'</span>\n');
+      }
+      break;
+    case 'agent_result':
+      appendResult(e.data.agent, esc(e.data.text));
+      switchTab(e.data.agent,'result');
       break;
     case 'agent_response':
-      // 最终结果：在对应面板追加分隔线
       const ag=e.data.role==='claude'?'claude':'codex';
-      appendTerm(ag,'\n<span class="sys">── '+e.data.phase+' 完成 (R'+e.data.round+') ──</span>\n');
-      // 如果是 result 事件的干净文本，在对面面板显示摘要
+      appendLog(ag,'\n<span class="sys">── '+e.data.phase+' 完成 (R'+e.data.round+') ──</span>\n');
+      // 结果 Tab 覆盖为最终权威内容
+      if(e.data.content){
+        const rel=document.getElementById('result_'+ag);
+        if(rel) rel.innerHTML='<span class="ok">── R'+e.data.round+' '+e.data.phase+' ──</span>\n'+esc(e.data.content);
+      }
+      switchTab(ag,'result');
+      // 在对面面板的过程日志显示通知
       if(e.data.role==='claude'){
-        appendTerm('codex','\n<span class="sys">── Claude R'+e.data.round+' 方案已发送给 Codex ──</span>\n');
+        appendLog('codex','\n<span class="sys">── Claude R'+e.data.round+' 方案已发送给 Codex ──</span>\n');
       }else{
-        appendTerm('claude','\n<span class="sys">── Codex R'+e.data.round+' 审查意见已发送给 Claude ──</span>\n');
+        appendLog('claude','\n<span class="sys">── Codex R'+e.data.round+' 审查意见已发送给 Claude ──</span>\n');
       }
       break;
     case 'consensus_reached':
       const ok='\n✓ '+e.data.msg+'\n';
-      appendTerm('claude','<span class="ok">'+ok+'</span>');
-      appendTerm('codex','<span class="ok">'+ok+'</span>');
+      appendLog('claude','<span class="ok">'+ok+'</span>');
+      appendLog('codex','<span class="ok">'+ok+'</span>');
       break;
     case 'max_rounds_reached':
-      appendTerm('claude','<span class="sys">\n⚠ '+e.data.msg+'</span>\n');
-      appendTerm('codex','<span class="sys">\n⚠ '+e.data.msg+'</span>\n');
+      appendLog('claude','<span class="sys">\n⚠ '+e.data.msg+'</span>\n');
+      appendLog('codex','<span class="sys">\n⚠ '+e.data.msg+'</span>\n');
       break;
     case 'execution_done':
-      appendTerm('claude','\n<span class="ok">══════ 执行完成 ══════</span>\n'+esc(e.data.result)+'\n');
+      appendLog('claude','\n<span class="ok">══════ 执行完成 ══════</span>\n');
+      appendResult('claude', esc(e.data.result));
+      switchTab('claude','result');
       break;
     case 'error':
-      appendTerm('claude','<span class="err">\n❌ '+esc(e.data.msg)+'</span>\n');
-      appendTerm('codex','<span class="err">\n❌ '+esc(e.data.msg)+'</span>\n');
+      appendLog('claude','<span class="err">\n❌ '+esc(e.data.msg)+'</span>\n');
+      appendLog('codex','<span class="err">\n❌ '+esc(e.data.msg)+'</span>\n');
       break;
     case 'status_change':
       if(e.data.status==='stopped'){
-        appendTerm('claude','<span class="sys">\n⏹ 已中止</span>\n');
-        appendTerm('codex','<span class="sys">\n⏹ 已中止</span>\n');
+        appendLog('claude','<span class="sys">\n⏹ 已中止</span>\n');
+        appendLog('codex','<span class="sys">\n⏹ 已中止</span>\n');
       }
       break;
   }
 }
 
-function appendTerm(agent, html){
-  const el=document.getElementById('term_'+agent);
+function switchTab(agent, tab){
+  document.querySelectorAll('.tab[data-agent="'+agent+'"]').forEach(t=>t.classList.toggle('active',t.dataset.tab===tab));
+  document.getElementById('log_'+agent).classList.toggle('active',tab==='log');
+  document.getElementById('result_'+agent).classList.toggle('active',tab==='result');
+}
+
+function appendLog(agent, html){
+  const el=document.getElementById('log_'+agent);
+  if(!el)return;
+  el.innerHTML+=html;
+  el.scrollTop=el.scrollHeight;
+}
+
+function appendResult(agent, html){
+  const el=document.getElementById('result_'+agent);
   if(!el)return;
   el.innerHTML+=html;
   el.scrollTop=el.scrollHeight;

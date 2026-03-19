@@ -30,6 +30,7 @@ Claude 出方案，Codex 审查挑刺，Claude 思考反馈后修订，循环直
 
 ```
 ├── bridge.py                  # 核心程序（编排引擎 + Web UI + HTTP Server）
+├── prompts.json               # 可编辑的提示词模板
 ├── 一键启动Bridge.command       # macOS 双击启动脚本
 └── README.md
 ```
@@ -40,15 +41,33 @@ Claude 出方案，Codex 审查挑刺，Claude 思考反馈后修订，循环直
 
 两个 CLI 各自维持独立的对话会话：
 - Claude：首次 `claude -p`，后续 `claude -c -p`（-c = continue）
-- Codex：首次 `codex exec`，后续 `codex exec resume --last`
+- Codex：首次 `codex exec --json`，后续 `codex exec --json resume --last`
 
 每轮只传对方最新回复，不重复灌历史。
+
+### 双 Tab 面板
+
+每个面板（Claude / Codex）提供「过程」和「结果」两个 Tab：
+- **过程 Tab**：实时流式显示分析思考过程、命令执行、stderr 输出
+- **结果 Tab**：显示最终干净的计划文档（Claude）或审查结论（Codex）
+
+Tab 自动切换：分析开始时切到「过程」，出结果时切到「结果」，也可手动点击切换。
+
+### 结构化输出
+
+- Claude Code 使用 `--output-format stream-json` 输出 NDJSON 事件流，从中提取 `text_delta`（过程）和 `result`（结果）
+- Codex 使用 `--json` 输出 JSONL 事件流，解析 `item.completed` (agent_message / command_execution) 等事件
+
+### stderr 并发读取
+
+两个 CLI 的 stderr 由独立后台线程实时读取，解决了 pipe buffer 填满导致子进程死锁的问题。MCP 启动噪音（如 `mcp: MCP_DOCKER starting...`）会被识别并以暗淡样式显示在过程 Tab 中。
 
 ### 提示词
 
 - Claude 首轮自动读取项目中的 `CLAUDE.md`，按「核心三问」分析（数据从哪来、到哪去、中间经历什么）
 - Codex 审查：第一性原理阅读代码，不逢迎讨好，实事求是
 - 从根因着手，不做最小可行修复
+- 提示词可通过 UI 的「提示词」按钮实时编辑，保存到 `prompts.json`
 
 ### 人工干预
 
@@ -57,10 +76,6 @@ Claude 出方案，Codex 审查挑刺，Claude 思考反馈后修订，循环直
 ### 执行
 
 Codex 回复 APPROVED 后，点「执行」，Claude 在同一会话中用 `--dangerously-skip-permissions` 执行方案。
-
-### 实时输出
-
-CLI 输出逐行流式显示在浏览器中。也可用 `--tmux` 模式在终端双窗格查看原始输出。
 
 ## 启动方式
 
