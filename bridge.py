@@ -21,13 +21,23 @@ import threading
 import subprocess
 import sys
 import os
-import re
 import argparse
 import urllib.parse
 import shutil
 import uuid
 from datetime import datetime
 from pathlib import Path
+
+from bridge.protocol import (
+    EXECUTABLE_STATES, FIXABLE_STATES, CONTINUABLE_STATES,
+    is_approved,
+)
+from bridge.session import (
+    LOG_DIR, SessionState, sessions, sessions_lock,
+    get_session, add_event, add_history_event,
+)
+from bridge.adapters.claude_adapter import ClaudeCodeAdapter
+from bridge.adapters.codex_adapter import CodexAdapter
 
 # ═════════════════════════════════════════════════════════════════
 # Prompt Configuration (全局共享)
@@ -62,378 +72,71 @@ prompt_config = load_prompts()
 STREAM_DEBUG = os.environ.get("BRIDGE_DEBUG_STREAM") == "1"
 
 # ═════════════════════════════════════════════════════════════════
-# Session State — 每个协商会话独立
+# Plan 文件并发锁 — per-project 锁注册表
 # ═════════════════════════════════════════════════════════════════
-LOG_DIR = Path("/tmp/bridge-logs")
-
-sessions = {}           # session_id → SessionState
-sessions_lock = threading.Lock()
-plan_file_lock = threading.Lock()   # 序列化 plan-mode Claude 调用（单 Bridge 进程内）
+plan_file_locks = {}    # project_path → Lock（单 Bridge 进程内）
+plan_file_locks_lock = threading.Lock()
+PLAN_LOCK_ACQUIRE_TIMEOUT = 0.1
 
 
-class SessionState:
-    def __init__(self, session_id, task, project_path, max_rounds):
-        self.session_id = session_id
-        self.task = task
-        self.project_path = project_path
-        self.max_rounds = max_rounds
-        self.status = "running"
-        self.current_round = 0
-        self.history = []
-        self.consensus = False
-        self.consensus_round = 0
-        self.execution_result = None
-        self.error = None
-        # 事件流（每会话独立）
-        self.events = []
-        self.event_lock = threading.Lock()
-        # 进程控制
-        self.stop_flag = threading.Event()
-        self.claude_has_session = False
-        self.claude_session_id = str(uuid.uuid4())   # 创建时生成，全程绑定
-        self.status_lock = threading.Lock()           # 状态转换专用锁
-        self.codex_has_session = False
-        self.active_proc = None
-        # 日志目录（每会话独立）
-        self.log_dir = LOG_DIR / session_id
-        self.log_dir.mkdir(parents=True, exist_ok=True)
-        # 执行后审查（Issue 4）
-        self.review_round = 0
-        self.max_review_rounds = 3
-        self.review_history = []
-        self.exec_baseline_ref = None
-        self.exec_baseline_untracked = set()
-        self.is_git_repo = False
+def _get_plan_file_lock(project_path):
+    """返回 project_path 对应的 plan 检测锁。"""
+    with plan_file_locks_lock:
+        lock = plan_file_locks.get(project_path)
+        if lock is None:
+            lock = threading.Lock()
+            plan_file_locks[project_path] = lock
+        return lock
 
 
-def get_session(sid):
-    """按 session_id 查找会话，不存在返回 None。"""
-    with sessions_lock:
-        return sessions.get(sid)
+def _acquire_plan_file_lock(project_path, stop_flag):
+    """按 project_path 获取 plan 锁；等待期间可被 stop_flag 中断。"""
+    lock = _get_plan_file_lock(project_path)
+    while True:
+        if lock.acquire(timeout=PLAN_LOCK_ACQUIRE_TIMEOUT):
+            return lock
+        if stop_flag.is_set():
+            return None
 
-
-def add_event(sess, etype, data):
-    with sess.event_lock:
-        sess.events.append({
-            "id": len(sess.events), "type": etype,
-            "data": data, "ts": datetime.now().isoformat(),
-        })
-
-
-def add_history_event(sess, history_list, entry, event_type):
-    """原子地追加历史记录并发送事件（统一快照锁）。"""
-    with sess.event_lock:
-        history_list.append(entry)
-        sess.events.append({
-            "id": len(sess.events), "type": event_type,
-            "data": entry, "ts": datetime.now().isoformat(),
-        })
 
 
 # ═════════════════════════════════════════════════════════════════
-# Plan 文件可靠关联 — 快照差集
+# Plan 文件可靠关联 — 实现在 bridge/plan.py
 # ═════════════════════════════════════════════════════════════════
-def _snapshot_plan_files():
-    """快照 ~/.claude/plans/ 下所有 .md 文件，返回 {path: mtime}。"""
-    plans_dir = Path.home() / ".claude" / "plans"
-    if not plans_dir.exists():
-        return {}
-    return {p: p.stat().st_mtime for p in plans_dir.glob("*.md")}
-
-
-def _find_new_plan_file(before_snapshot):
-    """对比快照，找到新增或修改的 plan 文件内容。"""
-    after = _snapshot_plan_files()
-    new_files = []
-    for path, mtime in after.items():
-        if path not in before_snapshot or mtime > before_snapshot[path]:
-            new_files.append(path)
-    if not new_files:
-        return ""
-    newest = max(new_files, key=lambda p: p.stat().st_mtime)
-    try:
-        return newest.read_text(encoding="utf-8").strip()
-    except Exception:
-        return ""
-
-
-def _validate_plan_relevance(plan_content, task):
-    """检查 plan 内容是否与当前任务存在关键词关联。
-    防御外部 Claude 进程在持锁期间写入无关 plan 文件的边缘情况。
-    保护边界：关键词匹配是启发式的，不是完美隔离。
-    """
-    if not plan_content or not task:
-        return True  # 无内容或无任务时不拦截
-    # 取任务中的关键词（长度 >= 2 的中文/英文 token）
-    tokens = re.findall(r'[\u4e00-\u9fff]{2,}|[a-zA-Z_]\w{2,}', task)
-    if not tokens:
-        return True  # 无法提取关键词时不拦截
-    # 至少有一个关键词出现在 plan 内容中
-    return any(t in plan_content for t in tokens)
+import bridge.plan
 
 
 # ═════════════════════════════════════════════════════════════════
-# CLI Wrappers — 流式输出，逐行写日志
+# Adapter 单例 — CLI 封装已迁入 bridge/adapters/
 # ═════════════════════════════════════════════════════════════════
-def _stderr_reader(proc, agent, log_file, log_lock, sess):
-    """后台线程：逐行读取 stderr，推送到过程日志，防止 pipe buffer 填满导致死锁。"""
-    MCP_NOISE = ("mcp:", "mcp_", "starting mcp", "mcp server", "mcp startup",
-                 "mcp client", "handshaking", "initialize response")
-    try:
-        for line in proc.stderr:
-            stripped = line.rstrip('\n')
-            if not stripped:
-                continue
-            with log_lock:
-                log_file.write(f"[stderr] {line}")
-                log_file.flush()
-            is_mcp = any(p in stripped.lower() for p in MCP_NOISE)
-            if is_mcp:
-                add_event(sess, "agent_stderr", {"agent": agent, "text": stripped, "is_mcp": True})
-            else:
-                add_event(sess, "agent_chunk", {"agent": agent, "text": stripped + "\n"})
-    except ValueError:
-        pass  # pipe closed
+_claude_adapter = ClaudeCodeAdapter(
+    plan_lock_acquire_fn=_acquire_plan_file_lock,
+)
+_codex_adapter = CodexAdapter()
 
 
+# ═════════════════════════════════════════════════════════════════
+# CLI Wrappers — 薄委托到 adapter 实例（签名不变，保证向后兼容）
+# ═════════════════════════════════════════════════════════════════
 def call_claude_streaming(prompt, cwd, sess, continue_session=False,
                           bypass_permissions=False, log_tag="claude",
                           skip_plan_detection=False):
-    """
-    调用 Claude Code CLI，用 stream-json 逐 token 流式输出。
-    协商阶段: --permission-mode plan / 执行阶段: --dangerously-skip-permissions
-    会话绑定: --session-id (首次) / --resume (续接)，替代不可靠的 -c
-    """
-    cmd = ["claude"]
-    if continue_session:
-        cmd.extend(["--resume", sess.claude_session_id])
-    else:
-        cmd.extend(["--session-id", sess.claude_session_id])
-    cmd.extend(["-p", "--verbose", "--output-format", "stream-json", "--include-partial-messages"])
-    if bypass_permissions:
-        cmd.append("--dangerously-skip-permissions")
-    else:
-        cmd.extend(["--permission-mode", "plan"])
-    cmd.append(prompt)
-
-    log_file = sess.log_dir / f"{log_tag}.log"
-    add_event(sess, "cli_start", {"agent": "claude", "round": sess.current_round})
-
-    # plan_file_lock 序列化 plan-mode Claude 调用（单 Bridge 进程内），
-    # 保证快照差集结果归属当前会话。不保护外部 Claude 进程。
-    lock = plan_file_lock if not skip_plan_detection else None
-    if lock:
-        lock.acquire()
-    try:
-        # 拿到锁后立即检查 stop_flag，防止等锁期间已被中止的会话继续启动
-        if sess.stop_flag.is_set():
-            return "(已中止)"
-
-        # Plan 文件快照（Popen 前）
-        plan_snapshot = _snapshot_plan_files() if not skip_plan_detection else None
-
-        proc = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, cwd=cwd, bufsize=1,
-            env={**os.environ, "CLAUDE_CODE_DISABLE_NONINTERACTIVE_WARNING": "1"},
-        )
-        sess.active_proc = proc
-
-        stream_display = []
-        result_text = ""
-
-        with open(log_file, "a", encoding="utf-8") as lf:
-            header = f"\n{'═'*60}\n[Round {sess.current_round}] Claude — {datetime.now().strftime('%H:%M:%S')}\n{'═'*60}\n"
-            lf.write(header)
-            lf.flush()
-
-            log_lock = threading.Lock()
-            stderr_t = threading.Thread(
-                target=_stderr_reader, args=(proc, "claude", lf, log_lock, sess), daemon=True)
-            stderr_t.start()
-
-            for line in proc.stdout:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    evt = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-
-                etype = evt.get("type", "")
-
-                if etype == "stream_event":
-                    inner = evt.get("event", {})
-                    inner_type = inner.get("type", "")
-                    delta = inner.get("delta", {})
-                    if delta.get("type") == "text_delta":
-                        chunk = delta.get("text", "")
-                        if chunk:
-                            stream_display.append(chunk)
-                            with log_lock:
-                                lf.write(chunk)
-                                lf.flush()
-                            add_event(sess, "agent_chunk", {"agent": "claude", "text": chunk})
-                    elif inner_type == "content_block_stop":
-                        # 只有当 stream_display 末尾不是换行时才追加，防止连续空行
-                        if stream_display and not stream_display[-1].endswith("\n"):
-                            stream_display.append("\n")
-                            with log_lock:
-                                lf.write("\n")
-                                lf.flush()
-                            add_event(sess, "agent_chunk", {"agent": "claude", "text": "\n"})
-                    else:
-                        # 受控调试采样：记录未识别事件供后续分析
-                        if STREAM_DEBUG:
-                            _sc = getattr(sess, '_sample_counts', None)
-                            if _sc is None:
-                                _sc = {}
-                                sess._sample_counts = _sc
-                            ek = inner_type or etype
-                            cnt = _sc.get(ek, 0)
-                            if cnt < 5:
-                                _sc[ek] = cnt + 1
-                                sample = json.dumps(evt, ensure_ascii=False)[:500]
-                                with log_lock:
-                                    lf.write(f"[SAMPLE] {sample}\n")
-                                    lf.flush()
-
-                elif etype == "result":
-                    result_text = evt.get("result", "")
-
-        proc.wait()
-        stderr_t.join(timeout=5)
-        sess.active_proc = None
-
-        if sess.stop_flag.is_set():
-            return result_text or "".join(stream_display).strip() or "(已中止)"
-
-        # 输出优先级 + 内容关联校验
-        if not skip_plan_detection and plan_snapshot is not None:
-            plan_content = _find_new_plan_file(plan_snapshot)
-            if plan_content and _validate_plan_relevance(plan_content, sess.task):
-                output = plan_content
-            else:
-                if plan_content:
-                    add_event(sess, "warning", {
-                        "msg": "检测到 plan 文件内容与当前任务不相关，已忽略（可能来自外部 Claude 进程）"
-                    })
-                output = result_text or "".join(stream_display).strip()
-        else:
-            output = result_text or "".join(stream_display).strip()
-
-        if not output:
-            if proc.returncode != 0:
-                raise RuntimeError(f"Claude CLI 错误 (code {proc.returncode})")
-
-        if output:
-            add_event(sess, "agent_result", {"agent": "claude", "text": output})
-
-        return output
-
-    except FileNotFoundError:
-        raise RuntimeError("未找到 'claude' 命令。请安装: npm install -g @anthropic-ai/claude-code")
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        sess.active_proc = None
-        raise RuntimeError("Claude CLI 超时")
-    finally:
-        if lock:
-            lock.release()
+    """调用 Claude Code CLI — 委托到 ClaudeCodeAdapter.run()。"""
+    return _claude_adapter.run(
+        prompt, cwd, sess, log_tag=log_tag,
+        continue_session=continue_session,
+        bypass_permissions=bypass_permissions,
+        session_id=sess.claude_session_id,
+        skip_plan_detection=skip_plan_detection,
+    )
 
 
 def call_codex_streaming(prompt, cwd, sess, resume_last=False, log_tag="codex"):
-    """
-    调用 Codex CLI (--json JSONL 模式)，实时解析事件流。
-    """
-    cmd = ["codex"]
-    if resume_last:
-        cmd.extend(["exec", "--json", "resume", "--last", prompt])
-    else:
-        cmd.extend(["exec", "--json", prompt])
-
-    log_file = sess.log_dir / f"{log_tag}.log"
-    add_event(sess, "cli_start", {"agent": "codex", "round": sess.current_round})
-
-    try:
-        proc = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, cwd=cwd, bufsize=1,
-        )
-        sess.active_proc = proc
-
-        agent_messages = []
-        with open(log_file, "a", encoding="utf-8") as lf:
-            header = f"\n{'═'*60}\n[Round {sess.current_round}] Codex — {datetime.now().strftime('%H:%M:%S')}\n{'═'*60}\n"
-            lf.write(header)
-            lf.flush()
-
-            log_lock = threading.Lock()
-            stderr_t = threading.Thread(
-                target=_stderr_reader, args=(proc, "codex", lf, log_lock, sess), daemon=True)
-            stderr_t.start()
-
-            for line in proc.stdout:
-                raw = line.strip()
-                if not raw:
-                    continue
-                with log_lock:
-                    lf.write(line)
-                    lf.flush()
-
-                try:
-                    evt = json.loads(raw)
-                except json.JSONDecodeError:
-                    add_event(sess, "agent_chunk", {"agent": "codex", "text": line})
-                    continue
-
-                etype = evt.get("type", "")
-                item = evt.get("item", {})
-                item_type = item.get("type", "")
-
-                if etype == "item.completed" and item_type == "agent_message":
-                    text = item.get("text", "")
-                    if text:
-                        agent_messages.append(text)
-                        add_event(sess, "agent_chunk", {"agent": "codex", "text": text + "\n"})
-
-                elif etype == "item.started" and item_type == "command_execution":
-                    cmd_str = item.get("command", "")
-                    if cmd_str:
-                        add_event(sess, "agent_chunk", {"agent": "codex", "text": f"$ {cmd_str}\n", "chunk_type": "command"})
-
-                elif etype == "item.completed" and item_type == "command_execution":
-                    cmd_output = item.get("aggregated_output", "")
-                    if cmd_output:
-                        display = cmd_output if len(cmd_output) <= 2000 else cmd_output[:2000] + "\n...(truncated)\n"
-                        add_event(sess, "agent_chunk", {"agent": "codex", "text": display, "chunk_type": "command_output"})
-                        add_event(sess, "chunk_boundary", {"agent": "codex", "boundary_type": "command_output"})
-
-        proc.wait()
-        stderr_t.join(timeout=5)
-        sess.active_proc = None
-
-        result_text = agent_messages[-1] if agent_messages else ""
-        output = result_text
-
-        if sess.stop_flag.is_set():
-            return output or "(已中止)"
-
-        if proc.returncode != 0 and not output:
-            raise RuntimeError(f"Codex CLI 错误 (code {proc.returncode})")
-
-        if output:
-            add_event(sess, "agent_result", {"agent": "codex", "text": output})
-
-        return output
-
-    except FileNotFoundError:
-        raise RuntimeError("未找到 'codex' 命令。请安装: npm install -g @openai/codex")
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        sess.active_proc = None
-        raise RuntimeError("Codex CLI 超时")
+    """调用 Codex CLI — 委托到 CodexAdapter.run()。"""
+    return _codex_adapter.run(
+        prompt, cwd, sess, log_tag=log_tag,
+        resume_last=resume_last,
+    )
 
 
 # ═════════════════════════════════════════════════════════════════
@@ -607,309 +310,61 @@ def build_codex_post_review_followup_prompt(sess, fix_result):
 
 
 # ═════════════════════════════════════════════════════════════════
-# Orchestration Engine
+# Orchestration Engine — 实现在 bridge/orchestration/engine.py
 # ═════════════════════════════════════════════════════════════════
-def last_complete_round(history):
-    """返回 history 中最后一个完整轮次号（同时有 claude 和 codex 记录）。无则返回 0。"""
-    has_claude = set()
-    has_codex = set()
-    for h in history:
-        r = h.get("round", 0)
-        if h["role"] == "claude":
-            has_claude.add(r)
-        elif h["role"] == "codex":
-            has_codex.add(r)
-    complete = has_claude & has_codex
-    return max(complete) if complete else 0
+from bridge.orchestration import engine as _engine
 
+# 纯函数直接再导出
+last_complete_round = _engine.last_complete_round
+# is_approved 已通过 from bridge.protocol import is_approved 导入（L32）
 
-def is_approved(text):
-    """审查通过判定：第一行首个词必须是 APPROVED（与提示词协议一致）。"""
-    first_line = text.strip().split("\n")[0]
-    return bool(re.match(r'\s*APPROVED\b', first_line, re.IGNORECASE))
+# 薄 wrapper：保留原签名，调用时从本模块 __globals__ 查找依赖注入 engine。
+# run_first_review 必须在 run_execution 之前定义（后者将其作为 dep 传入）。
+
+def run_first_review(sess, approved_plan):
+    _engine.run_first_review(
+        sess, approved_plan,
+        call_codex=call_codex_streaming,
+        reviewer=_codex_adapter,
+        build_codex_post_review_prompt=build_codex_post_review_prompt,
+    )
 
 
 def run_negotiation(sess, start_round=1):
-    task = sess.task
-    cwd = sess.project_path
-    max_rounds = sess.max_rounds
-
-    try:
-        with sess.status_lock:
-            sess.status = "running"
-        add_event(sess, "status_change", {"status": "running", "msg": "协商开始"})
-
-        for rnd in range(start_round, max_rounds + 1):
-            if sess.stop_flag.is_set():
-                with sess.status_lock:
-                    sess.status = "idle"
-                add_event(sess, "status_change", {"status": "stopped", "msg": "用户中止"})
-                return
-
-            sess.current_round = rnd
-            add_event(sess, "round_start", {"round": rnd, "max": max_rounds})
-
-            # ── A) Claude 出方案 / 修订 ─────────────────────
-            add_event(sess, "agent_thinking", {"agent": "claude", "round": rnd})
-
-            if rnd == 1 and start_round == 1:
-                prompt_c = build_claude_first_prompt(task, cwd)
-            else:
-                last_codex = ""
-                for h in reversed(sess.history):
-                    if h["role"] == "codex":
-                        last_codex = h["content"]
-                        break
-                user_injects = collect_user_injects(sess.history)
-                prompt_c = build_claude_revise_prompt(last_codex, user_injects)
-
-            plan = call_claude_streaming(
-                prompt_c, cwd, sess,
-                continue_session=sess.claude_has_session,
-            )
-            sess.claude_has_session = True
-
-            entry_c = {
-                "round": rnd, "role": "claude", "phase": "方案",
-                "content": plan, "timestamp": datetime.now().isoformat(),
-            }
-            add_history_event(sess, sess.history, entry_c, "agent_response")
-
-            if sess.stop_flag.is_set():
-                return
-
-            # ── B) Codex 审查 ───────────────────────────────
-            add_event(sess, "agent_thinking", {"agent": "codex", "round": rnd})
-
-            if rnd == 1 and start_round == 1:
-                prompt_x = build_codex_first_prompt(task, plan)
-            else:
-                user_injects_x = collect_user_injects(sess.history)
-                prompt_x = build_codex_review_prompt(plan, user_injects_x)
-
-            review = call_codex_streaming(
-                prompt_x, cwd, sess,
-                resume_last=sess.codex_has_session,
-            )
-            sess.codex_has_session = True
-
-            entry_x = {
-                "round": rnd, "role": "codex", "phase": "审查",
-                "content": review, "timestamp": datetime.now().isoformat(),
-            }
-            add_history_event(sess, sess.history, entry_x, "agent_response")
-
-            # ── C) 共识? ───────────────────────────────────
-            if is_approved(review):
-                with sess.status_lock:
-                    sess.consensus = True
-                    sess.consensus_round = rnd
-                    sess.status = "consensus"
-                add_event(sess, "consensus_reached", {
-                    "round": rnd,
-                    "msg": f"Codex 在第 {rnd} 轮认可了方案，等待你确认执行或继续协商。",
-                })
-                return
-
-        with sess.status_lock:
-            sess.status = "max_rounds"
-        add_event(sess, "max_rounds_reached", {
-            "round": max_rounds,
-            "msg": f"已完成 {max_rounds} 轮协商（未获 APPROVED），可选择执行当前方案或继续协商。",
-        })
-
-    except Exception as e:
-        if start_round > 1:
-            # ── 续接失败：彻底回退到最后完整轮次 ──
-            lcr = last_complete_round(sess.history)
-
-            # 1) 裁剪 history：移除不完整轮次条目，保留 user 注入
-            sess.history = [
-                h for h in sess.history
-                if h["role"] == "user" or h.get("round", 0) <= lcr
-            ]
-
-            # 2) 归位 current_round 和 max_rounds
-            sess.current_round = lcr
-            sess.max_rounds = lcr
-
-            # 3) 找到最后完整轮次的 Claude 方案，用于恢复前端
-            restored_plan = ""
-            for h in reversed(sess.history):
-                if h["role"] == "claude" and h.get("round") == lcr:
-                    restored_plan = h["content"]
-                    break
-
-            # 4) 设状态并通知前端
-            with sess.status_lock:
-                sess.status = "max_rounds"
-            add_event(sess, "rollback", {
-                "round": lcr,
-                "max": lcr,
-                "plan": restored_plan,
-                "msg": f"继续协商出错（{e}），已回退到第 {lcr} 轮状态，仍可执行或再次续接。",
-            })
-        else:
-            with sess.status_lock:
-                sess.status = "error"
-            sess.error = str(e)
-            add_event(sess, "error", {"msg": str(e)})
+    _engine.run_negotiation(
+        sess, start_round=start_round,
+        call_claude=call_claude_streaming,
+        call_codex=call_codex_streaming,
+        reviewer=_codex_adapter,
+        build_claude_first_prompt=build_claude_first_prompt,
+        build_claude_revise_prompt=build_claude_revise_prompt,
+        build_codex_first_prompt=build_codex_first_prompt,
+        build_codex_review_prompt=build_codex_review_prompt,
+        collect_user_injects=collect_user_injects,
+    )
 
 
 def run_execution(sess):
-    try:
-        add_event(sess, "status_change", {"status": "executing", "msg": "Claude 正在执行..."})
-
-        # 记录执行前基线（tracked ref + untracked 文件快照）
-        sess.is_git_repo = _is_git_repo(sess.project_path)
-        if sess.is_git_repo:
-            sess.exec_baseline_ref = capture_baseline_ref(sess.project_path)
-            sess.exec_baseline_untracked = capture_baseline_untracked(sess.project_path)
-
-        final_plan = ""
-        for h in reversed(sess.history):
-            if h["role"] == "claude":
-                final_plan = h["content"]
-                break
-
-        prompt = build_execution_prompt(sess.task, final_plan, approved=sess.consensus)
-
-        result = call_claude_streaming(
-            prompt, sess.project_path, sess,
-            continue_session=True,
-            bypass_permissions=True,
-            log_tag="claude_exec",
-            skip_plan_detection=True,
-        )
-
-        sess.execution_result = result
-        add_event(sess, "execution_done", {"result": result})
-
-        # 自动触发第一轮 Codex 评审（只读，不修复）
-        if sess.stop_flag.is_set():
-            with sess.status_lock:
-                sess.status = "done"
-            return
-
-        run_first_review(sess, final_plan)
-
-    except Exception as e:
-        with sess.status_lock:
-            sess.status = "error"
-            sess.error = str(e)
-        add_event(sess, "error", {"msg": str(e)})
-
-
-def run_first_review(sess, approved_plan):
-    """执行完成后自动发起一轮 Codex 评审。只评审不修复。"""
-    try:
-        with sess.status_lock:
-            sess.status = "review_pending"
-        sess.review_round = 1
-        add_event(sess, "status_change", {"status": "review_pending", "msg": "Codex 正在评审执行结果..."})
-        add_event(sess, "review_start", {"round": 1, "max": sess.max_review_rounds})
-        add_event(sess, "agent_thinking", {"agent": "codex", "round": 1})
-
-        prompt = build_codex_post_review_prompt(sess, sess.task, approved_plan, sess.execution_result)
-
-        review = call_codex_streaming(
-            prompt, sess.project_path, sess,
-            resume_last=sess.codex_has_session, log_tag="codex_review_1")
-        sess.codex_has_session = True
-
-        # stop guard
-        if sess.stop_flag.is_set():
-            return
-
-        entry = {"round": 1, "role": "codex", "phase": "执行审查",
-                 "content": review, "timestamp": datetime.now().isoformat()}
-        add_history_event(sess, sess.review_history, entry, "review_response")
-
-        if "任务收口成功" in (review or "").split("\n")[0]:
-            with sess.status_lock:
-                sess.status = "done"
-            add_event(sess, "review_done", {"round": 1, "msg": "Codex 确认任务收口成功。", "success": True})
-        else:
-            with sess.status_lock:
-                sess.status = "review_fix"
-            add_event(sess, "review_needs_fix", {"round": 1, "msg": "Codex 发现问题，等待你确认是否修复。", "review": review})
-
-    except Exception as e:
-        with sess.status_lock:
-            sess.status = "error"
-            sess.error = str(e)
-        add_event(sess, "error", {"msg": f"评审阶段出错: {e}"})
+    _engine.run_execution(
+        sess,
+        call_claude=call_claude_streaming,
+        _is_git_repo=_is_git_repo,
+        capture_baseline_ref=capture_baseline_ref,
+        capture_baseline_untracked=capture_baseline_untracked,
+        build_execution_prompt=build_execution_prompt,
+        _run_first_review=run_first_review,
+    )
 
 
 def run_review_fix_cycle(sess):
-    """用户确认后：Claude 修复 → Codex 再评审。单轮。"""
-    try:
-        rr = sess.review_round + 1
-        if rr > sess.max_review_rounds:
-            with sess.status_lock:
-                sess.status = "done"
-            add_event(sess, "review_done", {"round": rr - 1, "msg": f"已达最大审查轮次 ({sess.max_review_rounds})。", "success": False})
-            return
-
-        sess.review_round = rr
-        with sess.status_lock:
-            sess.status = "review_pending"
-        add_event(sess, "status_change", {"status": "review_pending", "msg": f"审查修复轮 {rr}..."})
-        add_event(sess, "review_round_start", {"round": rr, "max": sess.max_review_rounds})
-
-        if sess.stop_flag.is_set():
-            return
-
-        # A) Claude 修复
-        add_event(sess, "agent_thinking", {"agent": "claude", "round": rr})
-        last_review = sess.review_history[-1]["content"] if sess.review_history else ""
-        fix_result = call_claude_streaming(
-            build_claude_post_fix_prompt(last_review), sess.project_path, sess,
-            continue_session=True, bypass_permissions=True,
-            log_tag=f"claude_fix_{rr}", skip_plan_detection=True)
-
-        # stop guard
-        if sess.stop_flag.is_set():
-            return
-
-        fix_entry = {"round": rr, "role": "claude", "phase": "修复",
-                     "content": fix_result, "timestamp": datetime.now().isoformat()}
-        add_history_event(sess, sess.review_history, fix_entry, "review_response")
-        sess.execution_result = fix_result
-
-        if sess.stop_flag.is_set():
-            return
-
-        # B) Codex 再评审
-        add_event(sess, "agent_thinking", {"agent": "codex", "round": rr})
-        review = call_codex_streaming(
-            build_codex_post_review_followup_prompt(sess, fix_result),
-            sess.project_path, sess,
-            resume_last=sess.codex_has_session, log_tag=f"codex_review_{rr}")
-        sess.codex_has_session = True
-
-        # stop guard
-        if sess.stop_flag.is_set():
-            return
-
-        review_entry = {"round": rr, "role": "codex", "phase": "执行审查",
-                        "content": review, "timestamp": datetime.now().isoformat()}
-        add_history_event(sess, sess.review_history, review_entry, "review_response")
-
-        if "任务收口成功" in (review or "").split("\n")[0]:
-            with sess.status_lock:
-                sess.status = "done"
-            add_event(sess, "review_done", {"round": rr, "msg": f"Codex 在第 {rr} 轮确认任务收口成功。", "success": True})
-        else:
-            with sess.status_lock:
-                sess.status = "review_fix"
-            add_event(sess, "review_needs_fix", {"round": rr, "msg": "Codex 仍发现问题，等待你确认是否继续修复。", "review": review})
-
-    except Exception as e:
-        with sess.status_lock:
-            sess.status = "error"
-            sess.error = str(e)
-        add_event(sess, "error", {"msg": f"修复阶段出错: {e}"})
+    _engine.run_review_fix_cycle(
+        sess,
+        call_claude=call_claude_streaming,
+        call_codex=call_codex_streaming,
+        reviewer=_codex_adapter,
+        build_claude_post_fix_prompt=build_claude_post_fix_prompt,
+        build_codex_post_review_followup_prompt=build_codex_post_review_followup_prompt,
+    )
 
 
 # ═════════════════════════════════════════════════════════════════
@@ -1117,7 +572,7 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
                 return self._json({"error": "会话不存在"}, 404)
             # 原子 CAS：只有从 consensus/max_rounds 状态才能切到 executing
             with sess.status_lock:
-                if sess.status not in ("consensus", "max_rounds"):
+                if sess.status not in EXECUTABLE_STATES:
                     return self._json({"error": "当前不在可执行状态"}, 400)
                 sess.status = "executing"
             threading.Thread(target=run_execution, args=(sess,), daemon=True).start()
@@ -1143,7 +598,7 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
             if not sess:
                 return self._json({"error": "会话不存在"}, 404)
             with sess.status_lock:
-                if sess.status != "review_fix":
+                if sess.status not in FIXABLE_STATES:
                     return self._json({"error": "当前不在待修复状态"}, 400)
                 sess.status = "review_pending"
             sess.stop_flag.clear()
@@ -1155,7 +610,7 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
             if not sess:
                 return self._json({"error": "会话不存在"}, 404)
             with sess.status_lock:
-                if sess.status != "review_fix":
+                if sess.status not in FIXABLE_STATES:
                     return self._json({"error": "当前不在待修复状态"}, 400)
                 sess.status = "done"
             add_event(sess, "review_done", {"round": sess.review_round, "msg": "用户跳过修复，任务结束。", "success": False})
@@ -1199,7 +654,7 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
                 reason = body.get("message", "").strip()
                 if not reason:
                     return self._json({"error": "驳回共识时必须提供理由"}, 400)
-            elif cur != "max_rounds":
+            elif cur not in CONTINUABLE_STATES:
                 return self._json({"error": "只有在达到最大轮次或共识状态下才能继续协商"}, 400)
             # 校验通过，一次性迁移状态（consensus 三元组原子写入）
             with sess.status_lock:

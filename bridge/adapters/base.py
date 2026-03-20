@@ -2,22 +2,27 @@
 Bridge CLIAdapter 基类
 =====================
 所有 CLI 工具适配器的抽象基类。
-只在 Python 内实现，前端消费只读元数据 (capabilities)。
 
 设计原则:
-  1. 每个工具的差异在 adapter 内部隔离
-  2. 编排引擎只通过基类接口调用
+  1. 每个工具的差异在 adapter 内部隔离 (build_command, parse_stream_line)
+  2. 编排引擎只通过基类接口调用 (run)
   3. 能力矩阵 (capabilities) 声明每个工具支持什么
-  4. 认证能力全部标记为"待验证" — 当前代码无认证检测逻辑
+  4. run() 是 Template Method — 管理进程生命周期，调用抽象钩子
+  5. 认证能力全部标记为"待验证" — 当前代码无认证检测逻辑
 
-对应 bridge.py (commit cdc4613):
-  - call_claude_streaming: L199-335
-  - call_codex_streaming: L337-437
-  - _stderr_reader: L178-196 (共享)
+Step 3 从 bridge.py 迁入:
+  - _stderr_reader: L110-128 (共享静态方法)
+  - 进程生命周期: Popen/日志/事件发射 (run 具体方法)
 """
 
-import re
+import os
+import shutil
+import subprocess
+import threading
 from abc import ABC, abstractmethod
+from datetime import datetime
+
+from bridge.session import add_event
 
 
 class CLIAdapter(ABC):
@@ -37,6 +42,26 @@ class CLIAdapter(ABC):
         """工具显示名称，如 "Claude Code", "Codex"。"""
         ...
 
+    @property
+    @abstractmethod
+    def cli_name(self) -> str:
+        """可执行文件名，如 "claude", "codex"。"""
+        ...
+
+    # ── 可覆盖属性 ──
+
+    @property
+    def agent_name(self) -> str:
+        """事件流中使用的代理名称。默认与 id 相同，子类可覆盖。"""
+        return self.id
+
+    @property
+    def log_raw_stdout(self) -> bool:
+        """是否在解析前记录 raw stdout 行到日志。
+        Codex=True（记录所有 raw lines），Claude=False（仅记录 text chunks）。
+        """
+        return True
+
     # ── 能力矩阵 ──
 
     @property
@@ -44,27 +69,25 @@ class CLIAdapter(ABC):
         """能力声明 — 前端只读消费，不做适配逻辑。
 
         所有认证相关字段标记为待验证。
-        当前代码唯一的认证逻辑是 FileNotFoundError 报错 (L335-336, L431-432)。
         """
         return {
-            "can_detect_install": True,     # 所有工具都应支持 which <tool>
+            "can_detect_install": True,
             "can_detect_auth": False,       # 待验证
             "can_trigger_auth": False,      # 待验证
-            "auth_method": "unknown",       # 待验证: browser_oauth / api_key_env / config_file / manual
-            "plan_mode": False,             # 是否支持 plan-only 模式
-            "dangerous_mode": False,        # 是否有跳过权限的 flag
-            "stream_json": False,           # 是否支持结构化流输出
-            "session_resume": False,        # 是否支持会话续接
+            "auth_method": "unknown",       # 待验证
+            "plan_mode": False,
+            "dangerous_mode": False,
+            "stream_json": False,
+            "session_resume": False,
         }
 
     # ── 生命周期 ──
 
-    @abstractmethod
     def check_installed(self) -> bool:
         """检查工具是否已安装。"""
-        ...
+        return shutil.which(self.cli_name) is not None
 
-    # ── 执行 ──
+    # ── 抽象钩子（子类必须实现） ──
 
     @abstractmethod
     def build_command(self, prompt: str, cwd: str, **kwargs) -> list[str]:
@@ -84,33 +107,195 @@ class CLIAdapter(ABC):
 
         返回格式:
           {"type": "text_chunk", "text": "..."}
+          {"type": "block_stop"}
+          {"type": "message", "text": "..."}
           {"type": "command_start", "command": "..."}
           {"type": "command_output", "output": "..."}
           {"type": "result", "text": "..."}
-          {"type": "error", "message": "..."}
+          {"type": "debug_sample", "key": "...", "raw": "..."}
           None — 忽略该行
         """
         ...
 
+    # ── 可选钩子（子类可覆盖） ──
+
+    def get_env_overrides(self) -> dict | None:
+        """返回子进程额外环境变量，默认 None。"""
+        return None
+
+    def extract_result(self, stream_display: list[str], result_text: str) -> str:
+        """从流数据计算最终输出。默认优先 result_text，否则拼接 stream_display。"""
+        return result_text or "".join(stream_display).strip()
+
+    def format_process_error(self, returncode: int, log_file) -> str:
+        """非零退出错误消息。子类可覆盖以保留原始措辞。"""
+        return f"{self.display_name} CLI 错误 (code {returncode})"
+
+    def format_not_found_error(self) -> str:
+        """可执行文件未找到错误消息。子类可覆盖以保留原始措辞。"""
+        return f"未找到 '{self.cli_name}' 命令"
+
     # ── 协议检测 ──
 
     def detect_approval(self, text: str) -> bool:
-        """检测审查结果是否为 APPROVED。
-
-        默认实现: 首行首词为 APPROVED (大小写不敏感)。
-        对应 bridge.py L626-629 is_approved()。
-        """
-        if not text:
-            return False
-        first_line = text.strip().split("\n")[0]
-        return bool(re.match(r'\s*APPROVED\b', first_line, re.IGNORECASE))
+        """检测审查结果是否为 APPROVED。默认委托 protocol.is_approved()。"""
+        from bridge.protocol import is_approved
+        return is_approved(text)
 
     def detect_closure(self, text: str) -> bool:
         """检测执行后审查结果是否为"任务收口成功"。
 
         默认实现: 首行含"任务收口成功"。
-        对应 bridge.py L828, L899。
         """
         if not text:
             return False
         return "任务收口成功" in text.split("\n")[0]
+
+    # ── 共享工具 ──
+
+    @staticmethod
+    def stderr_reader(proc, agent, log_file, log_lock, sess):
+        """后台线程：逐行读取 stderr，推送到过程日志，防止 pipe buffer 填满导致死锁。"""
+        MCP_NOISE = ("mcp:", "mcp_", "starting mcp", "mcp server", "mcp startup",
+                     "mcp client", "handshaking", "initialize response")
+        try:
+            for line in proc.stderr:
+                stripped = line.rstrip('\n')
+                if not stripped:
+                    continue
+                with log_lock:
+                    log_file.write(f"[stderr] {line}")
+                    log_file.flush()
+                is_mcp = any(p in stripped.lower() for p in MCP_NOISE)
+                if is_mcp:
+                    add_event(sess, "agent_stderr", {"agent": agent, "text": stripped, "is_mcp": True})
+                else:
+                    add_event(sess, "agent_chunk", {"agent": agent, "text": stripped + "\n"})
+        except ValueError:
+            pass  # pipe closed
+
+    # ── 进程生命周期 (Template Method) ──
+
+    def run(self, prompt, cwd, sess, log_tag=None, **kwargs):
+        """完整 CLI 调用生命周期。子类可重写添加前/后处理（如 plan 检测）。"""
+        agent = self.agent_name
+        log_tag = log_tag or agent
+        cmd = self.build_command(prompt, cwd, **kwargs)
+        log_file = sess.log_dir / f"{log_tag}.log"
+        add_event(sess, "cli_start", {"agent": agent, "round": sess.current_round})
+
+        try:
+            env = dict(os.environ)
+            overrides = self.get_env_overrides()
+            if overrides:
+                env.update(overrides)
+
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, cwd=cwd, bufsize=1, env=env,
+            )
+            sess.active_proc = proc
+
+            stream_display = []
+            result_text = ""
+
+            with open(log_file, "a", encoding="utf-8") as lf:
+                header = f"\n{'═'*60}\n[Round {sess.current_round}] {agent.capitalize()} — {datetime.now().strftime('%H:%M:%S')}\n{'═'*60}\n"
+                lf.write(header)
+                lf.flush()
+
+                log_lock = threading.Lock()
+                stderr_t = threading.Thread(
+                    target=self.stderr_reader,
+                    args=(proc, agent, lf, log_lock, sess), daemon=True)
+                stderr_t.start()
+
+                for raw_line in proc.stdout:
+                    stripped = raw_line.strip()
+                    if not stripped:
+                        continue
+
+                    # Codex: 解析前记录 raw line（保留原始行为）
+                    if self.log_raw_stdout:
+                        with log_lock:
+                            lf.write(raw_line)
+                            lf.flush()
+
+                    norm = self.parse_stream_line(stripped)
+                    if norm is None:
+                        continue
+
+                    ntype = norm["type"]
+
+                    if ntype == "text_chunk":
+                        chunk = norm["text"]
+                        stream_display.append(chunk)
+                        if not self.log_raw_stdout:  # Claude: 只写 text chunks
+                            with log_lock:
+                                lf.write(chunk)
+                                lf.flush()
+                        add_event(sess, "agent_chunk", {"agent": agent, "text": chunk})
+
+                    elif ntype == "block_stop":
+                        if stream_display and not stream_display[-1].endswith("\n"):
+                            stream_display.append("\n")
+                            if not self.log_raw_stdout:
+                                with log_lock:
+                                    lf.write("\n")
+                                    lf.flush()
+                            add_event(sess, "agent_chunk", {"agent": agent, "text": "\n"})
+
+                    elif ntype == "message":
+                        text = norm["text"]
+                        result_text = text
+                        add_event(sess, "agent_chunk", {"agent": agent, "text": text + "\n"})
+
+                    elif ntype == "command_start":
+                        add_event(sess, "agent_chunk", {
+                            "agent": agent, "text": f"$ {norm['command']}\n",
+                            "chunk_type": "command"})
+
+                    elif ntype == "command_output":
+                        add_event(sess, "agent_chunk", {
+                            "agent": agent, "text": norm["output"],
+                            "chunk_type": "command_output"})
+                        add_event(sess, "chunk_boundary", {
+                            "agent": agent, "boundary_type": "command_output"})
+
+                    elif ntype == "result":
+                        result_text = norm["text"]
+
+                    elif ntype == "debug_sample":
+                        # STREAM_DEBUG 按事件类型采样，保留原始行为
+                        _sc = getattr(sess, '_sample_counts', None)
+                        if _sc is None:
+                            _sc = {}
+                            sess._sample_counts = _sc
+                        ek = norm["key"]
+                        cnt = _sc.get(ek, 0)
+                        if cnt < 5:
+                            _sc[ek] = cnt + 1
+                            with log_lock:
+                                lf.write(f"[SAMPLE] {norm['raw']}\n")
+                                lf.flush()
+
+            proc.wait()
+            stderr_t.join(timeout=5)
+            sess.active_proc = None
+
+            if sess.stop_flag.is_set():
+                output = self.extract_result(stream_display, result_text)
+                return output or "(已中止)"
+
+            output = self.extract_result(stream_display, result_text)
+
+            if not output and proc.returncode != 0:
+                raise RuntimeError(self.format_process_error(proc.returncode, log_file))
+
+            if output:
+                add_event(sess, "agent_result", {"agent": agent, "text": output})
+
+            return output
+
+        except FileNotFoundError:
+            raise RuntimeError(self.format_not_found_error())

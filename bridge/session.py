@@ -1,20 +1,9 @@
 """
 Bridge Session 管理
 ==================
-SessionState 类和事件管理函数的接口声明。
+SessionState 类和事件管理函数。
 
-当前阶段：骨架声明，不接入运行路径。
-实际代码仍在 bridge.py L64-131。
-Step 2 时将 bridge.py 中的实现迁入此文件。
-
-对应 bridge.py 行号 (commit cdc4613):
-  - SessionState: L74-107
-  - add_event: L115-120
-  - add_history_event: L123-130
-  - get_session: L110-112
-  - sessions dict: L69
-  - sessions_lock: L70
-  - plan_file_lock: L71
+依赖: bridge.protocol (EVENT_TYPES)
 """
 
 import threading
@@ -22,18 +11,18 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
+from bridge.protocol import EVENT_TYPES
 
-# Step 2 时从 bridge.py 迁入的全局状态
-# sessions = {}           # session_id → SessionState
-# sessions_lock = threading.Lock()
-# plan_file_lock = threading.Lock()
-# LOG_DIR = Path("/tmp/bridge-logs")
+LOG_DIR = Path("/tmp/bridge-logs")
+
+sessions = {}           # session_id → SessionState
+sessions_lock = threading.Lock()
 
 
 class SessionState:
     """协商会话状态 — 每个浏览器 Tab 独立。
 
-    字段清单 (与 bridge.py L74-107 一一对应):
+    字段清单:
         session_id:     str     — uuid hex[:8]
         task:           str     — 用户任务描述
         project_path:   str     — 项目路径
@@ -67,6 +56,63 @@ class SessionState:
         exec_baseline_ref, exec_baseline_untracked, events
     """
 
-    def __init__(self, session_id: str, task: str, project_path: str, max_rounds: int):
-        # Step 2 时填入完整实现
-        raise NotImplementedError("骨架声明，Step 2 迁入实现")
+    def __init__(self, session_id, task, project_path, max_rounds):
+        self.session_id = session_id
+        self.task = task
+        self.project_path = project_path
+        self.max_rounds = max_rounds
+        self.status = "running"
+        self.current_round = 0
+        self.history = []
+        self.consensus = False
+        self.consensus_round = 0
+        self.execution_result = None
+        self.error = None
+        # 事件流（每会话独立）
+        self.events = []
+        self.event_lock = threading.Lock()
+        # 进程控制
+        self.stop_flag = threading.Event()
+        self.claude_has_session = False
+        self.claude_session_id = str(uuid.uuid4())   # 创建时生成，全程绑定
+        self.status_lock = threading.Lock()           # 状态转换专用锁
+        self.codex_has_session = False
+        self.active_proc = None
+        # 日志目录（每会话独立）
+        self.log_dir = LOG_DIR / session_id
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        # 执行后审查（Issue 4）
+        self.review_round = 0
+        self.max_review_rounds = 3
+        self.review_history = []
+        self.exec_baseline_ref = None
+        self.exec_baseline_untracked = set()
+        self.is_git_repo = False
+
+
+def get_session(sid):
+    """按 session_id 查找会话，不存在返回 None。"""
+    with sessions_lock:
+        return sessions.get(sid)
+
+
+def add_event(sess, etype, data):
+    if etype not in EVENT_TYPES:
+        raise ValueError(f"未声明的事件类型: {etype}，请先在 bridge/protocol.py EVENT_TYPES 中注册")
+    with sess.event_lock:
+        sess.events.append({
+            "id": len(sess.events), "type": etype,
+            "data": data, "ts": datetime.now().isoformat(),
+        })
+
+
+def add_history_event(sess, history_list, entry, event_type):
+    """原子地追加历史记录并发送事件（统一快照锁）。"""
+    if event_type not in EVENT_TYPES:
+        raise ValueError(f"未声明的事件类型: {event_type}，请先在 bridge/protocol.py EVENT_TYPES 中注册")
+    with sess.event_lock:
+        history_list.append(entry)
+        sess.events.append({
+            "id": len(sess.events), "type": event_type,
+            "data": entry, "ts": datetime.now().isoformat(),
+        })

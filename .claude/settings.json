@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//private/tmp/**)",
+      "Bash(timeout 30 codex exec --json '回复一句话：hello world')",
+      "Bash(brew list:*)",
+      "Bash(kill 1861)",
+      "Bash(ps -p 1861 -o pid)",
+      "Bash(python3 -c \":*)",
+      "Bash(python3 -c \"import bridge; print\\(''''Import OK''''\\)\")",
+      "Bash(python3 -c \"import ast; ast.parse\\(open\\(''/Users/809456948qq.com/code/bridge/bridge.py''\\).read\\(\\)\\); print\\(''Syntax OK''\\)\")",
+      "Bash(python3 -c \"import bridge; print\\(''Import OK''\\)\")",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git push:*)",
+      "Bash(kill 49257 49256)",
+      "Bash(tmux list-sessions:*)"
+    ]
+  }
+}

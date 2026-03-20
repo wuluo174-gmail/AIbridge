@@ -97,9 +97,9 @@ bridge.py (2167 行)
 
 | 模块 | 职责 | 外部依赖 |
 |------|------|---------|
-| `bridge/session.py` | SessionState 类 + 事件管理 | 无 |
+| `bridge/session.py` | SessionState 类 + 事件管理 | protocol (EVENT_TYPES) |
 | `bridge/protocol.py` | 事件类型常量 + 状态枚举 | 无 |
-| `bridge/adapters/base.py` | CLIAdapter ABC | 无 |
+| `bridge/adapters/base.py` | CLIAdapter ABC + run() 进程生命周期 | session (add_event) |
 | `bridge/adapters/claude_adapter.py` | Claude Code CLI 封装 | subprocess |
 | `bridge/adapters/codex_adapter.py` | Codex CLI 封装 | subprocess |
 | `bridge/orchestration/engine.py` | 协商/执行/审查循环 | adapters, session, protocol |
@@ -112,30 +112,38 @@ bridge.py (2167 行)
 class CLIAdapter(ABC):
     id: str                    # "claude-code", "codex"
     display_name: str
+    cli_name: str              # 可执行文件名: "claude", "codex"
+    agent_name: str            # 事件流代理名: "claude", "codex"
+    log_raw_stdout: bool       # Codex=True (记录 raw lines), Claude=False (仅 text chunks)
 
     @property
     def capabilities(self) -> dict:
         """能力矩阵 — 前端只读消费"""
-        return {
-            "can_detect_install": True,
-            "can_detect_auth": False,       # 待验证
-            "can_trigger_auth": False,       # 待验证
-            "auth_method": "unknown",        # 待验证
-            "plan_mode": False,
-            "dangerous_mode": False,
-            "stream_json": False,
-            "session_resume": False,
-        }
+        ...
 
-    @abstractmethod
-    def check_installed(self) -> bool: ...
+    # ── 生命周期 ──
+    def check_installed(self) -> bool: ...          # 具体: shutil.which(cli_name)
+    def run(self, prompt, cwd, sess, **kw) -> str:  # 具体: Template Method (进程生命周期)
+
+    # ── 抽象钩子 (子类必须实现) ──
     @abstractmethod
     def build_command(self, prompt, cwd, **kwargs) -> list[str]: ...
     @abstractmethod
     def parse_stream_line(self, line: str) -> dict | None: ...
 
+    # ── 可选钩子 (子类可重写) ──
+    def get_env_overrides(self) -> dict | None: ...       # 默认 None
+    def extract_result(self, stream_display, result_text) -> str: ...  # 默认 result_text or join
+    def format_process_error(self, returncode, log_file) -> str: ...   # 非零退出消息
+    def format_not_found_error(self) -> str: ...           # FileNotFoundError 消息
+
+    # ── 协议检测 ──
     def detect_approval(self, text: str) -> bool: ...
     def detect_closure(self, text: str) -> bool: ...
+
+    # ── 共享工具 ──
+    @staticmethod
+    def stderr_reader(proc, agent, log_file, log_lock, sess): ...
 ```
 
 ### 持久化边界

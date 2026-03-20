@@ -9,6 +9,8 @@ Bridge 协议常量 — 唯一权威真相源
 所有常量从 bridge.py 代码逐行提取，行号标注基于 commit cdc4613。
 """
 
+import re
+
 
 # ═════════════════════════════════════════════════════════════════
 # 状态枚举 (9 种) — bridge.py L1891
@@ -37,6 +39,18 @@ CONTINUABLE_STATES = frozenset({"consensus", "max_rounds"})
 
 # 终态 (轮询停止)
 TERMINAL_STATES = frozenset({"idle", "done", "error"})
+
+
+# ═════════════════════════════════════════════════════════════════
+# 协议判定辅助 — 审批/收口检测的权威实现
+# ═════════════════════════════════════════════════════════════════
+
+def is_approved(text):
+    """审查通过判定：首行首词为 APPROVED（大小写不敏感）。"""
+    if not text:
+        return False
+    first_line = text.strip().split("\n")[0]
+    return bool(re.match(r'\s*APPROVED\b', first_line, re.IGNORECASE))
 
 
 # ═════════════════════════════════════════════════════════════════
