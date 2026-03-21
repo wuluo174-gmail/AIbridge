@@ -2,7 +2,7 @@
 // Input: event + current state → Output: state mutations
 // No DOM, no side effects, fully testable
 
-import type { BridgeEvent, AppState, LogEntry, AgentPanel } from './types.js'
+import type { BridgeEvent, AppState, LogEntry, AgentPanel, DisplayNames } from './types.js'
 
 function pushLog(state: AppState, agent: AgentPanel, entry: LogEntry): void {
   state.logs[agent].push(entry)
@@ -13,7 +13,7 @@ function pushBothLogs(state: AppState, entry: LogEntry): void {
   state.logs.reviewer.push(entry)
 }
 
-export function handleEvent(e: BridgeEvent, state: AppState): void {
+export function handleEvent(e: BridgeEvent, state: AppState, names: DisplayNames): void {
   switch (e.type) {
     case 'round_start': {
       const text = `══════ 第 ${e.data.round} / ${e.data.max} 轮 ══════`
@@ -25,7 +25,7 @@ export function handleEvent(e: BridgeEvent, state: AppState): void {
       state.activeTab[e.data.agent] = 'log'
       pushLog(state, e.data.agent, {
         kind: 'separator', level: 'sys',
-        text: `[${state.toolDisplayNames[e.data.agent]} 处理中...]`,
+        text: `[${names[e.data.agent]} 处理中...]`,
       })
       break
     }
@@ -105,12 +105,12 @@ export function handleEvent(e: BridgeEvent, state: AppState): void {
       if (agent === 'planner') {
         pushLog(state, 'reviewer', {
           kind: 'separator', level: 'sys',
-          text: `── ${state.toolDisplayNames.planner} R${e.data.round} 方案已发送给 ${state.toolDisplayNames.reviewer} ──`,
+          text: `── ${names.planner} R${e.data.round} 方案已发送给 ${names.reviewer} ──`,
         })
         if (e.data.content) {
           pushLog(state, 'reviewer', {
             kind: 'collapsible',
-            label: `查看发送给 ${state.toolDisplayNames.reviewer} 的方案内容`,
+            label: `查看发送给 ${names.reviewer} 的方案内容`,
             content: e.data.content,
             open: false,
           })
@@ -118,12 +118,12 @@ export function handleEvent(e: BridgeEvent, state: AppState): void {
       } else {
         pushLog(state, 'planner', {
           kind: 'separator', level: 'sys',
-          text: `── ${state.toolDisplayNames.reviewer} R${e.data.round} 审查意见已发送给 ${state.toolDisplayNames.planner} ──`,
+          text: `── ${names.reviewer} R${e.data.round} 审查意见已发送给 ${names.planner} ──`,
         })
         if (e.data.content) {
           pushLog(state, 'planner', {
             kind: 'collapsible',
-            label: `查看发送给 ${state.toolDisplayNames.planner} 的审查意见`,
+            label: `查看发送给 ${names.planner} 的审查意见`,
             content: e.data.content,
             open: false,
           })
@@ -187,23 +187,23 @@ export function handleEvent(e: BridgeEvent, state: AppState): void {
       if (rrole === 'reviewer' && e.data.content) {
         pushLog(state, 'reviewer', {
           kind: 'collapsible',
-          label: `${state.toolDisplayNames.reviewer} 审查意见`,
+          label: `${names.reviewer} 审查意见`,
           content: e.data.content, open: true,
         })
         pushLog(state, 'planner', {
           kind: 'collapsible',
-          label: `查看 ${state.toolDisplayNames.reviewer} 审查意见`,
+          label: `查看 ${names.reviewer} 审查意见`,
           content: e.data.content, open: false,
         })
       } else if (rrole === 'planner' && e.data.content) {
         pushLog(state, 'planner', {
           kind: 'collapsible',
-          label: `${state.toolDisplayNames.planner} 修复总结`,
+          label: `${names.planner} 修复总结`,
           content: e.data.content, open: true,
         })
         pushLog(state, 'reviewer', {
           kind: 'collapsible',
-          label: `查看 ${state.toolDisplayNames.planner} 修复总结`,
+          label: `查看 ${names.planner} 修复总结`,
           content: e.data.content, open: false,
         })
       }
@@ -235,6 +235,11 @@ export function handleEvent(e: BridgeEvent, state: AppState): void {
         pushBothLogs(state, { kind: 'separator', level: 'sys', text: `⚠ ${e.data.msg}` })
       }
       state.doneBadge = e.data.success ? '✓ 收口成功' : '⚠ 审查完成'
+      break
+    }
+
+    case 'review_max_rounds_reached': {
+      pushBothLogs(state, { kind: 'separator', level: 'sys', text: `⚠ ${e.data.msg}` })
       break
     }
 

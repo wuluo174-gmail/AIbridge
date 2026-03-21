@@ -4,42 +4,56 @@
   import RoleSelect from './RoleSelect.svelte'
   import StatusPill from './StatusPill.svelte'
 
-  let { projectPath = $bindable(''), onBrowse, onOpenPrompts }: {
-    projectPath: string
+  let { onBrowse, onOpenPrompts, onOpenHistory }: {
     onBrowse: () => void
     onOpenPrompts: () => void
+    onOpenHistory: () => void
   } = $props()
-
-  let taskValue = $state('')
-  let roundsValue = $state(5)
-  let extraRounds = $state(3)
 </script>
 
 <div class="controls">
-  <PathInput bind:value={projectPath} {onBrowse} />
-  <div class="field f-task">
-    <!-- svelte-ignore a11y_label_has_associated_control -->
-    <label>任务描述</label>
-    <textarea rows="3" placeholder="描述任务..." bind:value={taskValue}></textarea>
+  <div class="controls-config">
+    <PathInput bind:value={store.projectPath} {onBrowse} />
+    <div class="field f-task">
+      <!-- svelte-ignore a11y_label_has_associated_control -->
+      <label>{store.t('ctrl.task')}</label>
+      <textarea rows="3" placeholder={store.t('ctrl.task_ph')} bind:value={store.taskValue}></textarea>
+    </div>
+    <div class="field f-rounds">
+      <!-- svelte-ignore a11y_label_has_associated_control -->
+      <label>{store.t('ctrl.rounds')}</label>
+      <input type="number" bind:value={store.roundsValue} min="1" max="20" />
+    </div>
+    <RoleSelect />
   </div>
-  <div class="field f-rounds">
-    <!-- svelte-ignore a11y_label_has_associated_control -->
-    <label>轮次</label>
-    <input type="number" bind:value={roundsValue} min="1" max="20" />
+  <div class="controls-status">
+    {#if store.execNote}
+      <span class="exec-note">{store.execNote}</span>
+    {/if}
+    <StatusPill />
   </div>
-  <RoleSelect />
-  <button class="btn btn-go" disabled={!store.canStart} onclick={() => store.doStart(projectPath, taskValue, roundsValue)}>▶ 开始</button>
-  <button class="btn btn-stop" disabled={!store.canStop} onclick={() => store.doStop()}>⏹ 中止</button>
-  <button class="btn btn-exec" disabled={!store.canExecute} onclick={() => store.doExec()}>⚡ 执行</button>
-  {#if store.canContinue}
-    <button class="btn btn-cont" onclick={() => store.doContinue(extraRounds)}>继续协商</button>
-    <input type="number" bind:value={extraRounds} min="1" max="20"
-      title="额外轮次" style="width:50px;text-align:center;background:var(--bg);border:1px solid var(--border);border-radius:4px;color:var(--text);padding:6px;font-size:13px" />
-  {/if}
-  {#if store.canFix}
-    <button class="btn btn-fix" onclick={() => store.doReviewFix()}>🔧 确认修复</button>
-    <button class="btn btn-skip" onclick={() => store.doReviewSkip()}>⏭ 跳过修复</button>
-  {/if}
-  <button class="btn btn-cfg" onclick={onOpenPrompts}>⚙ 提示词</button>
-  <StatusPill />
+  <div class="controls-actions">
+    <button class="btn btn-go" disabled={!store.canStart} onclick={() => store.doStart(store.projectPath, store.taskValue, store.roundsValue)}>{store.t('ctrl.start')}</button>
+    <button class="btn btn-stop" disabled={!store.canStop} onclick={() => store.doStop()}>{store.t('ctrl.stop')}</button>
+    <button class="btn btn-exec" disabled={!store.canExecute} onclick={() => store.doExec()}>{store.t('ctrl.exec')}</button>
+    {#if store.canContinue}
+      <button class="btn btn-cont" onclick={() => store.doContinue(store.extraRounds)}>{store.t('ctrl.continue')}</button>
+      <input type="number" bind:value={store.extraRounds} min="1" max="20"
+        title={store.t('ctrl.extra_rounds')} style="width:50px;text-align:center;background:var(--bg);border:1px solid var(--border);border-radius:4px;color:var(--text);padding:6px;font-size:13px" />
+    {/if}
+    {#if store.canFix}
+      <button class="btn btn-fix" onclick={() => store.doReviewFix()}>{store.t('ctrl.fix')}</button>
+      <button class="btn btn-skip" onclick={() => store.doReviewSkip()}>{store.t('ctrl.skip')}</button>
+    {/if}
+    {#if store.canReviewContinue}
+      <button class="btn btn-cont" onclick={() => store.doReviewContinue(store.extraRounds)}>{store.t('ctrl.review_continue')}</button>
+      <button class="btn btn-skip" onclick={() => store.doReviewSkip()}>{store.t('ctrl.skip')}</button>
+      <input type="number" bind:value={store.extraRounds} min="1" max="20"
+        title={store.t('ctrl.extra_rounds')} style="width:50px;text-align:center;background:var(--bg);border:1px solid var(--border);border-radius:4px;color:var(--text);padding:6px;font-size:13px" />
+    {/if}
+    <button class="btn btn-cfg" onclick={() => store.toggleTheme()}>{store.theme === 'dark' ? '☀' : '🌙'}</button>
+    <button class="btn btn-cfg" onclick={() => store.switchLocale()}>{store.getLocale() === 'zh-CN' ? 'EN' : '中'}</button>
+    <button class="btn btn-cfg" onclick={onOpenHistory}>{store.t('ctrl.history')}</button>
+    <button class="btn btn-cfg" onclick={onOpenPrompts}>{store.t('ctrl.prompts')}</button>
+  </div>
 </div>

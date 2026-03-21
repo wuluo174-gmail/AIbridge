@@ -7,7 +7,7 @@ export type AgentPanel = 'planner' | 'reviewer'
 // 9 session states (protocol.py L20-30)
 export type SessionStatus =
   | 'idle' | 'running' | 'consensus' | 'max_rounds'
-  | 'executing' | 'review_pending' | 'review_fix'
+  | 'executing' | 'review_pending' | 'review_fix' | 'review_max_rounds'
   | 'done' | 'error'
 
 export const TERMINAL_STATES: ReadonlySet<SessionStatus> = new Set(['idle', 'done', 'error'])
@@ -16,7 +16,7 @@ export const CONTINUABLE_STATES: ReadonlySet<SessionStatus> = new Set(['consensu
 
 // 20 event types — discriminated union (protocol.py L61-87, L211-232)
 export type BridgeEvent =
-  | { type: 'status_change'; data: { status: string; msg: string } }
+  | { type: 'status_change'; data: { status: string; msg: string; msg_key?: string; msg_params?: Record<string, string | number> } }
   | { type: 'round_start'; data: { round: number; max: number } }
   | { type: 'agent_thinking'; data: { agent: AgentPanel; round: number } }
   | { type: 'cli_start'; data: { agent: AgentPanel; round: number } }
@@ -25,17 +25,18 @@ export type BridgeEvent =
   | { type: 'agent_stderr'; data: { agent: AgentPanel; text: string; is_mcp: boolean } }
   | { type: 'agent_result'; data: { agent: AgentPanel; text: string } }
   | { type: 'agent_response'; data: { round: number; role: AgentPanel | 'user'; phase: string; content: string } }
-  | { type: 'consensus_reached'; data: { round: number; msg: string } }
-  | { type: 'max_rounds_reached'; data: { round: number; msg: string } }
-  | { type: 'warning'; data: { msg: string } }
-  | { type: 'rollback'; data: { round: number; max: number; plan: string; msg: string } }
-  | { type: 'error'; data: { msg: string } }
+  | { type: 'consensus_reached'; data: { round: number; msg: string; msg_key?: string; msg_params?: Record<string, string | number> } }
+  | { type: 'max_rounds_reached'; data: { round: number; msg: string; msg_key?: string; msg_params?: Record<string, string | number> } }
+  | { type: 'warning'; data: { msg: string; msg_key?: string; msg_params?: Record<string, string | number> } }
+  | { type: 'rollback'; data: { round: number; max: number; plan: string; msg: string; msg_key?: string; msg_params?: Record<string, string | number> } }
+  | { type: 'error'; data: { msg: string; msg_key?: string; msg_params?: Record<string, string | number> } }
   | { type: 'execution_done'; data: { result: string; executor_panel: AgentPanel } }
   | { type: 'review_start'; data: { round: number; max: number } }
   | { type: 'review_round_start'; data: { round: number; max: number } }
   | { type: 'review_response'; data: { round: number; role: AgentPanel; phase: string; content: string } }
-  | { type: 'review_needs_fix'; data: { round: number; msg: string; review: string } }
-  | { type: 'review_done'; data: { round: number; msg: string; success: boolean } }
+  | { type: 'review_needs_fix'; data: { round: number; msg: string; review: string; msg_key?: string; msg_params?: Record<string, string | number> } }
+  | { type: 'review_done'; data: { round: number; msg: string; success: boolean; msg_key?: string; msg_params?: Record<string, string | number> } }
+  | { type: 'review_max_rounds_reached'; data: { round: number; msg: string; msg_key?: string; msg_params?: Record<string, string | number> } }
 
 export type BridgeEventType = BridgeEvent['type']
 
@@ -76,6 +77,8 @@ export interface SessionState {
   planner_tool_id: string
   reviewer_tool_id: string
   executor_panel: AgentPanel
+  review_round: number
+  max_review_rounds: number
 }
 
 export interface HistoryEntry {
@@ -140,28 +143,35 @@ export const PROMPT_KEYS = [
 
 export type PromptKey = typeof PROMPT_KEYS[number]
 
+// Display names — computed from sessionRoleConfig + toolMap, never stored
+export type DisplayNames = Record<AgentPanel, string>
+
+export function resolveDisplayNames(
+  config: RoleConfig,
+  toolMap: Record<string, ToolInfo>,
+  fallback?: (role: AgentPanel) => string
+): DisplayNames {
+  const fb = fallback ?? ((r: AgentPanel) => r === 'planner' ? 'Planner' : 'Reviewer')
+  return {
+    planner: toolMap[config.planner_tool_id]?.display_name ?? fb('planner'),
+    reviewer: toolMap[config.reviewer_tool_id]?.display_name ?? fb('reviewer'),
+  }
+}
+
 // Complete app state — everything event-handler and hydrator read/write
 export interface AppState {
-  // Layer 1: backend mirror
   session: SessionState
-
-  // Layer 2: event-derived
   logs: Record<AgentPanel, LogEntry[]>
   versions: Record<AgentPanel, VersionEntry[]>
   executionResult: string | null
   showExecResult: boolean
   executorPanel: AgentPanel
-
-  // Layer 2 attached: UI state that event-handler/hydrator write
-  activeVer: Record<AgentPanel, number>  // -1 = follow latest
+  activeVer: Record<AgentPanel, number>
   activeTab: Record<AgentPanel, 'log' | 'result'>
   activeFold: Record<AgentPanel, string | null>
   foldSeq: number
   doneBadge: string | null
-
-  // Layer 3: role config
-  roleConfig: RoleConfig
-  toolDisplayNames: Record<AgentPanel, string>
+  sessionRoleConfig: RoleConfig
 }
 
 export function createEmptyState(): AppState {
@@ -172,6 +182,7 @@ export function createEmptyState(): AppState {
       history_len: 0, error: null,
       planner_tool_id: 'claude-code', reviewer_tool_id: 'codex',
       executor_panel: 'planner',
+      review_round: 0, max_review_rounds: 3,
     },
     logs: { planner: [], reviewer: [] },
     versions: { planner: [], reviewer: [] },
@@ -183,7 +194,45 @@ export function createEmptyState(): AppState {
     activeFold: { planner: null, reviewer: null },
     foldSeq: 0,
     doneBadge: null,
-    roleConfig: { planner_tool_id: 'claude-code', reviewer_tool_id: 'codex' },
-    toolDisplayNames: { planner: 'Planner', reviewer: 'Reviewer' },
+    sessionRoleConfig: { planner_tool_id: 'claude-code', reviewer_tool_id: 'codex' },
   }
+}
+
+export interface TabData {
+  id: string
+  label: string
+  sid: string | null
+  cursor: number
+  snapshot: AppState
+  projectPath: string
+  taskValue: string
+  roundsValue: number
+  extraRounds: number
+  injectValue: string
+}
+
+export interface ArchivedSession {
+  session_id: string
+  task: string
+  project_path: string
+  final_status: string
+  current_round: number
+  max_rounds: number
+  consensus: boolean
+  consensus_round: number
+  planner_tool_id: string
+  reviewer_tool_id: string
+  created_at: string
+  finished_at: string
+}
+
+export interface ArchivedHistoryResponse {
+  entries: HistoryEntry[]
+  execution_result: string | null
+  review_entries: ReviewEntry[]
+  review_round: number
+  review_status: { status: string; round: number } | null
+  event_cursor: number
+  planner_tool_id: string
+  reviewer_tool_id: string
 }

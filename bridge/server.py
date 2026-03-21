@@ -161,6 +161,8 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
                 "planner_tool_id": sess.planner_tool_id,
                 "reviewer_tool_id": sess.reviewer_tool_id,
                 "executor_panel": _b._resolve_executor_panel(sess),
+                "review_round": sess.review_round,
+                "max_review_rounds": sess.max_review_rounds,
             })
         elif p.path == "/api/sessions":
             with sessions_lock:
@@ -386,11 +388,28 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
             if not sess:
                 return self._json({"error": "会话不存在"}, 404)
             with sess.status_lock:
-                if sess.status not in _b.FIXABLE_STATES:
+                if sess.status not in _b.REVIEW_SKIPPABLE_STATES:
                     return self._json({"error": "当前不在待修复状态"}, 400)
                 sess.status = "done"
-            add_event(sess, "review_done", {"round": sess.review_round, "msg": "用户跳过修复，任务结束。", "success": False})
+            add_event(sess, "review_done", {"round": sess.review_round, "msg": "用户跳过修复，任务结束。", "success": False, "msg_key": "be.skip_review"})
             _b._try_persist(sess)
+            self._json({"ok": True})
+        elif p.path == "/api/review_continue":
+            body = self._body()
+            sess = get_session(body.get("session_id"))
+            if not sess:
+                return self._json({"error": "会话不存在"}, 404)
+            extra = int(body.get("extra_rounds", 3))
+            if extra < 1 or extra > 20:
+                return self._json({"error": "额外轮次须在 1-20 之间"}, 400)
+            with sess.status_lock:
+                if sess.status not in _b.REVIEW_CONTINUABLE_STATES:
+                    return self._json({"error": "当前不在审查最大轮次状态"}, 400)
+                sess.status = "review_pending"
+            sess.max_review_rounds += extra
+            sess.stop_flag.clear()
+            add_event(sess, "status_change", {"status": "review_pending", "msg": "继续审查", "msg_key": "be.continue_review"})
+            threading.Thread(target=_b.run_review_fix_cycle, args=(sess,), daemon=True).start()
             self._json({"ok": True})
         elif p.path == "/api/prompts":
             body = self._body()
@@ -454,7 +473,8 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
             sess.max_rounds = lcr + extra
             sess.stop_flag.clear()
             add_event(sess, "status_change", {"status": "running",
-                      "msg": "驳回共识，继续协商" if cur == "consensus" else "继续协商"})
+                      "msg": "驳回共识，继续协商" if cur == "consensus" else "继续协商",
+                      "msg_key": "be.continue_rejected" if cur == "consensus" else "be.continue"})
             threading.Thread(
                 target=_b.run_negotiation, args=(sess,),
                 kwargs={"start_round": start_round}, daemon=True
@@ -471,8 +491,6 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
                 return self._json({"error": f"未注册的工具: {planner_id}"}, 400)
             if reviewer_id not in registered:
                 return self._json({"error": f"未注册的工具: {reviewer_id}"}, 400)
-            if planner_id == reviewer_id:
-                return self._json({"error": "Planner 和 Reviewer 不能是同一工具"}, 400)
             for tid in [planner_id, reviewer_id]:
                 if not _b._registry.get(tid).check_installed():
                     name = _b._registry.get(tid).display_name

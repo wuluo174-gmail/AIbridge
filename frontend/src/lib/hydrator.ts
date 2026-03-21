@@ -3,9 +3,11 @@
 // Input: API responses → Output: store state mutations
 
 import { api } from './api.js'
+import { isClosureText } from './protocol.js'
+import { resolveDisplayNames } from './types.js'
 import type {
   AppState, AgentPanel, SessionState, HistoryResponse,
-  LogEntry, ReviewEntry,
+  LogEntry, ReviewEntry, DisplayNames, ToolInfo,
 } from './types.js'
 
 function pushLog(state: AppState, agent: AgentPanel, entry: LogEntry): void {
@@ -17,47 +19,41 @@ function pushBothLogs(state: AppState, entry: LogEntry): void {
   state.logs.reviewer.push(entry)
 }
 
-export async function hydrateSession(sid: string, state: AppState): Promise<number> {
-  // Step 1: restore backend state snapshot
+export async function hydrateSession(sid: string, state: AppState, toolMap: Record<string, ToolInfo>, fallback?: (role: AgentPanel) => string): Promise<number> {
   const s = await api<SessionState>('GET', `/api/state?sid=${sid}`)
   state.session = s
   if (s.planner_tool_id) {
-    state.roleConfig = { planner_tool_id: s.planner_tool_id, reviewer_tool_id: s.reviewer_tool_id }
+    state.sessionRoleConfig = { planner_tool_id: s.planner_tool_id, reviewer_tool_id: s.reviewer_tool_id }
     state.executorPanel = s.executor_panel ?? 'planner'
   }
 
-  // Step 2: restore negotiation history → rebuild versions
+  const names = resolveDisplayNames(state.sessionRoleConfig, toolMap, fallback)
+
   const h = await api<HistoryResponse>('GET', `/api/history?sid=${sid}`)
   for (const entry of h.entries ?? []) {
-    const role = entry.role
-    if (role === 'user') continue
-    const agent = role as AgentPanel
+    if (entry.role === 'user') continue
+    const agent = entry.role as AgentPanel
     if (!state.versions[agent].some(v => v.round === entry.round)) {
       state.versions[agent].push({ round: entry.round, phase: entry.phase, content: entry.content })
     }
   }
   for (const agent of ['planner', 'reviewer'] as const) {
-    if (state.versions[agent].length) {
-      state.activeVer[agent] = -1
-    }
+    if (state.versions[agent].length) state.activeVer[agent] = -1
   }
 
-  // Step 3: restore execution result
   if (h.execution_result != null) {
     state.executionResult = h.execution_result
     state.showExecResult = true
   }
 
-  // Step 4: restore review context
   if (h.review_status) {
-    hydrateReviewContext(h, state)
+    hydrateReviewContext(h, state, names)
   }
 
-  // Step 5: return cursor to skip already-restored events
   return h.event_cursor ?? 0
 }
 
-export function hydrateReviewContext(history: HistoryResponse, state: AppState): void {
+export function hydrateReviewContext(history: HistoryResponse, state: AppState, names: DisplayNames): void {
   pushBothLogs(state, { kind: 'separator', level: 'ok', text: '══════ 执行后审查开始 ══════' })
 
   for (const h of history.review_entries ?? []) {
@@ -67,8 +63,8 @@ export function hydrateReviewContext(history: HistoryResponse, state: AppState):
     })
     if (h.content) {
       const label = h.role === 'planner'
-        ? `${state.toolDisplayNames.planner} 修复总结`
-        : `${state.toolDisplayNames.reviewer} 审查意见`
+        ? `${names.planner} 修复总结`
+        : `${names.reviewer} 审查意见`
       pushLog(state, h.role, { kind: 'collapsible', label, content: h.content, open: false })
       const other: AgentPanel = h.role === 'planner' ? 'reviewer' : 'planner'
       pushLog(state, other, { kind: 'collapsible', label: `查看${label}`, content: h.content, open: false })
@@ -80,21 +76,25 @@ export function hydrateReviewContext(history: HistoryResponse, state: AppState):
 
   if (rs.status === 'done') {
     const lastReviewer = (history.review_entries ?? [])
-      .filter((e: ReviewEntry) => e.role === 'reviewer')
-      .pop()
-    const success = lastReviewer?.content?.split('\n')[0]?.includes('任务收口成功') ?? false
+      .filter((e: ReviewEntry) => e.role === 'reviewer').pop()
+    const success = isClosureText(lastReviewer?.content ?? '')
     const msg = success ? '══════ 任务收口成功 ══════' : '⚠ 审查完成（未达成收口确认）'
     pushBothLogs(state, { kind: 'separator', level: success ? 'ok' : 'sys', text: msg })
     state.doneBadge = success ? '✓ 收口成功' : '⚠ 审查完成'
   } else if (rs.status === 'review_fix') {
     pushBothLogs(state, {
       kind: 'separator', level: 'sys',
-      text: `⚠ ${state.toolDisplayNames.reviewer} 发现问题，等待你确认是否修复。`,
+      text: `⚠ ${names.reviewer} 发现问题，等待你确认是否修复。`,
+    })
+  } else if (rs.status === 'review_max_rounds') {
+    pushBothLogs(state, {
+      kind: 'separator', level: 'sys',
+      text: `⚠ 已达最大审查轮次，等待你选择继续审查或跳过。`,
     })
   } else if (rs.status === 'review_pending') {
     pushLog(state, 'reviewer', {
       kind: 'separator', level: 'sys',
-      text: `[${state.toolDisplayNames.reviewer} 评审中...]`,
+      text: `[${names.reviewer} 评审中...]`,
     })
   }
 }

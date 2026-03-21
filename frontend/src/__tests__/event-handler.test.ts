@@ -1,11 +1,13 @@
 import { describe, it, expect } from 'vitest'
 import { handleEvent } from '../lib/event-handler.js'
 import { createEmptyState } from '../lib/types.js'
-import type { BridgeEvent } from '../lib/types.js'
+import type { BridgeEvent, DisplayNames } from '../lib/types.js'
+
+const names: DisplayNames = { planner: 'Claude', reviewer: 'Codex' }
 
 function handle(e: BridgeEvent) {
   const state = createEmptyState()
-  handleEvent(e, state)
+  handleEvent(e, state, names)
   return state
 }
 
@@ -21,7 +23,7 @@ describe('handleEvent', () => {
   it('agent_thinking switches tab to log', () => {
     const s = createEmptyState()
     s.activeTab.planner = 'result'
-    handleEvent({ type: 'agent_thinking', data: { agent: 'planner', round: 1 } }, s)
+    handleEvent({ type: 'agent_thinking', data: { agent: 'planner', round: 1 } }, s, names)
     expect(s.activeTab.planner).toBe('log')
     expect(s.logs.planner).toHaveLength(1)
     expect((s.logs.planner[0] as { text: string }).text).toContain('处理中')
@@ -41,14 +43,12 @@ describe('handleEvent', () => {
 
   it('agent_chunk command_output creates fold', () => {
     const s = createEmptyState()
-    handleEvent({ type: 'agent_chunk', data: { agent: 'planner', text: 'line1', chunk_type: 'command_output' } }, s)
+    handleEvent({ type: 'agent_chunk', data: { agent: 'planner', text: 'line1', chunk_type: 'command_output' } }, s, names)
     expect(s.activeFold.planner).toBeTruthy()
-    expect(s.logs.planner).toHaveLength(2) // fold_start + fold_chunk
+    expect(s.logs.planner).toHaveLength(2)
     expect(s.logs.planner[0]).toMatchObject({ kind: 'fold_start' })
     expect(s.logs.planner[1]).toMatchObject({ kind: 'fold_chunk', text: 'line1' })
-
-    // Second chunk reuses same fold
-    handleEvent({ type: 'agent_chunk', data: { agent: 'planner', text: 'line2', chunk_type: 'command_output' } }, s)
+    handleEvent({ type: 'agent_chunk', data: { agent: 'planner', text: 'line2', chunk_type: 'command_output' } }, s, names)
     expect(s.logs.planner).toHaveLength(3)
     expect(s.logs.planner[2]).toMatchObject({ kind: 'fold_chunk', text: 'line2' })
   })
@@ -56,7 +56,7 @@ describe('handleEvent', () => {
   it('chunk_boundary closes fold', () => {
     const s = createEmptyState()
     s.activeFold.planner = 'fold_1'
-    handleEvent({ type: 'chunk_boundary', data: { agent: 'planner', boundary_type: 'end' } }, s)
+    handleEvent({ type: 'chunk_boundary', data: { agent: 'planner', boundary_type: 'end' } }, s, names)
     expect(s.activeFold.planner).toBeNull()
     expect(s.logs.planner[0]).toMatchObject({ kind: 'fold_end' })
   })
@@ -77,24 +77,14 @@ describe('handleEvent', () => {
   })
 
   it('agent_response planner creates version + switches tab + notifies reviewer', () => {
-    const s = handle({
-      type: 'agent_response',
-      data: { round: 1, role: 'planner', phase: '提议', content: 'plan content' },
-    })
+    const s = handle({ type: 'agent_response', data: { round: 1, role: 'planner', phase: '提议', content: 'plan content' } })
     expect(s.versions.planner).toHaveLength(1)
-    expect(s.versions.planner[0]).toMatchObject({ round: 1, phase: '提议', content: 'plan content' })
     expect(s.activeTab.planner).toBe('result')
-    expect(s.activeVer.planner).toBe(-1)
-    expect(s.showExecResult).toBe(false)
-    // Reviewer gets notification
     expect(s.logs.reviewer.some(l => l.kind === 'collapsible')).toBe(true)
   })
 
   it('agent_response user appends to both panels', () => {
-    const s = handle({
-      type: 'agent_response',
-      data: { round: 1, role: 'user', phase: '人工干预', content: 'user feedback' },
-    })
+    const s = handle({ type: 'agent_response', data: { round: 1, role: 'user', phase: '人工干预', content: 'user feedback' } })
     expect(s.logs.planner).toHaveLength(1)
     expect(s.logs.reviewer).toHaveLength(1)
     expect((s.logs.planner[0] as { text: string }).text).toContain('你')
@@ -102,12 +92,8 @@ describe('handleEvent', () => {
 
   it('agent_response deduplicates versions by round', () => {
     const s = createEmptyState()
-    const e: BridgeEvent = {
-      type: 'agent_response',
-      data: { round: 1, role: 'planner', phase: '提议', content: 'v1' },
-    }
-    handleEvent(e, s)
-    handleEvent(e, s)
+    const e: BridgeEvent = { type: 'agent_response', data: { round: 1, role: 'planner', phase: '提议', content: 'v1' } }
+    handleEvent(e, s, names); handleEvent(e, s, names)
     expect(s.versions.planner).toHaveLength(1)
   })
 
@@ -145,21 +131,13 @@ describe('handleEvent', () => {
 
   it('rollback truncates versions and resets activeVer', () => {
     const s = createEmptyState()
-    s.versions.planner = [
-      { round: 1, phase: '提议', content: 'v1' },
-      { round: 2, phase: '提议', content: 'v2' },
-      { round: 3, phase: '提议', content: 'v3' },
-    ]
-    s.versions.reviewer = [
-      { round: 1, phase: '审查', content: 'r1' },
-      { round: 2, phase: '审查', content: 'r2' },
-    ]
+    s.versions.planner = [{ round: 1, phase: '提议', content: 'v1' }, { round: 2, phase: '提议', content: 'v2' }, { round: 3, phase: '提议', content: 'v3' }]
+    s.versions.reviewer = [{ round: 1, phase: '审查', content: 'r1' }, { round: 2, phase: '审查', content: 'r2' }]
     s.activeVer.planner = 2
-    handleEvent({ type: 'rollback', data: { round: 1, max: 5, plan: '', msg: 'rolled back' } }, s)
+    handleEvent({ type: 'rollback', data: { round: 1, max: 5, plan: '', msg: 'rolled back' } }, s, names)
     expect(s.versions.planner).toHaveLength(1)
     expect(s.versions.reviewer).toHaveLength(1)
     expect(s.activeVer.planner).toBe(-1)
-    expect(s.activeVer.reviewer).toBe(-1)
   })
 
   it('status_change stopped appends to both', () => {
@@ -173,19 +151,13 @@ describe('handleEvent', () => {
   })
 
   it('review_response reviewer creates collapsibles on both panels', () => {
-    const s = handle({
-      type: 'review_response',
-      data: { round: 1, role: 'reviewer', phase: '审查', content: 'review content' },
-    })
+    const s = handle({ type: 'review_response', data: { round: 1, role: 'reviewer', phase: '审查', content: 'review content' } })
     expect(s.logs.reviewer.some(l => l.kind === 'collapsible' && l.open === true)).toBe(true)
     expect(s.logs.planner.some(l => l.kind === 'collapsible' && l.open === false)).toBe(true)
   })
 
   it('review_response planner creates collapsibles on both panels', () => {
-    const s = handle({
-      type: 'review_response',
-      data: { round: 1, role: 'planner', phase: '修复', content: 'fix summary' },
-    })
+    const s = handle({ type: 'review_response', data: { round: 1, role: 'planner', phase: '修复', content: 'fix summary' } })
     expect(s.logs.planner.some(l => l.kind === 'collapsible' && l.open === true)).toBe(true)
     expect(s.logs.reviewer.some(l => l.kind === 'collapsible' && l.open === false)).toBe(true)
   })

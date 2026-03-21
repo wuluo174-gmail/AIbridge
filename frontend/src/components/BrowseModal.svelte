@@ -1,5 +1,6 @@
 <script lang="ts">
   import { store } from '../lib/store.svelte.js'
+  import { showAlert } from '../lib/dialog.svelte.js'
 
   let { open = $bindable(false), onSelect }: { open: boolean; onSelect: (path: string) => void } = $props()
 
@@ -11,10 +12,6 @@
   let selectedPath = $state('')
   let clickTimer: ReturnType<typeof setTimeout> | null = null
 
-  function escapeHtml(s: string): string {
-    return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-  }
-
   export async function openAt(initialPath: string) {
     open = true
     await browseDir(initialPath || '')
@@ -22,13 +19,13 @@
 
   async function browseDir(path: string) {
     const r = await store.browseDir(path)
-    if (r.error) { alert(r.error); return }
+    if (r.error) { await showAlert(r.error); return }
     browseCurrent = r.current
     selectedPath = r.current
     pathInput = r.current
     parent = r.parent
     dirs = r.dirs
-    info = r.current + (r.is_git ? '  (git repo)' : '') + (r.truncated ? '  [仅显示前200项]' : '')
+    info = r.current + (r.is_git ? '  ' + store.t('browse.git_tag') : '') + (r.truncated ? '  ' + store.t('browse.truncated') : '')
   }
 
   function onClose() { open = false }
@@ -65,14 +62,14 @@
   <div class="modal-mask open">
     <div class="modal">
       <div class="modal-hdr">
-        <span>选择项目文件夹</span>
+        <span>{store.t('browse.title')}</span>
         <button class="close" onclick={onClose}>&times;</button>
       </div>
       <div class="modal-body" style="padding:0">
         <div class="browse-bar">
-          <input type="text" bind:value={pathInput} placeholder="输入路径直接跳转..."
+          <input type="text" bind:value={pathInput} placeholder={store.t('browse.path_ph')}
             onkeydown={onPathKeydown} />
-          <button class="btn" onclick={onGoClick}>前往</button>
+          <button class="btn" onclick={onGoClick}>{store.t('browse.go')}</button>
         </div>
         <div style="overflow-y:auto;max-height:55vh">
           {#if parent}
@@ -96,7 +93,7 @@
             </div>
           {/each}
           {#if !dirs.length && parent}
-            <div style="padding:20px;text-align:center;color:var(--dim)">没有子文件夹</div>
+            <div style="padding:20px;text-align:center;color:var(--dim)">{store.t('browse.empty')}</div>
           {/if}
         </div>
       </div>
@@ -104,8 +101,8 @@
         <div style="flex:1;font-size:12px;color:var(--dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">
           {info}
         </div>
-        <button class="btn btn-cancel" onclick={onClose}>取消</button>
-        <button class="btn btn-save" onclick={onSelectClick}>选择此文件夹</button>
+        <button class="btn btn-cancel" onclick={onClose}>{store.t('common.cancel')}</button>
+        <button class="btn btn-save" onclick={onSelectClick}>{store.t('browse.select')}</button>
       </div>
     </div>
   </div>

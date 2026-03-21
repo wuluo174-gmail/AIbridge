@@ -17,11 +17,11 @@
     <span class={dotClass}></span>
     <span class="panel-tool-name">{displayName}</span>
     {#if store.doneBadge && agent === store.executorPanel}
-      <span class="done-badge">{store.doneBadge}</span>
+      <span class="done-badge">{store.t(store.doneBadge)}</span>
     {/if}
     <div class="tab-group">
-      <button class="tab" class:active={logActive} onclick={() => store.switchTab(agent, 'log')}>过程</button>
-      <button class="tab" class:active={resultActive} onclick={() => store.switchTab(agent, 'result')}>结果</button>
+      <button class="tab" class:active={logActive} onclick={() => store.switchTab(agent, 'log')}>{store.t('panel.log')}</button>
+      <button class="tab" class:active={resultActive} onclick={() => store.switchTab(agent, 'result')}>{store.t('panel.result')}</button>
     </div>
   </div>
   <div class="tab-body">

@@ -30,6 +30,7 @@ from pathlib import Path
 # ── re-exports: bridge.protocol ──
 from bridge.protocol import (
     EXECUTABLE_STATES, FIXABLE_STATES, CONTINUABLE_STATES,
+    REVIEW_CONTINUABLE_STATES, REVIEW_SKIPPABLE_STATES,
     is_approved,
 )
 
@@ -179,8 +180,13 @@ def create_session(sid, task, project, rounds):
     reviewer = _registry.get(_role_config.reviewer_tool_id)
     sess.planner_tool_id = planner.id
     sess.reviewer_tool_id = reviewer.id
-    sess.init_adapter_state(planner.id, planner.capabilities)
-    sess.init_adapter_state(reviewer.id, reviewer.capabilities)
+    sess.planner_state_key = planner.id
+    sess.reviewer_state_key = (
+        f"{reviewer.id}:reviewer" if reviewer.id == planner.id
+        else reviewer.id
+    )
+    sess.init_adapter_state(sess.planner_state_key, planner.capabilities)
+    sess.init_adapter_state(sess.reviewer_state_key, reviewer.capabilities)
     return sess
 
 
@@ -251,7 +257,7 @@ def _resolve_execution_roles(sess):
 
     # 会话状态键: executor==planner → 复用协商 session; 否则独立 session
     if executor.id == sess.planner_tool_id:
-        exec_state_key = executor.id
+        exec_state_key = sess.planner_state_key
     else:
         exec_state_key = f"{executor.id}:exec"
         if exec_state_key not in sess.adapter_state:
@@ -261,7 +267,7 @@ def _resolve_execution_roles(sess):
             }
 
     if exec_reviewer_id == sess.reviewer_tool_id:
-        er_state_key = exec_reviewer_id
+        er_state_key = sess.reviewer_state_key
     else:
         er_state_key = f"{exec_reviewer_id}:exec_review"
         if er_state_key not in sess.adapter_state:
@@ -508,8 +514,8 @@ def run_negotiation(sess, start_round=1):
 
     _engine.run_negotiation(
         sess, start_round=start_round,
-        call_planner=_make_role_caller(planner, "planner", planner.id),
-        call_reviewer=_make_role_caller(reviewer_adapter, "reviewer", reviewer_adapter.id),
+        call_planner=_make_role_caller(planner, "planner", sess.planner_state_key),
+        call_reviewer=_make_role_caller(reviewer_adapter, "reviewer", sess.reviewer_state_key),
         reviewer_adapter=reviewer_adapter,
         build_planner_first_prompt=build_claude_first_prompt,
         build_planner_revise_prompt=build_claude_revise_prompt,

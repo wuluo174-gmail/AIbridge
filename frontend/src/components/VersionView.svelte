@@ -28,15 +28,15 @@
           class="ver-tab vt-exec"
           class:active={store.showExecResult}
           onclick={() => onTabClick(-2)}
-        >执行结果</button>
+        >{store.t('ver.exec_result')}</button>
       {/if}
     </div>
     <div class="ver-content">
       {#if agent === store.executorPanel && store.showExecResult && store.executionResult != null}
-        <span class="ok">── 执行结果 ──</span>
+        <span class="ok">── {store.t('ver.exec_result')} ──</span>
 {store.executionResult}
       {:else if vers.length && vers[idx]}
-        <span class="ok">── R{vers[idx].round} {vers[idx].phase} ──</span>
+        <span class="ok">── R{vers[idx].round} {store.tPhase(vers[idx].phase)} ──</span>
 {vers[idx].content}
       {/if}
     </div>

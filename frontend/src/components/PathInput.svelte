@@ -16,7 +16,7 @@
     if (value.trim()) return
     const r = await store.recentPaths()
     if (!r.paths?.length) { dropdownOpen = false; return }
-    items = r.paths.map((p, i) => ({ path: p, name: p, section: i === 0 ? '最近使用' : undefined }))
+    items = r.paths.map((p, i) => ({ path: p, name: p, section: i === 0 ? store.t('path.recent') : undefined }))
     dropdownOpen = true
   }
 
@@ -41,11 +41,11 @@
 
 <div class="field f-path">
   <!-- svelte-ignore a11y_label_has_associated_control -->
-  <label>项目路径</label>
+  <label>{store.t('path.label')}</label>
   <div class="path-wrap">
-    <input type="text" bind:value autocomplete="off" placeholder="输入路径或点击浏览..."
+    <input type="text" bind:value autocomplete="off" placeholder={store.t('path.ph')}
       oninput={onInput} onfocus={onFocus} onblur={onBlur} />
-    <button class="btn btn-browse" title="浏览文件夹" onclick={onBrowse}>📂</button>
+    <button class="btn btn-browse" title={store.t('path.browse')} onclick={onBrowse}>📂</button>
     <div class="path-dropdown" class:open={dropdownOpen}>
       {#each items as item}
         {#if item.section}

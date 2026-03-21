@@ -151,7 +151,8 @@ class ClaudeCodeAdapter(CLIAdapter):
             return plan_content
         if plan_content:
             add_event(sess, "warning", {
-                "msg": "检测到 plan 文件内容与当前任务不相关，已忽略（可能来自外部 Claude 进程）"
+                "msg": "检测到 plan 文件内容与当前任务不相关，已忽略（可能来自外部 Claude 进程）",
+                "msg_key": "be.plan_irrelevant",
             })
         return output
 

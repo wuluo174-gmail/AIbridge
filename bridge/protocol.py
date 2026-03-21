@@ -25,6 +25,7 @@ STATES = frozenset({
     "executing",
     "review_pending",
     "review_fix",
+    "review_max_rounds",
     "done",
     "error",
 })
@@ -37,6 +38,9 @@ FIXABLE_STATES = frozenset({"review_fix"})
 
 # 可从中继续协商的状态
 CONTINUABLE_STATES = frozenset({"consensus", "max_rounds"})
+
+REVIEW_CONTINUABLE_STATES = frozenset({"review_max_rounds"})
+REVIEW_SKIPPABLE_STATES = frozenset({"review_fix", "review_max_rounds"})
 
 # 终态 (轮询停止)
 TERMINAL_STATES = frozenset({"idle", "done", "error"})
@@ -52,6 +56,14 @@ def is_approved(text):
         return False
     first_line = text.strip().split("\n")[0]
     return bool(re.match(r'\s*APPROVED\b', first_line, re.IGNORECASE))
+
+
+def is_closure(text):
+    """收口判定：首行以"任务收口成功"开头，后接边界（空白、标点、行尾）。"""
+    if not text:
+        return False
+    first_line = text.strip().split("\n")[0]
+    return bool(re.match(r'\s*任务收口成功(?:\s|[，。：:,.!！]|$)', first_line))
 
 
 # ═════════════════════════════════════════════════════════════════
@@ -84,6 +96,7 @@ EVENT_TYPES = frozenset({
     "review_response",
     "review_needs_fix",
     "review_done",
+    "review_max_rounds_reached",
 })
 
 
@@ -134,6 +147,7 @@ POST_ENDPOINTS = (
     "/api/stop",            # 停止
     "/api/review_fix",      # 确认修复
     "/api/review_skip",     # 跳过修复
+    "/api/review_continue", # 继续审查
     "/api/prompts",         # 更新提示词
     "/api/inject",          # 注入反馈
     "/api/continue",        # 继续协商
@@ -149,6 +163,7 @@ STATE_RESPONSE_KEYS = frozenset({
     "status", "round", "max_rounds", "consensus",
     "consensus_round", "history_len", "error",
     "planner_tool_id", "reviewer_tool_id", "executor_panel",
+    "review_round", "max_review_rounds",
 })
 
 HISTORY_RESPONSE_KEYS = frozenset({
@@ -229,4 +244,5 @@ EVENT_PAYLOAD_REQUIRED_KEYS = {
     "review_response":      {"round", "role", "phase", "content"},
     "review_needs_fix":     {"round", "msg", "review"},
     "review_done":          {"round", "msg", "success"},
+    "review_max_rounds_reached": {"round", "msg"},
 }

@@ -7,7 +7,7 @@
 </script>
 
 <div class="inject">
-  <input type="text" bind:value={store.injectValue} placeholder="协商中插入你的意见..."
+  <input type="text" bind:value={store.injectValue} placeholder={store.t('inject.ph')}
     onkeydown={onKeydown} />
-  <button class="btn btn-inj" disabled={!store.canInject} onclick={() => store.doInject()}>发送</button>
+  <button class="btn btn-inj" disabled={!store.canInject} onclick={() => store.doInject()}>{store.t('inject.send')}</button>
 </div>

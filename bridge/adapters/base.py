@@ -229,13 +229,9 @@ class CLIAdapter(ABC):
         return is_approved(text)
 
     def detect_closure(self, text: str) -> bool:
-        """检测执行后审查结果是否为"任务收口成功"。
-
-        默认实现: 首行含"任务收口成功"。
-        """
-        if not text:
-            return False
-        return "任务收口成功" in text.split("\n")[0]
+        """检测执行后审查结果是否为"任务收口成功"。默认委托 protocol.is_closure()。"""
+        from bridge.protocol import is_closure
+        return is_closure(text)
 
     # ── 共享工具 ──
 

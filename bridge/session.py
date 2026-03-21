@@ -96,6 +96,8 @@ class SessionState:
         # ── Step 7: 角色配置 + 泛化会话追踪 ──
         self.planner_tool_id = "claude-code"
         self.reviewer_tool_id = "codex"
+        self.planner_state_key = None
+        self.reviewer_state_key = None
         # 默认初始化 adapter_state — 两个内置工具
         # create_session() 会用 init_adapter_state() 覆盖为实际值
         _default_claude_sid = str(uuid.uuid4())
