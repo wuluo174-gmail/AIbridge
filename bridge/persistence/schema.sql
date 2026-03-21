@@ -50,8 +50,11 @@ CREATE INDEX IF NOT EXISTS idx_review_history_sid ON review_history(session_id);
 CREATE TABLE IF NOT EXISTS cli_tools (
     id TEXT PRIMARY KEY,                   -- "claude-code", "codex"
     display_name TEXT NOT NULL,
+    agent_name TEXT,
+    detected_installed INTEGER DEFAULT 0,
     executable_path TEXT,
     version TEXT,
+    probe_error TEXT,
     capabilities_json TEXT DEFAULT '{}',   -- 能力矩阵 JSON 快照
     last_checked_at TEXT
 );
@@ -64,6 +67,8 @@ CREATE TABLE IF NOT EXISTS role_assignments (
     reviewer_tool_id TEXT NOT NULL REFERENCES cli_tools(id),
     is_active INTEGER DEFAULT 0
 );
+CREATE UNIQUE INDEX IF NOT EXISTS idx_role_assignments_name
+ON role_assignments(name);
 
 -- 提示词模板
 CREATE TABLE IF NOT EXISTS prompt_templates (
@@ -78,4 +83,10 @@ CREATE TABLE IF NOT EXISTS prompt_templates (
 CREATE TABLE IF NOT EXISTS recent_paths (
     path TEXT PRIMARY KEY,
     last_used_at TEXT NOT NULL
+);
+
+-- 内部元数据（迁移标记等）
+CREATE TABLE IF NOT EXISTS _meta (
+    key TEXT PRIMARY KEY,
+    value TEXT
 );

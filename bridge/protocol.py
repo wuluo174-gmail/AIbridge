@@ -7,6 +7,7 @@ Bridge 协议常量 — 唯一权威真相源
 当文档与本模块冲突时，以本模块为准。
 
 所有常量从 bridge.py 代码逐行提取，行号标注基于 commit cdc4613。
+Step 7: 新增 /api/tools, /api/role_config 端点 + 扩展响应键。
 """
 
 import re
@@ -59,49 +60,49 @@ def is_approved(text):
 
 EVENT_TYPES = frozenset({
     # 协商阶段 (14 种)
-    "status_change",        # L640,646,761,809,857,1138,1224
-    "round_start",          # L650
-    "agent_thinking",       # L653,682,811,864,884
-    "cli_start",            # L220,357 — 前端未处理
-    "agent_chunk",          # L194,277,285,388,399,404,410
-    "chunk_boundary",       # L411
-    "agent_stderr",         # L192
-    "agent_result",         # L331,427 — 前端 case 为空 break
-    "agent_response",       # L676,700,1185,1218 (via add_history_event)
-    "consensus_reached",    # L708
-    "max_rounds_reached",   # L716
-    "warning",              # L319
-    "rollback",             # L746
-    "error",                # L756,800,841,912
+    "status_change",
+    "round_start",
+    "agent_thinking",
+    "cli_start",
+    "agent_chunk",
+    "chunk_boundary",
+    "agent_stderr",
+    "agent_result",
+    "agent_response",
+    "consensus_reached",
+    "max_rounds_reached",
+    "warning",
+    "rollback",
+    "error",
 
     # 执行阶段 (1 种)
-    "execution_done",       # L786
+    "execution_done",
 
     # 审查循环 (5 种)
-    "review_start",         # L810
-    "review_round_start",   # L858
-    "review_response",      # L826,877,897 (via add_history_event)
-    "review_needs_fix",     # L835,906
-    "review_done",          # L831,851,902,1161
+    "review_start",
+    "review_round_start",
+    "review_response",
+    "review_needs_fix",
+    "review_done",
 })
 
 
 # ═════════════════════════════════════════════════════════════════
-# 提示词配置键 (11 个) — prompts.json + 前端 cfgKeys (L1910)
+# 提示词配置键 (11 个) — prompts.json + 前端 cfgKeys
 # ═════════════════════════════════════════════════════════════════
 
 PROMPT_KEYS = (
-    "claude_first",                  # L452
-    "claude_revise",                 # L474
-    "codex_first",                   # L480
-    "codex_review",                  # L491
-    "execution",                     # L502
-    "execution_unapproved",          # L506
-    "codex_post_review",             # L592
-    "claude_post_fix",               # L598
-    "codex_post_review_followup",    # L605
-    "user_inject_label_claude",      # L472
-    "user_inject_label_codex",       # L489
+    "claude_first",
+    "claude_revise",
+    "codex_first",
+    "codex_review",
+    "execution",
+    "execution_unapproved",
+    "codex_post_review",
+    "claude_post_fix",
+    "codex_post_review_followup",
+    "user_inject_label_claude",
+    "user_inject_label_codex",
 )
 
 PROMPT_KEYS_SET = frozenset(PROMPT_KEYS)
@@ -112,26 +113,31 @@ PROMPT_KEYS_SET = frozenset(PROMPT_KEYS)
 # ═════════════════════════════════════════════════════════════════
 
 GET_ENDPOINTS = (
-    "/",                    # L947 — HTML UI
-    "/api/events",          # L954 — 事件轮询
-    "/api/state",           # L962 — 会话状态
-    "/api/sessions",        # L977 — 会话列表
-    "/api/history",         # L988 — 协商/审查历史
-    "/api/browse",          # L1021 — 目录浏览
-    "/api/complete",        # L1051 — 路径补全
-    "/api/recent_paths",    # L1080 — 最近路径
-    "/api/prompts",         # L1082 — 提示词配置
+    "/",                    # HTML UI
+    "/api/events",          # 事件轮询
+    "/api/state",           # 会话状态
+    "/api/sessions",        # 会话列表
+    "/api/history",         # 协商/审查历史
+    "/api/browse",          # 目录浏览
+    "/api/complete",        # 路径补全
+    "/api/recent_paths",    # 最近路径
+    "/api/prompts",         # 提示词配置
+    "/api/archived_sessions",         # 已归档会话列表
+    "/api/archived_session_history",  # 已归档会话详细历史
+    "/api/tools",           # Step 7: 已注册工具列表
+    "/api/role_config",     # Step 7: 角色配置
 )
 
 POST_ENDPOINTS = (
-    "/api/start",           # L1089 — 启动协商
-    "/api/execute",         # L1113 — 触发执行
-    "/api/stop",            # L1125 — 停止
-    "/api/review_fix",      # L1140 — 确认修复
-    "/api/review_skip",     # L1152 — 跳过修复
-    "/api/prompts",         # L1163 — 更新提示词
-    "/api/inject",          # L1169 — 注入反馈
-    "/api/continue",        # L1187 — 继续协商
+    "/api/start",           # 启动协商
+    "/api/execute",         # 触发执行
+    "/api/stop",            # 停止
+    "/api/review_fix",      # 确认修复
+    "/api/review_skip",     # 跳过修复
+    "/api/prompts",         # 更新提示词
+    "/api/inject",          # 注入反馈
+    "/api/continue",        # 继续协商
+    "/api/role_config",     # Step 7: 更新角色配置
 )
 
 
@@ -142,6 +148,7 @@ POST_ENDPOINTS = (
 STATE_RESPONSE_KEYS = frozenset({
     "status", "round", "max_rounds", "consensus",
     "consensus_round", "history_len", "error",
+    "planner_tool_id", "reviewer_tool_id", "executor_panel",
 })
 
 HISTORY_RESPONSE_KEYS = frozenset({
@@ -167,6 +174,34 @@ RECENT_PATHS_RESPONSE_KEYS = frozenset({"paths"})
 
 START_RESPONSE_KEYS = frozenset({"ok", "session_id"})
 
+ARCHIVED_SESSIONS_RESPONSE_KEYS = frozenset({"sessions"})
+
+ARCHIVED_SESSION_LISTING_KEYS = frozenset({
+    "session_id", "task", "project_path", "final_status",
+    "current_round", "max_rounds", "consensus", "consensus_round",
+    "planner_tool_id", "reviewer_tool_id",
+    "created_at", "finished_at",
+})
+
+ARCHIVED_HISTORY_RESPONSE_KEYS = frozenset({
+    "entries", "execution_result", "review_entries",
+    "review_round", "review_status", "event_cursor",
+    "planner_tool_id", "reviewer_tool_id",
+})
+
+# Step 7: 工具/角色配置响应键
+TOOLS_RESPONSE_KEYS = frozenset({"tools"})
+
+TOOL_LISTING_KEYS = frozenset({
+    "id", "display_name", "agent_name", "detected_installed",
+    "executable_path", "version", "probe_error", "last_checked_at",
+    "capabilities",
+})
+
+ROLE_CONFIG_RESPONSE_KEYS = frozenset({
+    "planner_tool_id", "reviewer_tool_id", "executor_tool_id", "tools",
+})
+
 
 # ═════════════════════════════════════════════════════════════════
 # 事件 payload 必需字段 (用于 contract test 断言)
@@ -188,7 +223,7 @@ EVENT_PAYLOAD_REQUIRED_KEYS = {
     "warning":              {"msg"},
     "rollback":             {"round", "max", "plan", "msg"},
     "error":                {"msg"},
-    "execution_done":       {"result"},
+    "execution_done":       {"result", "executor_panel"},
     "review_start":         {"round", "max"},
     "review_round_start":   {"round", "max"},
     "review_response":      {"round", "role", "phase", "content"},

@@ -12,19 +12,30 @@
 
 ---
 
-## 2. 当前架构 (bridge.py 单文件)
+## 2. 仓库结构
 
 ```
-bridge.py (2167 行)
-├── 全局配置 (L32-62): prompts.json, recent_paths.json, STREAM_DEBUG
-├── Session 管理 (L64-131): SessionState, add_event, add_history_event
-├── Plan 文件归属 (L133-172): 快照差集 + 关键词校验
-├── CLI Wrappers (L176-437): call_claude_streaming, call_codex_streaming
-├── 提示词构建 (L440-606): build_*_prompt 系列函数
-├── Git 工具 (L517-606): baseline 捕获 + diff 生成
-├── 编排引擎 (L609-912): run_negotiation, run_execution, run_first_review, run_review_fix_cycle
-├── HTTP Server (L915-1240): ThreadedHTTPServer, BridgeHandler (9 GET + 8 POST)
-└── HTML UI (L1243-2132): 内嵌前端 (~900 行 HTML/CSS/JS)
+bridge/                          ← Python 后端模块
+├── protocol.py                    事件类型 + 协议常量
+├── adapters/                      CLI 适配器 (claude, codex)
+├── orchestration/                 编排引擎 + 提示词构建
+├── persistence/                   SQLite store + schema
+├── server.py                      HTTP Server (9 GET + 8 POST) + HTML_UI 冻结快照
+└── session.py                     SessionState + 事件管理
+
+frontend/                        ← Svelte 5 + TypeScript 前端 (Vite 构建)
+├── src/
+│   ├── components/                11 个 Svelte 组件
+│   ├── lib/                       store, event-handler, hydrator, types, api
+│   └── App.svelte                 根组件
+└── dist/                          构建产物 (gitignored，server.py 优先伺服)
+
+src-tauri/                       ← Tauri v2 桌面壳 (Rust)
+├── src/main.rs                    进程管理 + webview 导航
+└── tauri.conf.json                构建/dev 配置
+
+bridge.py                        ← 薄 facade + main() 入口
+tests/test_contract.py           ← 合同测试 (199 cases)
 ```
 
 ### 数据流
@@ -168,18 +179,18 @@ class CLIAdapter(ABC):
 | **Electron** | 生态最成熟，调试工具完善，社区大 | 包体大 (150MB+)，内存占用高 | 重视开发效率和生态 |
 | **保持 HTTP+浏览器** | 零打包成本，当前方案直接可用 | 非原生体验，无系统集成 (通知/托盘等) | 优先快速迭代，暂不关注分发 |
 
-**决策时机**: Step 8 (Python 内核拆分完成后)
+**Step 8A 决策 (macOS POC)**: Tauri v2。Python 后端通过 `/bin/zsh -c` 启动（复制 `.command` 的 PATH + zshrc 语义）。
+进程管理：`start_new_session=True` 隔离 CLI 进程组，`proc_lock` 保护 pgid 原子读写，
+二段式清理 (SIGTERM → 3s → SIGKILL)。Tauri webview 加载 `http://localhost:PORT/`。
+Linux 可从此 POC 延伸（同为 POSIX），Windows 为独立后续步骤。
 
 ### 4.2 前端框架
 
-| 方案 | 优势 | 劣势 |
-|------|------|------|
-| **React + TypeScript** | 生态最大，Tauri 集成示例多 | 学习曲线，引入构建工具链 |
-| **Vue 3 + TypeScript** | 模板语法直观，渐进式迁移友好 | 生态相对较小 |
-| **Svelte** | 编译时优化，包体极小 | 生态最小，招人难 |
-| **保持 vanilla JS** | 零依赖，已验证可用 | 组件化困难，状态管理 ad-hoc |
+**已决策: Svelte 5 + TypeScript** (Step 9 实施完成)
 
-**决策时机**: Step 9 (协议和 API 稳定后)
+- 编译时优化，包体极小，Svelte 5 runes 提供细粒度响应式
+- frontend/ 为独立 Vite 项目，Tauri beforeBuildCommand / beforeDevCommand 自动编译
+- server.py 保留 HTML_UI 冻结快照供无构建环境降级
 
 ### 4.3 持久化
 
@@ -224,7 +235,7 @@ Step 7: adapter 扩展 + 角色配置 UI
     │
 Step 8: 桌面壳选型 + 集成
     │
-Step 9: 前端框架迁移
+Step 9: 前端框架迁移 ✅ (Svelte 5 + Vite + TypeScript)
     │
 Step 10: 移动端 daemon + remote client
 ```

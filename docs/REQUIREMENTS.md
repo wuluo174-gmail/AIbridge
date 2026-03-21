@@ -12,7 +12,7 @@ Bridge 是一个轻量级 vibe coding 辅助工具，聚焦于 CLI 编排。核�
 
 | 角色 | 环境 | 能力 |
 |------|------|------|
-| 桌面端开发者 | macOS / Windows / Linux | 完整功能：协商、执行、审查、历史、配置 |
+| 桌面端开发者 | macOS (Step 8A POC) / Linux (POSIX 延伸) / Windows (待实现) | 完整功能：协商、执行、审查、历史、配置 |
 | 移动端监控者 | iOS / Android | 远程查看会话状态、发送反馈注入、触发执行/停止；**不运行 CLI** |
 
 ## 3. 功能模块
@@ -193,11 +193,9 @@ Bridge 是一个轻量级 vibe coding 辅助工具，聚焦于 CLI 编排。核�
 
 ## 5. 候选技术方案与取舍
 
-**以下均为候选，待 Python 内核稳定后最终确定。**
-
-| 层 | 候选 A | 候选 B | 候选 C | 取舍要点 |
-|----|--------|--------|--------|---------|
-| 桌面壳 | Tauri v2 (5-10MB) | Electron (150MB+) | 保持 HTTP+浏览器 (0MB) | 包体 vs 生态成熟度 vs 零打包 |
-| 前端 | React + TS | Vue 3 + TS | 保持 vanilla JS | 协议固化后再选，避免重写两次 |
-| 持久化 | Python sqlite3 (标准库) | JSON 文件 | — | sqlite3 零依赖，查询能力更强 |
-| 移动端 | Tauri v2 Mobile | React Native | Flutter / PWA | 待 daemon 协议定义后选 |
+| 层 | 决策 | 状态 | 说明 |
+|----|------|------|------|
+| 桌面壳 | **Tauri v2** | Step 8A: macOS POC 已实施 | Python via `/bin/zsh -c` 启动，进程组级清理，系统托盘 |
+| 前端 | **Svelte 5 + TypeScript** | 已实施 | frontend/ 独立 Vite 项目；server.py 保留 HTML_UI 冻结快照作为无构建环境降级 |
+| 持久化 | **Python sqlite3** | 已实施 (Step 6) | 标准库零依赖 |
+| 移动端 | 待选 (Tauri v2 Mobile / RN / Flutter) | Step 10 范围 | daemon + remote client 架构 |

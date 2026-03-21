@@ -7,3 +7,7 @@ __pycache__/
 *.key
 credentials.json
 secrets.json
+src-tauri/target/
+frontend/node_modules/
+frontend/dist/
+recent_paths.json

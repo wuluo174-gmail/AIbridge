@@ -297,34 +297,19 @@ Bridge 项目已完成 Python 内核模块化（Step 1-7）。现在需要选择
 
 ---
 
-## Step 9: 前端框架迁移
+## Step 9: 前端框架迁移 ✅
 
-### 目标
-将 HTML_UI 中的 vanilla JS 迁移到选定的前端框架。
+### 决策
+**Svelte 5 + TypeScript**，Vite 构建，frontend/ 独立项目。
 
-### 前置条件
-- Step 8 完成 (桌面壳集成)
-
-### 不回归验证
-- NR-10 全部通过 (前端行为完整验证)
-
-### 提示词
-
-```
-Bridge 项目已完成桌面壳集成（Step 8）。现在需要将内嵌的 vanilla JS 前端迁移到组件化框架。
-
-当前前端特性（必须完整保留，参见 REQUIREMENTS.md NR-10）：
-- 双面板 + Process/Result tab
-- 版本历史 R1/R2/R3
-- agent_thinking 自动切 tab
-- MCP stderr 淡化
-- 路径浏览器 + 自动补全 + 最近路径
-- 页面刷新恢复
-- 提示词编辑器 modal
-- 状态 pill + 按钮可用性
-
-事件处理逻辑在 handle(e) switch-case 中（20 种事件类型），必须全部迁移。
-```
+### 实施结果
+- 11 个 Svelte 5 组件，3 层状态模型 (store.svelte.ts)
+- 纯函数事件处理器 (event-handler.ts)，20/20 事件类型全覆盖
+- 页面刷新恢复 (hydrator.ts)，完整 TypeScript 类型 (types.ts)
+- 45 个前端单元测试 (vitest)
+- NR-10 全部 12 项功能已实现
+- server.py 保留 HTML_UI 冻结快照作为无构建环境降级
+- Tauri beforeBuildCommand / beforeDevCommand 自动编译前端
 
 ---
 

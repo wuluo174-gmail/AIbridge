@@ -136,8 +136,8 @@ idle ──POST /api/start──► running
 ### 3.1 GET 端点 (9 个)
 
 #### `GET /`
-- **返回**: HTML_UI 页面 (text/html)
-- **位置**: L947-953
+- **返回**: text/html — 优先返回 `frontend/dist/index.html` (Svelte 5 构建产物)；无 dist 时降级返回内嵌 HTML_UI 冻结快照
+- **位置**: server.py do_GET L112-122
 
 #### `GET /api/events?sid={sid}&since={cursor}`
 - **返回**: `{events: Event[], next: int}`

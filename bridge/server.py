@@ -10,7 +10,9 @@ BridgeHandler 通过 _BridgeProxy 间接引用 bridge.py 命名空间中的
 import http.server
 import socketserver
 import json
+import signal
 import threading
+import time
 import os
 import uuid
 import urllib.parse
@@ -99,16 +101,38 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
         sid = qs.get("sid", [None])[0]
         return get_session(sid) if sid else None
 
+    _DIST_DIR = Path(__file__).parent.parent / "frontend" / "dist"
+    _MIME_MAP = {'.js': 'text/javascript', '.css': 'text/css',
+                 '.svg': 'image/svg+xml', '.png': 'image/png',
+                 '.woff2': 'font/woff2', '.woff': 'font/woff'}
+
     def do_GET(self):
         p = urllib.parse.urlparse(self.path)
         qs = urllib.parse.parse_qs(p.query)
         if p.path == "/":
-            body = HTML_UI.encode()
+            dist_index = self._DIST_DIR / "index.html"
+            if dist_index.is_file():
+                body = dist_index.read_bytes()
+            else:
+                body = HTML_UI.encode()
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+        elif p.path.startswith("/assets/"):
+            filepath = (self._DIST_DIR / p.path.lstrip("/")).resolve()
+            dist_resolved = str(self._DIST_DIR.resolve()) + os.sep
+            if filepath.is_file() and str(filepath).startswith(dist_resolved):
+                body = filepath.read_bytes()
+                mime = self._MIME_MAP.get(filepath.suffix, 'application/octet-stream')
+                self.send_response(200)
+                self.send_header("Content-Type", mime)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            else:
+                self.send_error(404)
         elif p.path == "/api/events":
             sess = self._get_session_from_qs(qs)
             if not sess:
@@ -122,7 +146,10 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
             if not sess:
                 return self._json({"status": "idle", "round": 0, "max_rounds": 5,
                                     "consensus": False, "consensus_round": 0,
-                                    "history_len": 0, "error": None})
+                                    "history_len": 0, "error": None,
+                                    "planner_tool_id": _b._role_config.planner_tool_id,
+                                    "reviewer_tool_id": _b._role_config.reviewer_tool_id,
+                                    "executor_panel": "planner"})
             self._json({
                 "status": sess.status,
                 "round": sess.current_round,
@@ -131,6 +158,9 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
                 "consensus_round": sess.consensus_round,
                 "history_len": len(sess.history),
                 "error": sess.error,
+                "planner_tool_id": sess.planner_tool_id,
+                "reviewer_tool_id": sess.reviewer_tool_id,
+                "executor_panel": _b._resolve_executor_panel(sess),
             })
         elif p.path == "/api/sessions":
             with sessions_lock:
@@ -153,7 +183,7 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
                 entries = [
                     {"round": h["round"], "role": h["role"], "phase": h["phase"],
                      "content": h["content"]}
-                    for h in sess.history if h["role"] in ("claude", "codex")
+                    for h in sess.history if h["role"] not in ("user",)
                 ]
                 review_entries = [
                     {"round": h["round"], "role": h["role"], "phase": h["phase"],
@@ -235,6 +265,31 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
             self._json({"paths": _b.load_recent_paths()})
         elif p.path == "/api/prompts":
             self._json(_b.prompt_config)
+        elif p.path == "/api/archived_sessions":
+            limit = int(qs.get("limit", ["50"])[0])
+            offset = int(qs.get("offset", ["0"])[0])
+            self._json({"sessions": _b.list_archived_sessions(limit, offset)})
+        elif p.path == "/api/archived_session_history":
+            sid = qs.get("sid", [None])[0]
+            if not sid:
+                return self._json({"entries": [], "execution_result": None,
+                                   "review_entries": [], "review_round": 0,
+                                   "review_status": None, "event_cursor": 0,
+                                   "planner_tool_id": None, "reviewer_tool_id": None})
+            self._json(_b.get_archived_session_history(sid))
+        elif p.path == "/api/tools":
+            self._json({"tools": _b._registry.discover()})
+        elif p.path == "/api/role_config":
+            tools = _b._registry.discover()
+            rc = _b.get_role_config()
+            executor = _b._registry.resolve_executor(
+                _b.RoleConfig(rc["planner_tool_id"], rc["reviewer_tool_id"]))
+            self._json({
+                "planner_tool_id": rc["planner_tool_id"],
+                "reviewer_tool_id": rc["reviewer_tool_id"],
+                "executor_tool_id": executor.id,
+                "tools": tools,
+            })
         else:
             self.send_error(404)
 
@@ -253,7 +308,7 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
             if not os.path.isdir(project):
                 return self._json({"error": f"项目路径无效: {project_raw}"}, 400)
             sid = uuid.uuid4().hex[:8]
-            sess = SessionState(sid, task, project, rounds)
+            sess = _b.create_session(sid, task, project, rounds)
             with sessions_lock:
                 sessions[sid] = sess
             recent = _b.load_recent_paths()
@@ -280,11 +335,35 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
             if not sess:
                 return self._json({"error": "会话不存在"}, 404)
             sess.stop_flag.set()
-            if sess.active_proc and sess.active_proc.poll() is None:
+            with sess.proc_lock:
+                pgid = sess.active_pgid
+            if pgid:
                 try:
-                    sess.active_proc.kill()
-                except Exception:
-                    pass
+                    os.killpg(pgid, signal.SIGTERM)
+                except (ProcessLookupError, PermissionError):
+                    with sess.proc_lock:
+                        sess.active_pgid = None
+
+                def _stop_followup(pgid, sess):
+                    deadline = time.time() + 3
+                    while time.time() < deadline:
+                        try:
+                            os.killpg(pgid, 0)
+                        except (ProcessLookupError, PermissionError):
+                            with sess.proc_lock:
+                                sess.active_pgid = None
+                            return
+                        time.sleep(0.3)
+                    try:
+                        os.killpg(pgid, signal.SIGKILL)
+                    except (ProcessLookupError, PermissionError):
+                        pass
+                    with sess.proc_lock:
+                        sess.active_pgid = None
+
+                threading.Thread(
+                    target=_stop_followup, args=(pgid, sess), daemon=True
+                ).start()
             with sess.status_lock:
                 sess.status = "idle"
             add_event(sess, "status_change", {"status": "stopped", "msg": "用户中止"})
@@ -311,11 +390,16 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
                     return self._json({"error": "当前不在待修复状态"}, 400)
                 sess.status = "done"
             add_event(sess, "review_done", {"round": sess.review_round, "msg": "用户跳过修复，任务结束。", "success": False})
+            _b._try_persist(sess)
             self._json({"ok": True})
         elif p.path == "/api/prompts":
             body = self._body()
-            _b.prompt_config.update(body)
-            _b.save_prompts(_b.prompt_config)
+            # 先构造副本并持久化，成功后再替换内存，避免脏状态
+            merged = dict(_b.prompt_config)
+            merged.update(body)
+            _b.save_prompts(merged)
+            _b.prompt_config.clear()
+            _b.prompt_config.update(merged)
             self._json({"ok": True})
         elif p.path == "/api/inject":
             body = self._body()
@@ -376,6 +460,33 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
                 kwargs={"start_round": start_round}, daemon=True
             ).start()
             self._json({"ok": True})
+        elif p.path == "/api/role_config":
+            body = self._body()
+            planner_id = body.get("planner_tool_id", "").strip()
+            reviewer_id = body.get("reviewer_tool_id", "").strip()
+            if not planner_id or not reviewer_id:
+                return self._json({"error": "planner_tool_id 和 reviewer_tool_id 均为必填"}, 400)
+            registered = _b._registry.list_tool_ids()
+            if planner_id not in registered:
+                return self._json({"error": f"未注册的工具: {planner_id}"}, 400)
+            if reviewer_id not in registered:
+                return self._json({"error": f"未注册的工具: {reviewer_id}"}, 400)
+            if planner_id == reviewer_id:
+                return self._json({"error": "Planner 和 Reviewer 不能是同一工具"}, 400)
+            for tid in [planner_id, reviewer_id]:
+                if not _b._registry.get(tid).check_installed():
+                    name = _b._registry.get(tid).display_name
+                    return self._json({"error": f"{name} 未安装"}, 400)
+            caps = [_b._registry.get(tid).capabilities for tid in [planner_id, reviewer_id]]
+            if not any(c.get("dangerous_mode") for c in caps):
+                return self._json({"error": "至少需要一个支持执行模式的工具"}, 400)
+            with sessions_lock:
+                active = [s for s in sessions.values()
+                          if s.status not in ("idle", "done", "error")]
+            if active:
+                return self._json({"error": "存在进行中的会话，无法更改角色配置"}, 409)
+            _b._update_role_config(planner_id, reviewer_id)
+            self._json({"ok": True})
         else:
             self.send_error(404)
 
@@ -390,6 +501,8 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
 # ═════════════════════════════════════════════════════════════════
 # HTML UI — 双 Tab 面板 + 多会话支持
 # ═════════════════════════════════════════════════════════════════
+# FROZEN SNAPSHOT — 零构建 fallback，不再修改。新功能只在 frontend/ 中开发。
+# 当 frontend/dist/ 存在时，do_GET("/") 优先伺服构建产物；否则退回此快照。
 HTML_UI = r"""<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -441,7 +554,11 @@ body{font-family:'SF Mono','Fira Code','Menlo',monospace;background:var(--bg);co
 .panel+.panel{border-left:1px solid var(--border)}
 .panel-head{background:var(--surface);padding:8px 14px;font-size:13px;font-weight:700;border-bottom:1px solid var(--border);flex-shrink:0;display:flex;align-items:center;gap:8px;font-family:-apple-system,sans-serif}
 .panel-head .dot{width:10px;height:10px;border-radius:50%}
-.dot-claude{background:var(--claude)} .dot-codex{background:var(--codex)}
+.controls .f-role{flex:0 0 140px}
+.role-select{background:var(--bg);border:1px solid var(--border);border-radius:4px;color:var(--text);padding:6px 10px;font-size:13px;font-family:inherit;outline:none;width:100%}
+.role-select:focus{border-color:var(--claude)}
+.exec-note{font-size:11px;color:var(--user);font-family:-apple-system,sans-serif}
+.dot-planner{background:var(--claude)} .dot-reviewer{background:var(--codex)}
 .tab-group{margin-left:auto;display:flex;gap:2px}
 .tab{background:transparent;border:1px solid var(--border);border-radius:4px;color:var(--dim);padding:2px 10px;font-size:11px;cursor:pointer;font-family:-apple-system,sans-serif;font-weight:600}
 .tab.active{background:var(--border);color:var(--text)}
@@ -530,6 +647,10 @@ body{font-family:'SF Mono','Fira Code','Menlo',monospace;background:var(--bg);co
 </head>
 <body>
 
+<div style="background:#d29922;color:#000;padding:6px 12px;text-align:center;font-size:13px;font-family:-apple-system,sans-serif;flex-shrink:0">
+⚠ 当前使用内置 UI 快照。运行 <code>cd frontend && npm run build</code> 以使用最新前端。
+</div>
+
 <!-- 控制栏 -->
 <div class="controls">
   <div class="field f-path">
@@ -542,6 +663,9 @@ body{font-family:'SF Mono','Fira Code','Menlo',monospace;background:var(--bg);co
   </div>
   <div class="field f-task"><label>任务描述</label><textarea id="inp_task" rows="3" placeholder="描述任务..."></textarea></div>
   <div class="field f-rounds"><label>轮次</label><input type="number" id="inp_rounds" value="5" min="1" max="20"></div>
+  <div class="field f-role"><label>Planner</label><select id="sel_planner" class="role-select" onchange="onRoleChange()"></select></div>
+  <div class="field f-role"><label>Reviewer</label><select id="sel_reviewer" class="role-select" onchange="onRoleChange()"></select></div>
+  <span id="exec_note" class="exec-note" style="display:none"></span>
   <button class="btn btn-go" id="btn_go" onclick="doStart()">▶ 开始</button>
   <button class="btn btn-stop" id="btn_stop" onclick="doStop()" disabled>⏹ 中止</button>
   <button class="btn btn-exec" id="btn_exec" onclick="doExec()" disabled>⚡ 执行</button>
@@ -559,37 +683,37 @@ body{font-family:'SF Mono','Fira Code','Menlo',monospace;background:var(--bg);co
 <!-- 双终端面板 -->
 <div class="panels">
   <div class="panel">
-    <div class="panel-head">
-      <span class="dot dot-claude"></span> Claude Code
+    <div class="panel-head" id="head_planner">
+      <span class="dot dot-planner"></span> <span class="panel-tool-name">Planner</span>
       <div class="tab-group">
-        <button class="tab active" data-agent="claude" data-tab="log" onclick="switchTab('claude','log')">过程</button>
-        <button class="tab" data-agent="claude" data-tab="result" onclick="switchTab('claude','result')">结果</button>
+        <button class="tab active" data-agent="planner" data-tab="log" onclick="switchTab('planner','log')">过程</button>
+        <button class="tab" data-agent="planner" data-tab="result" onclick="switchTab('planner','result')">结果</button>
       </div>
     </div>
     <div class="tab-body">
-      <div class="term tab-pane active" id="log_claude"></div>
-      <div class="tab-pane" id="result_claude_wrap">
+      <div class="term tab-pane active" id="log_planner"></div>
+      <div class="tab-pane" id="result_planner_wrap">
         <div class="result-wrap">
-          <div class="ver-bar" id="ver_bar_claude"></div>
-          <div class="ver-content" id="result_claude"></div>
+          <div class="ver-bar" id="ver_bar_planner"></div>
+          <div class="ver-content" id="result_planner"></div>
         </div>
       </div>
     </div>
   </div>
   <div class="panel">
-    <div class="panel-head">
-      <span class="dot dot-codex"></span> Codex
+    <div class="panel-head" id="head_reviewer">
+      <span class="dot dot-reviewer"></span> <span class="panel-tool-name">Reviewer</span>
       <div class="tab-group">
-        <button class="tab active" data-agent="codex" data-tab="log" onclick="switchTab('codex','log')">过程</button>
-        <button class="tab" data-agent="codex" data-tab="result" onclick="switchTab('codex','result')">结果</button>
+        <button class="tab active" data-agent="reviewer" data-tab="log" onclick="switchTab('reviewer','log')">过程</button>
+        <button class="tab" data-agent="reviewer" data-tab="result" onclick="switchTab('reviewer','result')">结果</button>
       </div>
     </div>
     <div class="tab-body">
-      <div class="term tab-pane active" id="log_codex"></div>
-      <div class="tab-pane" id="result_codex_wrap">
+      <div class="term tab-pane active" id="log_reviewer"></div>
+      <div class="tab-pane" id="result_reviewer_wrap">
         <div class="result-wrap">
-          <div class="ver-bar" id="ver_bar_codex"></div>
-          <div class="ver-content" id="result_codex"></div>
+          <div class="ver-bar" id="ver_bar_reviewer"></div>
+          <div class="ver-content" id="result_reviewer"></div>
         </div>
       </div>
     </div>
@@ -611,28 +735,28 @@ body{font-family:'SF Mono','Fira Code','Menlo',monospace;background:var(--bg);co
     </div>
     <div class="modal-body">
       <div class="cfg-field">
-        <label>Claude 初始方案提示词</label>
-        <div class="cfg-hint">变量: {task} — 第1轮，Claude 根据此提示生成方案</div>
+        <label>Planner 初始方案提示词</label>
+        <div class="cfg-hint">变量: {task} {planner_name} — 第1轮，Planner 根据此提示生成方案</div>
         <textarea id="cfg_claude_first" rows="6"></textarea>
       </div>
       <div class="cfg-field">
-        <label>Claude 修订提示词</label>
-        <div class="cfg-hint">变量: {codex_feedback} {inject_section} — 第2+轮，Claude 根据反馈修订</div>
+        <label>Planner 修订提示词</label>
+        <div class="cfg-hint">变量: {codex_feedback} {inject_section} — 第2+轮，Planner 根据反馈修订</div>
         <textarea id="cfg_claude_revise" rows="6"></textarea>
       </div>
       <div class="cfg-field">
-        <label>Codex 首次审查提示词</label>
-        <div class="cfg-hint">变量: {task} {claude_plan} — 第1轮，Codex 审查方案</div>
+        <label>Reviewer 首次审查提示词</label>
+        <div class="cfg-hint">变量: {task} {claude_plan} — 第1轮，Reviewer 审查方案</div>
         <textarea id="cfg_codex_first" rows="6"></textarea>
       </div>
       <div class="cfg-field">
-        <label>Codex 继续审查提示词</label>
-        <div class="cfg-hint">变量: {claude_revision} {inject_section} — 第2+轮，Codex 继续审查</div>
+        <label>Reviewer 继续审查提示词</label>
+        <div class="cfg-hint">变量: {claude_revision} {inject_section} — 第2+轮，Reviewer 继续审查</div>
         <textarea id="cfg_codex_review" rows="6"></textarea>
       </div>
       <div class="cfg-field">
         <label>执行提示词 (APPROVED)</label>
-        <div class="cfg-hint">变量: {task} {plan_section} — Codex APPROVED 后 Claude 执行方案</div>
+        <div class="cfg-hint">变量: {task} {plan_section} — Reviewer APPROVED 后执行方案</div>
         <textarea id="cfg_execution" rows="4"></textarea>
       </div>
       <div class="cfg-field">
@@ -641,28 +765,28 @@ body{font-family:'SF Mono','Fira Code','Menlo',monospace;background:var(--bg);co
         <textarea id="cfg_execution_unapproved" rows="4"></textarea>
       </div>
       <div class="cfg-field">
-        <label>执行后审查提示词 (Codex)</label>
+        <label>执行后审查提示词 (Exec Reviewer)</label>
         <div class="cfg-hint">变量: {task} {approved_plan} {execution_result} {diff_section}</div>
         <textarea id="cfg_codex_post_review" rows="6"></textarea>
       </div>
       <div class="cfg-field">
-        <label>修复提示词 (Claude)</label>
+        <label>修复提示词 (Executor)</label>
         <div class="cfg-hint">变量: {review_feedback}</div>
         <textarea id="cfg_claude_post_fix" rows="4"></textarea>
       </div>
       <div class="cfg-field">
-        <label>再审查提示词 (Codex)</label>
+        <label>再审查提示词 (Exec Reviewer)</label>
         <div class="cfg-hint">变量: {fix_result} {diff_section}</div>
         <textarea id="cfg_codex_post_review_followup" rows="4"></textarea>
       </div>
       <div class="cfg-field">
-        <label>用户干预标签 (Claude)</label>
-        <div class="cfg-hint">注入用户意见时在 Claude 提示中显示的标题</div>
+        <label>用户干预标签 (Planner)</label>
+        <div class="cfg-hint">注入用户意见时在 Planner 提示中显示的标题</div>
         <textarea id="cfg_user_inject_label_claude" rows="1"></textarea>
       </div>
       <div class="cfg-field">
-        <label>用户干预标签 (Codex)</label>
-        <div class="cfg-hint">注入用户意见时在 Codex 提示中显示的标题</div>
+        <label>用户干预标签 (Reviewer)</label>
+        <div class="cfg-hint">注入用户意见时在 Reviewer 提示中显示的标题</div>
         <textarea id="cfg_user_inject_label_codex" rows="1"></textarea>
       </div>
     </div>
@@ -699,17 +823,21 @@ body{font-family:'SF Mono','Fira Code','Menlo',monospace;background:var(--bg);co
 let sid=null,cursor=0,poll=null,st='idle';
 
 // 版本缓存 — 纯前端状态，从事件流派生
-var versions = {claude: [], codex: []};
-var activeVer = {claude: -1, codex: -1}; // -1 = 跟随最新
+var versions = {planner: [], reviewer: []};
+var activeVer = {planner: -1, reviewer: -1}; // -1 = 跟随最新
 var executionResult = null;
 var showExecResult = false;
+var executorPanel = 'planner';
+var roleConfig = {planner_tool_id:'claude-code', reviewer_tool_id:'codex'};
+var toolMap = {};
+var toolDisplayNames = {planner:'Planner', reviewer:'Reviewer'};
 
 function renderVersionedResult(agent) {
   var bar = document.getElementById('ver_bar_' + agent);
   var el = document.getElementById('result_' + agent);
   if (!bar || !el) return;
   var vers = versions[agent];
-  if (!vers.length && !(agent === 'claude' && executionResult != null)) {
+  if (!vers.length && !(agent === executorPanel && executionResult != null)) {
     bar.innerHTML = '';
     el.innerHTML = '';
     return;
@@ -717,14 +845,14 @@ function renderVersionedResult(agent) {
   var idx = activeVer[agent] < 0 ? vers.length - 1 : Math.min(activeVer[agent], vers.length - 1);
   var tabs = '';
   vers.forEach(function(ver, i) {
-    var cls = (!showExecResult || agent !== 'claude') && i === idx ? 'ver-tab active' : 'ver-tab';
+    var cls = (!showExecResult || agent !== executorPanel) && i === idx ? 'ver-tab active' : 'ver-tab';
     tabs += '<button class="' + cls + '" data-ver-agent="' + agent + '" data-ver-idx="' + i + '">v' + (i+1) + ' (R' + ver.round + ')</button>';
   });
-  if (agent === 'claude' && executionResult != null) {
-    tabs += '<button class="ver-tab vt-exec' + (showExecResult ? ' active' : '') + '" data-ver-agent="claude" data-ver-idx="-2">执行结果</button>';
+  if (agent === executorPanel && executionResult != null) {
+    tabs += '<button class="ver-tab vt-exec' + (showExecResult ? ' active' : '') + '" data-ver-agent="' + executorPanel + '" data-ver-idx="-2">执行结果</button>';
   }
   bar.innerHTML = tabs;
-  if (agent === 'claude' && showExecResult && executionResult != null) {
+  if (agent === executorPanel && showExecResult && executionResult != null) {
     el.innerHTML = '<span class="ok">── 执行结果 ──</span>\n' + esc(executionResult);
   } else if (vers.length) {
     var v = vers[idx];
@@ -766,11 +894,11 @@ async function doStart(){
   const u=new URL(location);u.searchParams.set('sid',sid);
   if(u.searchParams.has('project'))u.searchParams.delete('project');
   history.replaceState(null,'',u);
-  versions = {claude: [], codex: []};
-  activeVer = {claude: -1, codex: -1};
+  versions = {planner: [], reviewer: []};
+  activeVer = {planner: -1, reviewer: -1};
   executionResult = null;
   showExecResult = false;
-  ['claude','codex'].forEach(function(a){
+  ['planner','reviewer'].forEach(function(a){
     document.getElementById('log_'+a).innerHTML='';
     document.getElementById('result_'+a).innerHTML='';
     document.getElementById('ver_bar_'+a).innerHTML='';
@@ -786,7 +914,7 @@ async function doStop(){
 }
 async function doExec(){
   if(!sid)return;
-  if(!confirm('确认执行？Claude 将用 --dangerously-skip-permissions'))return;
+  if(!confirm('确认执行？执行者将用 --dangerously-skip-permissions'))return;
   try{
     const r=await api('POST','/api/execute',{session_id:sid});
     if(r.error){alert('执行启动失败: '+r.error);return;}
@@ -817,7 +945,7 @@ async function doInject(){
 }
 async function doReviewFix(){
   if(!sid)return;
-  if(!confirm('确认修复？Claude 将继续用 --dangerously-skip-permissions'))return;
+  if(!confirm('确认修复？执行者将继续用 --dangerously-skip-permissions'))return;
   await api('POST','/api/review_fix',{session_id:sid});
 }
 async function doReviewSkip(){
@@ -838,7 +966,7 @@ async function pollEvt(){
 }
 
 // ── Issue 2: 折叠区管理 ──
-var activeFold={claude:null,codex:null};
+var activeFold={planner:null,reviewer:null};
 var foldSeq=0;
 function openCollapsible(agent,type){
   var el=document.getElementById('log_'+agent);
@@ -866,13 +994,13 @@ function handle(e){
   switch(e.type){
     case 'round_start':
       var hdr='══════ 第 '+e.data.round+' / '+e.data.max+' 轮 ══════';
-      appendLog('claude','<div class="log-sep sys">'+hdr+'</div>');
-      appendLog('codex','<div class="log-sep sys">'+hdr+'</div>');
+      appendLog('planner','<div class="log-sep sys">'+hdr+'</div>');
+      appendLog('reviewer','<div class="log-sep sys">'+hdr+'</div>');
       break;
     case 'agent_thinking':
       var who=e.data.agent;
       switchTab(who,'log');
-      appendLog(who,'<div class="log-sep sys">'+(who==='claude'?'[Claude 分析中...]':'[Codex 审查中...]')+'</div>');
+      appendLog(who,'<div class="log-sep sys">['+toolDisplayNames[who]+' 处理中...]</div>');
       break;
     case 'agent_chunk':{
       var ct=e.data.chunk_type||'text';
@@ -906,11 +1034,11 @@ function handle(e){
     case 'agent_response':{
       var role=e.data.role;
       if(role==='user'){
-        appendLog('claude','<div class="log-sep sys">[你] '+esc(e.data.content)+'</div>');
-        appendLog('codex','<div class="log-sep sys">[你] '+esc(e.data.content)+'</div>');
+        appendLog('planner','<div class="log-sep sys">[你] '+esc(e.data.content)+'</div>');
+        appendLog('reviewer','<div class="log-sep sys">[你] '+esc(e.data.content)+'</div>');
         break;
       }
-      var ag3=role==='claude'?'claude':'codex';
+      var ag3=e.data.role;
       appendLog(ag3,'<div class="log-sep sys">── '+e.data.phase+' 完成 (R'+e.data.round+') ──</div>');
       if(e.data.content){
         if(!versions[ag3].some(function(v){return v.round===e.data.round;})){
@@ -921,95 +1049,98 @@ function handle(e){
         renderVersionedResult(ag3);
       }
       switchTab(ag3,'result');
-      if(role==='claude'){
-        var h='<div class="log-sep sys">── Claude R'+e.data.round+' 方案已发送给 Codex ──</div>';
+      var otherPanel=ag3==='planner'?'reviewer':'planner';
+      if(ag3==='planner'){
+        var h='<div class="log-sep sys">── '+toolDisplayNames.planner+' R'+e.data.round+' 方案已发送给 '+toolDisplayNames.reviewer+' ──</div>';
         if(e.data.content){
-          h+='<details class="plan-preview"><summary>查看发送给 Codex 的方案内容</summary><div class="plan-body">'+esc(e.data.content)+'</div></details>';
+          h+='<details class="plan-preview"><summary>查看发送给 '+toolDisplayNames.reviewer+' 的方案内容</summary><div class="plan-body">'+esc(e.data.content)+'</div></details>';
         }
-        appendLog('codex',h);
-      }else if(role==='codex'){
-        var h2='<div class="log-sep sys">── Codex R'+e.data.round+' 审查意见已发送给 Claude ──</div>';
+        appendLog('reviewer',h);
+      }else if(ag3==='reviewer'){
+        var h2='<div class="log-sep sys">── '+toolDisplayNames.reviewer+' R'+e.data.round+' 审查意见已发送给 '+toolDisplayNames.planner+' ──</div>';
         if(e.data.content){
-          h2+='<details class="plan-preview"><summary>查看发送给 Claude 的审查意见</summary><div class="plan-body">'+esc(e.data.content)+'</div></details>';
+          h2+='<details class="plan-preview"><summary>查看发送给 '+toolDisplayNames.planner+' 的审查意见</summary><div class="plan-body">'+esc(e.data.content)+'</div></details>';
         }
-        appendLog('claude',h2);
+        appendLog('planner',h2);
       }
       break;
     }
     case 'consensus_reached':
-      appendLog('claude','<div class="log-sep ok">✓ '+e.data.msg+'</div>');
-      appendLog('codex','<div class="log-sep ok">✓ '+e.data.msg+'</div>');
+      appendLog('planner','<div class="log-sep ok">✓ '+e.data.msg+'</div>');
+      appendLog('reviewer','<div class="log-sep ok">✓ '+e.data.msg+'</div>');
       break;
     case 'max_rounds_reached':
-      appendLog('claude','<div class="log-sep sys">⚠ '+e.data.msg+'</div>');
-      appendLog('codex','<div class="log-sep sys">⚠ '+e.data.msg+'</div>');
+      appendLog('planner','<div class="log-sep sys">⚠ '+e.data.msg+'</div>');
+      appendLog('reviewer','<div class="log-sep sys">⚠ '+e.data.msg+'</div>');
       break;
     case 'execution_done':
-      appendLog('claude','<div class="log-sep ok">══════ 执行完成 ══════</div>');
+      var ep=e.data.executor_panel||executorPanel;
+      executorPanel=ep;
+      appendLog(ep,'<div class="log-sep ok">══════ 执行完成 ══════</div>');
       executionResult=e.data.result;
       showExecResult=true;
-      renderVersionedResult('claude');
-      var head=document.querySelector('.dot-claude').parentElement;
+      renderVersionedResult(ep);
+      var head=document.getElementById('head_'+ep);
       if(head&&!head.querySelector('.done-badge')){
         head.insertAdjacentHTML('beforeend','<span class="done-badge">✓ 执行完毕</span>');
       }
       break;
     case 'error':
-      appendLog('claude','<div class="log-sep err">❌ '+esc(e.data.msg)+'</div>');
-      appendLog('codex','<div class="log-sep err">❌ '+esc(e.data.msg)+'</div>');
+      appendLog('planner','<div class="log-sep err">❌ '+esc(e.data.msg)+'</div>');
+      appendLog('reviewer','<div class="log-sep err">❌ '+esc(e.data.msg)+'</div>');
       break;
     case 'warning':
-      appendLog('claude','<div class="log-sep sys">⚠ '+esc(e.data.msg)+'</div>');
+      appendLog('planner','<div class="log-sep sys">⚠ '+esc(e.data.msg)+'</div>');
       break;
     case 'rollback':
-      versions.claude=versions.claude.filter(function(v){return v.round<=e.data.round;});
-      versions.codex=versions.codex.filter(function(v){return v.round<=e.data.round;});
-      activeVer.claude=-1;
-      activeVer.codex=-1;
-      renderVersionedResult('claude');
-      renderVersionedResult('codex');
-      appendLog('claude','<div class="log-sep sys">⚠ '+esc(e.data.msg)+'</div>');
-      appendLog('codex','<div class="log-sep sys">⚠ '+esc(e.data.msg)+'</div>');
+      versions.planner=versions.planner.filter(function(v){return v.round<=e.data.round;});
+      versions.reviewer=versions.reviewer.filter(function(v){return v.round<=e.data.round;});
+      activeVer.planner=-1;
+      activeVer.reviewer=-1;
+      renderVersionedResult('planner');
+      renderVersionedResult('reviewer');
+      appendLog('planner','<div class="log-sep sys">⚠ '+esc(e.data.msg)+'</div>');
+      appendLog('reviewer','<div class="log-sep sys">⚠ '+esc(e.data.msg)+'</div>');
       break;
     case 'status_change':
       if(e.data.status==='stopped'){
-        appendLog('claude','<div class="log-sep sys">⏹ 已中止</div>');
-        appendLog('codex','<div class="log-sep sys">⏹ 已中止</div>');
+        appendLog('planner','<div class="log-sep sys">⏹ 已中止</div>');
+        appendLog('reviewer','<div class="log-sep sys">⏹ 已中止</div>');
       }
       break;
     // ── Issue 4: 审查循环事件 ──
     case 'review_response':{
       var rrole=e.data.role;
-      var rag=rrole==='claude'?'claude':'codex';
+      var rag=rrole;
       appendLog(rag,'<div class="log-sep sys">── '+e.data.phase+' (审查轮 '+e.data.round+') ──</div>');
-      if(rrole==='codex'&&e.data.content){
-        appendLog('codex','<details class="plan-preview" open><summary>Codex 审查意见</summary><div class="plan-body">'+esc(e.data.content)+'</div></details>');
-        appendLog('claude','<details class="plan-preview"><summary>查看 Codex 审查意见</summary><div class="plan-body">'+esc(e.data.content)+'</div></details>');
-      }else if(rrole==='claude'&&e.data.content){
-        appendLog('claude','<details class="plan-preview" open><summary>Claude 修复总结</summary><div class="plan-body">'+esc(e.data.content)+'</div></details>');
-        appendLog('codex','<details class="plan-preview"><summary>查看 Claude 修复总结</summary><div class="plan-body">'+esc(e.data.content)+'</div></details>');
+      if(rrole==='reviewer'&&e.data.content){
+        appendLog('reviewer','<details class="plan-preview" open><summary>'+toolDisplayNames.reviewer+' 审查意见</summary><div class="plan-body">'+esc(e.data.content)+'</div></details>');
+        appendLog('planner','<details class="plan-preview"><summary>查看 '+toolDisplayNames.reviewer+' 审查意见</summary><div class="plan-body">'+esc(e.data.content)+'</div></details>');
+      }else if(rrole==='planner'&&e.data.content){
+        appendLog('planner','<details class="plan-preview" open><summary>'+toolDisplayNames.planner+' 修复总结</summary><div class="plan-body">'+esc(e.data.content)+'</div></details>');
+        appendLog('reviewer','<details class="plan-preview"><summary>查看 '+toolDisplayNames.planner+' 修复总结</summary><div class="plan-body">'+esc(e.data.content)+'</div></details>');
       }
       break;
     }
     case 'review_start':
-      appendLog('claude','<div class="log-sep ok">══════ 执行后审查开始 ══════</div>');
-      appendLog('codex','<div class="log-sep ok">══════ 执行后审查开始 ══════</div>');
+      appendLog('planner','<div class="log-sep ok">══════ 执行后审查开始 ══════</div>');
+      appendLog('reviewer','<div class="log-sep ok">══════ 执行后审查开始 ══════</div>');
       break;
     case 'review_round_start':
-      appendLog('claude','<div class="log-sep sys">══════ 审查修复轮 '+e.data.round+' / '+e.data.max+' ══════</div>');
-      appendLog('codex','<div class="log-sep sys">══════ 审查修复轮 '+e.data.round+' / '+e.data.max+' ══════</div>');
+      appendLog('planner','<div class="log-sep sys">══════ 审查修复轮 '+e.data.round+' / '+e.data.max+' ══════</div>');
+      appendLog('reviewer','<div class="log-sep sys">══════ 审查修复轮 '+e.data.round+' / '+e.data.max+' ══════</div>');
       break;
     case 'review_needs_fix':
-      appendLog('claude','<div class="log-sep sys">⚠ '+esc(e.data.msg)+'</div>');
-      appendLog('codex','<div class="log-sep sys">⚠ '+esc(e.data.msg)+'</div>');
+      appendLog('planner','<div class="log-sep sys">⚠ '+esc(e.data.msg)+'</div>');
+      appendLog('reviewer','<div class="log-sep sys">⚠ '+esc(e.data.msg)+'</div>');
       break;
     case 'review_done':
       if(e.data.success){
-        appendLog('claude','<div class="log-sep ok">══════ 任务收口成功 ══════</div>');
-        appendLog('codex','<div class="log-sep ok">══════ 任务收口成功 ══════</div>');
+        appendLog('planner','<div class="log-sep ok">══════ 任务收口成功 ══════</div>');
+        appendLog('reviewer','<div class="log-sep ok">══════ 任务收口成功 ══════</div>');
       }else{
-        appendLog('claude','<div class="log-sep sys">⚠ '+esc(e.data.msg)+'</div>');
-        appendLog('codex','<div class="log-sep sys">⚠ '+esc(e.data.msg)+'</div>');
+        appendLog('planner','<div class="log-sep sys">⚠ '+esc(e.data.msg)+'</div>');
+        appendLog('reviewer','<div class="log-sep sys">⚠ '+esc(e.data.msg)+'</div>');
       }
       var badge=document.querySelector('.done-badge');
       if(badge)badge.textContent=e.data.success?'✓ 收口成功':'⚠ 审查完成';
@@ -1205,13 +1336,76 @@ async function browseDir(path){
   });
 })();
 
+// ── 角色配置管理 ──
+async function initRoleConfig() {
+    try {
+        var cfg = await api('GET', '/api/role_config');
+        roleConfig = {planner_tool_id: cfg.planner_tool_id, reviewer_tool_id: cfg.reviewer_tool_id};
+        var selP = document.getElementById('sel_planner');
+        var selR = document.getElementById('sel_reviewer');
+        toolMap = {};
+        selP.innerHTML = '';
+        selR.innerHTML = '';
+        (cfg.tools || []).forEach(function(t) {
+            toolMap[t.id] = t;
+            var label = t.display_name + (t.detected_installed===false ? '（启动扫描未发现）' : '');
+            selP.innerHTML += '<option value="'+t.id+'"'+(t.id===cfg.planner_tool_id?' selected':'')+'>'+label+'</option>';
+            selR.innerHTML += '<option value="'+t.id+'"'+(t.id===cfg.reviewer_tool_id?' selected':'')+'>'+label+'</option>';
+        });
+        updatePanelHeaders();
+        var en = document.getElementById('exec_note');
+        var notes = ['工具状态来自启动时扫描；保存角色配置时会实时校验安装状态'];
+        if (cfg.executor_tool_id !== cfg.planner_tool_id) {
+            notes.push('执行者: ' + (toolMap[cfg.executor_tool_id]||{}).display_name + '（按能力自动选择）');
+        }
+        var pTool = toolMap[cfg.planner_tool_id] || {};
+        var rTool = toolMap[cfg.reviewer_tool_id] || {};
+        if (pTool.last_checked_at) notes.push('Planner 扫描: ' + pTool.last_checked_at);
+        if (rTool.last_checked_at && rTool.id !== pTool.id) notes.push('Reviewer 扫描: ' + rTool.last_checked_at);
+        if (pTool.probe_error) notes.push('Planner: ' + pTool.probe_error);
+        if (rTool.probe_error) notes.push('Reviewer: ' + rTool.probe_error);
+        if (notes.length) {
+            en.textContent = notes.join(' ｜ ');
+            en.style.display = '';
+        } else {
+            en.style.display = 'none';
+        }
+    } catch(e) {}
+}
+function updatePanelHeaders() {
+    var pTool = toolMap[roleConfig.planner_tool_id] || {display_name:'Planner'};
+    var rTool = toolMap[roleConfig.reviewer_tool_id] || {display_name:'Reviewer'};
+    toolDisplayNames = {planner: pTool.display_name, reviewer: rTool.display_name};
+    var lh = document.querySelector('#head_planner .panel-tool-name');
+    var rh = document.querySelector('#head_reviewer .panel-tool-name');
+    if (lh) lh.textContent = pTool.display_name;
+    if (rh) rh.textContent = rTool.display_name;
+}
+async function onRoleChange() {
+    var pid = document.getElementById('sel_planner').value;
+    var rid = document.getElementById('sel_reviewer').value;
+    var r = await api('POST', '/api/role_config', {planner_tool_id: pid, reviewer_tool_id: rid});
+    if (r.error) { alert(r.error); initRoleConfig(); return; }
+    roleConfig = {planner_tool_id: pid, reviewer_tool_id: rid};
+    initRoleConfig();
+}
+
 // ── 初始化：从 URL 恢复会话 ──
 (function(){
+  initRoleConfig();
   var p=new URLSearchParams(location.search);
   if(p.get('project'))document.getElementById('inp_path').value=p.get('project');
   if(p.get('sid')){
     sid=p.get('sid');
     cursor=0; st='idle';
+    api('GET','/api/state?sid='+sid).then(function(s){
+      if(s.planner_tool_id) {
+        roleConfig.planner_tool_id = s.planner_tool_id;
+        roleConfig.reviewer_tool_id = s.reviewer_tool_id;
+        executorPanel = s.executor_panel || 'planner';
+        updatePanelHeaders();
+      }
+    });
     api('GET','/api/history?sid='+sid).then(function(r){
       if(r.entries){
         r.entries.forEach(function(h){
@@ -1220,53 +1414,54 @@ async function browseDir(path){
             versions[ag].push({round:h.round,phase:h.phase,content:h.content});
           }
         });
-        ['claude','codex'].forEach(function(ag){
+        ['planner','reviewer'].forEach(function(ag){
           if(versions[ag].length){activeVer[ag]=-1;renderVersionedResult(ag);}
         });
       }
       if(r.execution_result!=null){
         executionResult=r.execution_result;
         showExecResult=true;
-        renderVersionedResult('claude');
+        renderVersionedResult(executorPanel);
       }
       // ── 恢复审查上下文 ──
       if(r.review_status){
         var rs=r.review_status;
-        appendLog('claude','<div class="log-sep ok">══════ 执行后审查开始 ══════</div>');
-        appendLog('codex','<div class="log-sep ok">══════ 执行后审查开始 ══════</div>');
+        appendLog('planner','<div class="log-sep ok">══════ 执行后审查开始 ══════</div>');
+        appendLog('reviewer','<div class="log-sep ok">══════ 执行后审查开始 ══════</div>');
         if(r.review_entries&&r.review_entries.length){
           r.review_entries.forEach(function(h){
-            var ag=h.role==='claude'?'claude':'codex';
+            var ag=h.role;
             appendLog(ag,'<div class="log-sep sys">── '+h.phase+' (审查轮 '+h.round+') ──</div>');
             if(h.content){
-              var label=h.role==='codex'?'Codex 审查意见':'Claude 修复总结';
+              var label=toolDisplayNames[h.role]+'审查意见';
+              if(h.role==='planner') label=toolDisplayNames[h.role]+'修复总结';
               appendLog(ag,'<details class="plan-preview"><summary>'+label+'</summary><div class="plan-body">'+esc(h.content)+'</div></details>');
-              var other=ag==='claude'?'codex':'claude';
+              var other=ag==='planner'?'reviewer':'planner';
               appendLog(other,'<details class="plan-preview"><summary>查看'+label+'</summary><div class="plan-body">'+esc(h.content)+'</div></details>');
             }
           });
         }
         if(rs.status==='done'){
-          var lastCodex=null;
-          if(r.review_entries){for(var i=r.review_entries.length-1;i>=0;i--){if(r.review_entries[i].role==='codex'){lastCodex=r.review_entries[i];break;}}}
-          var success=lastCodex&&lastCodex.content&&lastCodex.content.split('\\n')[0].indexOf('任务收口成功')>=0;
+          var lastReviewer=null;
+          if(r.review_entries){for(var i=r.review_entries.length-1;i>=0;i--){if(r.review_entries[i].role==='reviewer'){lastReviewer=r.review_entries[i];break;}}}
+          var success=lastReviewer&&lastReviewer.content&&lastReviewer.content.split('\\n')[0].indexOf('任务收口成功')>=0;
           if(success){
-            appendLog('claude','<div class="log-sep ok">══════ 任务收口成功 ══════</div>');
-            appendLog('codex','<div class="log-sep ok">══════ 任务收口成功 ══════</div>');
+            appendLog('planner','<div class="log-sep ok">══════ 任务收口成功 ══════</div>');
+            appendLog('reviewer','<div class="log-sep ok">══════ 任务收口成功 ══════</div>');
           }else{
-            appendLog('claude','<div class="log-sep sys">⚠ 审查完成（未达成收口确认）</div>');
-            appendLog('codex','<div class="log-sep sys">⚠ 审查完成（未达成收口确认）</div>');
+            appendLog('planner','<div class="log-sep sys">⚠ 审查完成（未达成收口确认）</div>');
+            appendLog('reviewer','<div class="log-sep sys">⚠ 审查完成（未达成收口确认）</div>');
           }
-          var head=document.querySelector('.dot-claude');
+          var head=document.querySelector('.dot-planner');
           if(head)head=head.parentElement;
           if(head&&!head.querySelector('.done-badge')){
             head.insertAdjacentHTML('beforeend','<span class="done-badge">'+(success?'✓ 收口成功':'⚠ 审查完成')+'</span>');
           }
         }else if(rs.status==='review_fix'){
-          appendLog('claude','<div class="log-sep sys">⚠ Codex 发现问题，等待你确认是否修复。</div>');
-          appendLog('codex','<div class="log-sep sys">⚠ Codex 发现问题，等待你确认是否修复。</div>');
+          appendLog('planner','<div class="log-sep sys">⚠ '+toolDisplayNames.reviewer+' 发现问题，等待你确认是否修复。</div>');
+          appendLog('reviewer','<div class="log-sep sys">⚠ '+toolDisplayNames.reviewer+' 发现问题，等待你确认是否修复。</div>');
         }else if(rs.status==='review_pending'){
-          appendLog('codex','<div class="log-sep sys">[Codex 评审中...]</div>');
+          appendLog('reviewer','<div class="log-sep sys">['+toolDisplayNames.reviewer+' 评审中...]</div>');
         }
       }
       // 用 event_cursor 跳过已恢复事件

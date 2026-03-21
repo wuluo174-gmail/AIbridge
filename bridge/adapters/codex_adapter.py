@@ -35,6 +35,10 @@ class CodexAdapter(CLIAdapter):
     def cli_name(self) -> str:
         return "codex"
 
+    @property
+    def context_files(self):
+        return ["AGENTS.md", "CODEX.md"]
+
     # ── 能力矩阵 ──
 
     @property

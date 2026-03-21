@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Bridge</title>
+<style>
+:root{--bg:#0d1117;--surface:#161b22;--border:#30363d;--text:#e6edf3;--dim:#8b949e;--claude:#7c5cfc;--danger:#f85149}
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:'SF Mono','Fira Code','Menlo',monospace;background:var(--bg);color:var(--text);height:100vh;display:flex;align-items:center;justify-content:center;flex-direction:column}
+.startup,.error{display:flex;flex-direction:column;align-items:center;gap:16px;max-width:640px;padding:40px}
+.error{display:none;text-align:left;width:100%}
+h1{font-size:24px;font-weight:700;letter-spacing:-0.5px}
+.subtitle{color:var(--dim);font-size:13px;font-family:-apple-system,sans-serif}
+.pulse{width:32px;height:32px;border-radius:50%;background:var(--claude);animation:pulse 1.5s ease-in-out infinite}
+@keyframes pulse{0%,100%{opacity:.3;transform:scale(.8)}50%{opacity:1;transform:scale(1)}}
+.error h2{font-size:16px;color:var(--danger);margin-bottom:8px}
+.error-detail{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:14px;font-size:12px;line-height:1.6;white-space:pre-wrap;word-break:break-all;max-height:300px;overflow-y:auto;width:100%}
+.install-cmds{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:14px;font-size:13px;line-height:2;width:100%}
+.install-cmds code{color:var(--claude)}
+.log-path{color:var(--dim);font-size:11px;font-family:-apple-system,sans-serif;margin-top:8px;word-break:break-all}
+</style>
+</head>
+<body>
+<div class="startup" id="startup">
+  <div class="pulse"></div>
+  <h1>Claude ↔ Codex Bridge</h1>
+  <p class="subtitle">正在启动 Python 后端...</p>
+</div>
+<div class="error" id="error">
+  <h2 id="error-title"></h2>
+  <div id="error-body"></div>
+  <p class="log-path" id="log-path"></p>
+</div>
+<script>
+var INSTALL_MAP = {
+  python3: 'brew install python3',
+  claude: 'npm install -g @anthropic-ai/claude-code',
+  codex: 'npm install -g @openai/codex'
+};
+
+window.showStartupError = function(type, stderr, logPath) {
+  document.getElementById('startup').style.display = 'none';
+  var el = document.getElementById('error');
+  el.style.display = 'flex';
+  var title = document.getElementById('error-title');
+  var body = document.getElementById('error-body');
+
+  function makeDetail(text) {
+    var div = document.createElement('div');
+    div.className = 'error-detail';
+    div.textContent = text;
+    return div;
+  }
+
+  if (type === 'cli_not_found') {
+    title.textContent = '依赖工具未找到';
+    var missing = [];
+    var m = stderr.match(/BRIDGE_MISSING:(.*)/);
+    if (m) missing = m[1].trim().split(/\s+/);
+    if (missing.length) {
+      var wrap = document.createElement('div');
+      wrap.className = 'install-cmds';
+      for (var i = 0; i < missing.length; i++) {
+        var code = document.createElement('code');
+        code.textContent = INSTALL_MAP[missing[i]] || ('# install ' + missing[i]);
+        wrap.appendChild(code);
+        wrap.appendChild(document.createElement('br'));
+      }
+      body.appendChild(wrap);
+    } else {
+      body.appendChild(makeDetail(stderr));
+    }
+  } else if (type === 'python_crashed') {
+    title.textContent = 'Python 后端启动失败';
+    body.appendChild(makeDetail(stderr));
+  } else {
+    title.textContent = 'Python 后端 15s 内未就绪';
+    body.appendChild(makeDetail(stderr || '无 stderr 输出'));
+  }
+
+  if (logPath) {
+    document.getElementById('log-path').textContent = '完整日志: ' + logPath;
+  }
+};
+</script>
+</body>
+</html>

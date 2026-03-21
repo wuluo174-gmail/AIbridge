@@ -28,6 +28,13 @@ from bridge.session import add_event
 class CLIAdapter(ABC):
     """CLI 工具适配器基类。"""
 
+    def __init__(self):
+        # 启动时探测一次，后续 discover() 只读这份快照。
+        self._probed_path = None
+        self._probed_version = None
+        self._probe_error = None
+        self._probed_at = None
+
     # ── 身份 ──
 
     @property
@@ -54,6 +61,11 @@ class CLIAdapter(ABC):
     def agent_name(self) -> str:
         """事件流中使用的代理名称。默认与 id 相同，子类可覆盖。"""
         return self.id
+
+    @property
+    def context_files(self) -> list[str]:
+        """项目上下文文件列表。子类声明各自支持的文件名。"""
+        return []
 
     @property
     def log_raw_stdout(self) -> bool:
@@ -86,6 +98,80 @@ class CLIAdapter(ABC):
     def check_installed(self) -> bool:
         """检查工具是否已安装。"""
         return shutil.which(self.cli_name) is not None
+
+    @staticmethod
+    def _first_nonempty_line(*outputs) -> str | None:
+        for output in outputs:
+            if not output:
+                continue
+            for line in output.splitlines():
+                stripped = line.strip()
+                if stripped:
+                    return stripped
+        return None
+
+    def _probe_version_details(self, executable_path=None) -> tuple[str | None, str | None]:
+        """探测版本并返回 (version, error)。错误文本由 probe() 消费。"""
+        cmd = [executable_path or self.cli_name, "--version"]
+        try:
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        except FileNotFoundError:
+            return None, f"未找到 '{self.cli_name}' 命令"
+        except subprocess.TimeoutExpired:
+            return None, f"'{self.cli_name} --version' 执行超时"
+
+        if proc.returncode != 0:
+            detail = self._first_nonempty_line(proc.stderr, proc.stdout)
+            if detail:
+                return None, f"'{self.cli_name} --version' 失败: {detail}"
+            return None, f"'{self.cli_name} --version' 失败 (code {proc.returncode})"
+
+        version = self._first_nonempty_line(proc.stdout, proc.stderr)
+        if version:
+            return version, None
+        return None, f"'{self.cli_name} --version' 未返回版本信息"
+
+    def check_version(self, executable_path=None) -> str | None:
+        """尝试获取工具版本。失败返回 None，不抛异常。"""
+        version, _ = self._probe_version_details(executable_path)
+        return version
+
+    def probe(self):
+        """启动时探测工具路径和版本，结果缓存到实例上。"""
+        self._probed_path = None
+        self._probed_version = None
+        self._probe_error = None
+        self._probed_at = datetime.now().isoformat()
+
+        try:
+            executable_path = shutil.which(self.cli_name)
+            self._probed_path = executable_path
+            if executable_path is None:
+                self._probe_error = f"未找到 '{self.cli_name}' 命令"
+                return
+
+            self._probed_version, self._probe_error = self._probe_version_details(executable_path)
+        except Exception as e:
+            self._probe_error = f"探测失败: {e}"
+
+    def probe_snapshot(self) -> dict:
+        """返回当前 adapter 持有的启动探测快照。"""
+        return {
+            "id": self.id,
+            "display_name": self.display_name,
+            "agent_name": self.agent_name,
+            "detected_installed": self._probed_path is not None,
+            "executable_path": self._probed_path,
+            "version": self._probed_version,
+            "probe_error": self._probe_error,
+            "last_checked_at": self._probed_at,
+            "capabilities": self.capabilities,
+        }
 
     # ── 抽象钩子（子类必须实现） ──
 
@@ -176,9 +262,13 @@ class CLIAdapter(ABC):
 
     # ── 进程生命周期 (Template Method) ──
 
-    def run(self, prompt, cwd, sess, log_tag=None, **kwargs):
-        """完整 CLI 调用生命周期。子类可重写添加前/后处理（如 plan 检测）。"""
-        agent = self.agent_name
+    def run(self, prompt, cwd, sess, log_tag=None, agent_label=None, **kwargs):
+        """完整 CLI 调用生命周期。子类可重写添加前/后处理（如 plan 检测）。
+
+        agent_label: 覆盖事件中的 agent 名称。高层 role caller 传 "planner"/"reviewer"
+                     控制前端面板路由。低层直接调用不传，使用 self.agent_name。
+        """
+        agent = agent_label or self.agent_name
         log_tag = log_tag or agent
         cmd = self.build_command(prompt, cwd, **kwargs)
         log_file = sess.log_dir / f"{log_tag}.log"
@@ -193,8 +283,14 @@ class CLIAdapter(ABC):
             proc = subprocess.Popen(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 text=True, cwd=cwd, bufsize=1, env=env,
+                start_new_session=True,
             )
-            sess.active_proc = proc
+            with sess.proc_lock:
+                sess.active_proc = proc
+                try:
+                    sess.active_pgid = os.getpgid(proc.pid)
+                except (ProcessLookupError, PermissionError):
+                    sess.active_pgid = proc.pid
 
             stream_display = []
             result_text = ""
@@ -281,7 +377,14 @@ class CLIAdapter(ABC):
 
             proc.wait()
             stderr_t.join(timeout=5)
-            sess.active_proc = None
+            with sess.proc_lock:
+                sess.active_proc = None
+                pgid = sess.active_pgid
+                if pgid is not None:
+                    try:
+                        os.killpg(pgid, 0)
+                    except (ProcessLookupError, PermissionError):
+                        sess.active_pgid = None
 
             if sess.stop_flag.is_set():
                 output = self.extract_result(stream_display, result_text)

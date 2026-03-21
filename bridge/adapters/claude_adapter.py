@@ -33,6 +33,7 @@ class ClaudeCodeAdapter(CLIAdapter):
     """Claude Code CLI 适配器。"""
 
     def __init__(self, plan_lock_acquire_fn=None):
+        super().__init__()
         self._plan_lock_acquire_fn = plan_lock_acquire_fn
 
     # ── 身份 ──
@@ -52,6 +53,10 @@ class ClaudeCodeAdapter(CLIAdapter):
     @property
     def agent_name(self) -> str:
         return "claude"
+
+    @property
+    def context_files(self):
+        return ["CLAUDE.md"]
 
     @property
     def log_raw_stdout(self) -> bool:
@@ -152,7 +157,7 @@ class ClaudeCodeAdapter(CLIAdapter):
 
     # ── run() override — 包裹 plan 检测完整流程 ──
 
-    def run(self, prompt, cwd, sess, log_tag=None, **kwargs):
+    def run(self, prompt, cwd, sess, log_tag=None, agent_label=None, **kwargs):
         skip_plan_detection = kwargs.pop("skip_plan_detection", False)
 
         lock = None
@@ -172,7 +177,8 @@ class ClaudeCodeAdapter(CLIAdapter):
             # 运行时读 bridge.plan 模块属性（test monkeypatch 生效）
             plan_snapshot = bridge.plan.snapshot_plan_files() if not skip_plan_detection else None
 
-            output = super().run(prompt, cwd, sess, log_tag=log_tag, **kwargs)
+            output = super().run(prompt, cwd, sess, log_tag=log_tag,
+                                 agent_label=agent_label, **kwargs)
 
             # stop guard: 已中止则跳过 plan 差集检测（保留原始 bridge.py L244 语义）
             if sess.stop_flag.is_set():

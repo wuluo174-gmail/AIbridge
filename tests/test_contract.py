@@ -29,6 +29,7 @@ Bridge Contract Tests (v8)
 """
 
 import importlib.util
+import inspect
 import io
 import json
 import os
@@ -41,6 +42,7 @@ import types
 import urllib.parse
 import unittest
 import uuid
+from unittest import mock
 from pathlib import Path
 
 # 确保项目根目录在 path 中
@@ -56,6 +58,9 @@ from bridge.protocol import (
     COMPLETE_RESPONSE_KEYS, RECENT_PATHS_RESPONSE_KEYS,
     START_RESPONSE_KEYS, EVENT_PAYLOAD_REQUIRED_KEYS,
     GET_ENDPOINTS, POST_ENDPOINTS,
+    ARCHIVED_SESSIONS_RESPONSE_KEYS, ARCHIVED_SESSION_LISTING_KEYS,
+    ARCHIVED_HISTORY_RESPONSE_KEYS,
+    TOOLS_RESPONSE_KEYS, TOOL_LISTING_KEYS, ROLE_CONFIG_RESPONSE_KEYS,
 )
 
 
@@ -373,6 +378,8 @@ class TestProtocolConstants(unittest.TestCase):
             "/", "/api/events", "/api/state", "/api/sessions",
             "/api/history", "/api/browse", "/api/complete",
             "/api/recent_paths", "/api/prompts",
+            "/api/archived_sessions", "/api/archived_session_history",
+            "/api/tools", "/api/role_config",
         })
 
     def test_post_endpoints_exact(self):
@@ -380,6 +387,7 @@ class TestProtocolConstants(unittest.TestCase):
             "/api/start", "/api/execute", "/api/stop",
             "/api/review_fix", "/api/review_skip", "/api/prompts",
             "/api/inject", "/api/continue",
+            "/api/role_config",
         })
 
 
@@ -421,8 +429,12 @@ class TestSkeletonImports(unittest.TestCase):
         self.assertTrue(hasattr(prompts, 'build_claude_first_prompt'))
 
     def test_import_store(self):
-        from bridge.persistence import store
-        self.assertTrue(hasattr(store, 'Store'))
+        from bridge.persistence.store import Store
+        s = Store(":memory:")
+        try:
+            self.assertIsNotNone(s)
+        finally:
+            s.close()
 
     def test_import_plan(self):
         from bridge import plan
@@ -503,22 +515,22 @@ class TestPureFunctions(unittest.TestCase):
         self.assertEqual(self.mod.last_complete_round([]), 0)
 
     def test_lcr_complete_round(self):
-        h = [{"round": 1, "role": "claude"}, {"round": 1, "role": "codex"}]
+        h = [{"round": 1, "role": "planner"}, {"round": 1, "role": "reviewer"}]
         self.assertEqual(self.mod.last_complete_round(h), 1)
 
     def test_lcr_incomplete_round(self):
-        h = [{"round": 1, "role": "claude"}, {"round": 1, "role": "codex"},
-             {"round": 2, "role": "claude"}]
+        h = [{"round": 1, "role": "planner"}, {"round": 1, "role": "reviewer"},
+             {"round": 2, "role": "planner"}]
         self.assertEqual(self.mod.last_complete_round(h), 1)
 
     def test_lcr_multiple_complete(self):
-        h = [{"round": 1, "role": "claude"}, {"round": 1, "role": "codex"},
-             {"round": 2, "role": "claude"}, {"round": 2, "role": "codex"}]
+        h = [{"round": 1, "role": "planner"}, {"round": 1, "role": "reviewer"},
+             {"round": 2, "role": "planner"}, {"round": 2, "role": "reviewer"}]
         self.assertEqual(self.mod.last_complete_round(h), 2)
 
     def test_lcr_with_user_entries(self):
-        h = [{"round": 1, "role": "claude"}, {"round": 1, "role": "user"},
-             {"round": 1, "role": "codex"}]
+        h = [{"round": 1, "role": "planner"}, {"round": 1, "role": "user"},
+             {"round": 1, "role": "reviewer"}]
         self.assertEqual(self.mod.last_complete_round(h), 1)
 
     # ── collect_user_injects ──
@@ -625,6 +637,93 @@ class TestSessionStateLifecycle(unittest.TestCase):
 
     def test_history_initially_empty(self):
         self.assertEqual(self._make().history, [])
+
+    # ── Step 8A: proc_lock + active_pgid ──
+
+    def test_has_proc_lock(self):
+        self.assertIsNotNone(self._make().proc_lock)
+
+    def test_initial_active_pgid_is_none(self):
+        self.assertIsNone(self._make().active_pgid)
+
+    def test_proc_lock_protects_pgid_write(self):
+        """proc_lock 保护 active_pgid 的原子写入。"""
+        sess = self._make()
+        with sess.proc_lock:
+            sess.active_pgid = 12345
+        self.assertEqual(sess.active_pgid, 12345)
+
+    def test_proc_lock_protects_pgid_read(self):
+        """proc_lock 保护 active_pgid 的原子读取。"""
+        sess = self._make()
+        sess.active_pgid = 99999
+        with sess.proc_lock:
+            pgid = sess.active_pgid
+        self.assertEqual(pgid, 99999)
+
+    def test_active_pgid_independent_of_active_proc(self):
+        """active_pgid 独立于 active_proc 生命周期。"""
+        sess = self._make()
+        with sess.proc_lock:
+            sess.active_proc = "fake_proc"
+            sess.active_pgid = 42
+        with sess.proc_lock:
+            sess.active_proc = None
+        self.assertEqual(sess.active_pgid, 42)
+
+
+# ═════════════════════════════════════════════════════════════════
+# 4b. Step 8A 进程管理: _shutdown_all_sessions / _ensure_dead
+# ═════════════════════════════════════════════════════════════════
+
+class TestProcessManagement(unittest.TestCase):
+    """验证 Step 8A 进程清理函数的基础行为。"""
+
+    _skip_reason = None
+
+    @classmethod
+    def setUpClass(cls):
+        cls.mod = _load_bridge_module()
+        cls._tmpdir = _patch_log_dir(cls.mod)
+        if cls._tmpdir is None:
+            cls._skip_reason = "无法创建外部 scratch 目录；可通过 BRIDGE_TEST_TMPDIR 指向可写目录"
+
+    @classmethod
+    def tearDownClass(cls):
+        _restore_log_dir(cls.mod)
+        if cls._tmpdir:
+            shutil.rmtree(cls._tmpdir, ignore_errors=True)
+
+    def setUp(self):
+        if self._skip_reason:
+            self.skipTest(self._skip_reason)
+
+    def test_shutdown_all_sessions_exists(self):
+        self.assertTrue(callable(getattr(self.mod, '_shutdown_all_sessions', None)))
+
+    def test_ensure_dead_exists(self):
+        self.assertTrue(callable(getattr(self.mod, '_ensure_dead', None)))
+
+    def test_shutdown_all_sessions_returns_list(self):
+        """无活跃会话时返回空列表。"""
+        result = self.mod._shutdown_all_sessions()
+        self.assertIsInstance(result, list)
+        self.assertEqual(result, [])
+
+    def test_ensure_dead_with_empty_list(self):
+        """空 pgid 列表不报错。"""
+        self.mod._ensure_dead([])
+
+    def test_ensure_dead_with_nonexistent_pgid(self):
+        """不存在的 pgid 不报错（已死进程组）。"""
+        self.mod._ensure_dead([999999], timeout=0.1)
+
+    def test_stop_uses_active_pgid(self):
+        """验证 /api/stop 读取 active_pgid 而非 active_proc.kill()。"""
+        import bridge.server as srv
+        handler_source = inspect.getsource(srv.BridgeHandler.do_POST)
+        self.assertIn("active_pgid", handler_source)
+        self.assertNotIn("active_proc.kill()", handler_source)
 
 
 # ═════════════════════════════════════════════════════════════════
@@ -988,7 +1087,7 @@ class TestRuntimeEventContract(unittest.TestCase):
         """非 git 执行: execution_done + 自动 review_start。"""
         sess = self._make_session("e1")
         sess.status = "executing"
-        sess.history = [{"round": 1, "role": "claude", "content": "plan",
+        sess.history = [{"round": 1, "role": "planner", "content": "plan",
                          "phase": "方案", "timestamp": "t"}]
         sess.consensus = True
         self._install_popen_stub("executed ok", "任务收口成功\nall good")
@@ -1005,7 +1104,7 @@ class TestRuntimeEventContract(unittest.TestCase):
         """git 项目: baseline ref + untracked 被正确捕获 (NR-6)。"""
         sess = self._make_session("e2")
         sess.status = "executing"
-        sess.history = [{"round": 1, "role": "claude", "content": "plan",
+        sess.history = [{"round": 1, "role": "planner", "content": "plan",
                          "phase": "方案", "timestamp": "t"}]
         sess.consensus = True
         self.mod._is_git_repo = lambda cwd: True
@@ -1026,7 +1125,7 @@ class TestRuntimeEventContract(unittest.TestCase):
         """审查"任务收口成功" → done + review_done(success=True)。"""
         sess = self._make_session("r1")
         sess.status = "executing"
-        sess.history = [{"round": 1, "role": "claude", "content": "plan",
+        sess.history = [{"round": 1, "role": "planner", "content": "plan",
                          "phase": "方案", "timestamp": "t"}]
         sess.consensus = True
         self._install_popen_stub("executed", "任务收口成功\nall checks pass")
@@ -1043,7 +1142,7 @@ class TestRuntimeEventContract(unittest.TestCase):
         """审查发现问题 → review_fix + review_needs_fix。"""
         sess = self._make_session("r2")
         sess.status = "executing"
-        sess.history = [{"round": 1, "role": "claude", "content": "plan",
+        sess.history = [{"round": 1, "role": "planner", "content": "plan",
                          "phase": "方案", "timestamp": "t"}]
         sess.consensus = True
         self._install_popen_stub("executed", "发现以下问题需要修复")
@@ -1059,7 +1158,7 @@ class TestRuntimeEventContract(unittest.TestCase):
         sess = self._make_session("r3")
         sess.status = "review_fix"
         sess.review_round = 1
-        sess.review_history = [{"round": 1, "role": "codex", "phase": "执行审查",
+        sess.review_history = [{"round": 1, "role": "reviewer", "phase": "执行审查",
                                 "content": "问题", "timestamp": "t"}]
         sess.execution_result = "prev"
         self._install_popen_stub("fixed code", "任务收口成功\nok")
@@ -1092,9 +1191,9 @@ class TestRuntimeEventContract(unittest.TestCase):
         """续接失败: 回退到 last_complete_round。"""
         sess = self._make_session("rb")
         sess.history = [
-            {"round": 1, "role": "claude", "content": "plan1",
+            {"round": 1, "role": "planner", "content": "plan1",
              "phase": "方案", "timestamp": "t"},
-            {"round": 1, "role": "codex", "content": "review1",
+            {"round": 1, "role": "reviewer", "content": "review1",
              "phase": "审查", "timestamp": "t"},
         ]
         sess.current_round = 1
@@ -1471,6 +1570,22 @@ class TestAPIContractHermetic(unittest.TestCase):
             )
             return
 
+        cls._orig_probe_all = cls.mod._registry.probe_all
+
+        def _fake_probe_all():
+            for tool_id in cls.mod._registry.list_tool_ids():
+                inst = cls.mod._registry.get(tool_id)
+                inst._probed_path = f"/mock/{inst.cli_name}"
+                inst._probed_version = f"{inst.cli_name} 1.0.0"
+                inst._probe_error = None
+                inst._probed_at = "2026-01-01T00:00:00"
+
+        cls.mod._registry.probe_all = _fake_probe_all
+        cls.mod.init_store(":memory:")
+        for tool_id in cls.mod._registry.list_tool_ids():
+            inst = cls.mod._registry.get(tool_id)
+            inst.check_installed = (lambda _inst=inst: True)
+
         cls._project_path = ROOT
         cls._browse_path = ROOT
         cls._complete_prefix = ROOT if ROOT.endswith(os.sep) else ROOT + os.sep
@@ -1497,6 +1612,7 @@ class TestAPIContractHermetic(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         if hasattr(cls, '_orig_run_negotiation'):
+            cls.mod._registry.probe_all = cls._orig_probe_all
             cls.mod.run_negotiation = cls._orig_run_negotiation
             cls.mod.run_execution = cls._orig_run_execution
             cls.mod.run_review_fix_cycle = cls._orig_run_review_fix_cycle
@@ -1677,6 +1793,68 @@ class TestAPIContractHermetic(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertIn("<!doctype html>", data[:100].lower() if isinstance(data, str) else "")
 
+    # ── Step 9: 双模式伺服 ──
+    # 所有测试通过 tempdir + monkey-patch _DIST_DIR，不触碰真实 frontend/dist
+
+    def _with_temp_dist(self, setup_fn):
+        """在临时目录中 monkey-patch _DIST_DIR，执行 setup_fn 后还原。"""
+        import tempfile, shutil
+        from pathlib import Path
+        tmpdir = Path(tempfile.mkdtemp())
+        original = self.mod.BridgeHandler._DIST_DIR
+        self.mod.BridgeHandler._DIST_DIR = tmpdir
+        try:
+            setup_fn(tmpdir)
+        finally:
+            self.mod.BridgeHandler._DIST_DIR = original
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_root_serves_dist_when_available(self):
+        """GET / 优先返回 frontend/dist/index.html 的内容。"""
+        marker = "<!-- SVELTE-DIST-MARKER -->"
+        def setup(tmpdir):
+            (tmpdir / "index.html").write_text(
+                f"<!doctype html><html>{marker}</html>")
+            status, data = self._get("/")
+            self.assertEqual(status, 200)
+            self.assertIn(marker, data if isinstance(data, str) else "")
+        self._with_temp_dist(setup)
+
+    def test_root_fallback_when_no_dist(self):
+        """GET / 在无 dist 时返回 HTML_UI fallback (含告警栏)。"""
+        def setup(tmpdir):
+            # tmpdir exists but has no index.html → fallback
+            status, data = self._get("/")
+            self.assertEqual(status, 200)
+            text = data if isinstance(data, str) else ""
+            self.assertIn("<!doctype html>", text[:100].lower())
+            self.assertIn("内置 UI 快照", text)
+        self._with_temp_dist(setup)
+
+    def test_assets_serves_existing_file(self):
+        """GET /assets/xxx 返回 dist 中的静态文件。"""
+        def setup(tmpdir):
+            assets_dir = tmpdir / "assets"
+            assets_dir.mkdir()
+            (assets_dir / "test-abc123.js").write_text("console.log('ok')")
+            status, data = self._get("/assets/test-abc123.js")
+            self.assertEqual(status, 200)
+        self._with_temp_dist(setup)
+
+    def test_assets_rejects_traversal(self):
+        """GET /assets/../../etc/passwd 返回 404，不逃逸。"""
+        def setup(tmpdir):
+            status, _ = self._get("/assets/../../etc/passwd")
+            self.assertEqual(status, 404)
+        self._with_temp_dist(setup)
+
+    def test_assets_404_for_missing_file(self):
+        """GET /assets/nonexistent.js 返回 404。"""
+        def setup(tmpdir):
+            status, _ = self._get("/assets/nonexistent-xyz.js")
+            self.assertEqual(status, 404)
+        self._with_temp_dist(setup)
+
     def test_review_skip_wrong_state_returns_400(self):
         """非 review_fix 下 review_skip 返回 400。"""
         _, start_data = self._post("/api/start",
@@ -1833,6 +2011,1161 @@ class TestAPIContractHermetic(unittest.TestCase):
         finally:
             self.mod.CONTINUABLE_STATES = orig
             self._post("/api/stop", {"session_id": sid})
+
+
+    # ── Step 6: 归档端点 ──
+
+    def test_archived_sessions_response_shape(self):
+        """GET /api/archived_sessions 返回正确形状，键集合与协议常量一致。"""
+        status, data = self._get("/api/archived_sessions")
+        self.assertEqual(status, 200)
+        self.assertEqual(set(data.keys()), ARCHIVED_SESSIONS_RESPONSE_KEYS)
+        self.assertIsInstance(data["sessions"], list)
+
+    def test_archived_session_history_response_shape(self):
+        """GET /api/archived_session_history 无 sid 时返回空默认，键集合与协议常量一致。"""
+        status, data = self._get("/api/archived_session_history")
+        self.assertEqual(status, 200)
+        self.assertEqual(set(data.keys()), ARCHIVED_HISTORY_RESPONSE_KEYS)
+
+    # ── Step 7: /api/tools + /api/role_config ──
+
+    def test_tools_response_shape(self):
+        """GET /api/tools 返回工具列表，含 agent_name。"""
+        status, data = self._get("/api/tools")
+        self.assertEqual(status, 200)
+        self.assertEqual(set(data.keys()), TOOLS_RESPONSE_KEYS)
+        self.assertIsInstance(data["tools"], list)
+        self.assertGreater(len(data["tools"]), 0)
+        for tool in data["tools"]:
+            self.assertEqual(set(tool.keys()), TOOL_LISTING_KEYS)
+
+    def test_tools_api_returns_probe_timestamp(self):
+        """GET /api/tools 返回启动探测时间，来源于 probe 快照。"""
+        status, data = self._get("/api/tools")
+        self.assertEqual(status, 200)
+        for tool in data["tools"]:
+            self.assertEqual(tool["last_checked_at"], "2026-01-01T00:00:00")
+
+    def test_init_store_persists_probe_timestamp(self):
+        """init_store 将 probe 源头时间原样写入 SQLite。"""
+        tools = self.mod._store.list_tools()
+        self.assertGreater(len(tools), 0)
+        for tool in tools:
+            self.assertEqual(tool["last_checked_at"], "2026-01-01T00:00:00")
+
+    def test_role_config_get_response_shape(self):
+        """GET /api/role_config 返回当前角色配置 + 工具列表 + executor。"""
+        status, data = self._get("/api/role_config")
+        self.assertEqual(status, 200)
+        self.assertEqual(set(data.keys()), ROLE_CONFIG_RESPONSE_KEYS)
+        self.assertIn(data["planner_tool_id"], ["claude-code", "codex"])
+        self.assertIn(data["reviewer_tool_id"], ["claude-code", "codex"])
+        self.assertIsNotNone(data["executor_tool_id"])
+
+    def test_role_config_post_same_tool_rejected(self):
+        """POST /api/role_config 同工具双角色 → 400。"""
+        status, data = self._post("/api/role_config", {
+            "planner_tool_id": "claude-code",
+            "reviewer_tool_id": "claude-code",
+        })
+        self.assertEqual(status, 400)
+        self.assertIn("error", data)
+
+    def test_role_config_post_unknown_tool_rejected(self):
+        """POST /api/role_config 未注册工具 → 400。"""
+        status, data = self._post("/api/role_config", {
+            "planner_tool_id": "nonexistent",
+            "reviewer_tool_id": "codex",
+        })
+        self.assertEqual(status, 400)
+
+    def test_role_config_post_active_session_rejected(self):
+        """POST /api/role_config 存在活跃会话 → 409。"""
+        # 创建一个运行中会话
+        from bridge.session import sessions, sessions_lock, SessionState
+        sess = SessionState("rcfg_test", "t", "/tmp", 3)
+        sess.status = "running"
+        with sessions_lock:
+            sessions["rcfg_test"] = sess
+        try:
+            status, data = self._post("/api/role_config", {
+                "planner_tool_id": "codex",
+                "reviewer_tool_id": "claude-code",
+            })
+            self.assertEqual(status, 409)
+        finally:
+            with sessions_lock:
+                sessions.pop("rcfg_test", None)
+
+    def test_role_config_get_uses_startup_snapshot_post_uses_live_install_check(self):
+        """GET 返回启动快照；POST 仍使用 live check_installed 校验。"""
+        inst = self.mod._registry.get("codex")
+        old_path = inst._probed_path
+        old_version = inst._probed_version
+        old_error = inst._probe_error
+        old_checked_at = inst._probed_at
+        try:
+            inst._probed_path = None
+            inst._probed_version = None
+            inst._probe_error = "未找到 'codex' 命令"
+            inst._probed_at = "2026-01-02T00:00:00"
+
+            status, data = self._get("/api/role_config")
+            self.assertEqual(status, 200)
+            codex = next(t for t in data["tools"] if t["id"] == "codex")
+            self.assertFalse(codex["detected_installed"])
+            self.assertEqual(codex["last_checked_at"], "2026-01-02T00:00:00")
+
+            status, data = self._post("/api/role_config", {
+                "planner_tool_id": "claude-code",
+                "reviewer_tool_id": "codex",
+            })
+            self.assertEqual(status, 200)
+            self.assertTrue(data["ok"])
+        finally:
+            inst._probed_path = old_path
+            inst._probed_version = old_version
+            inst._probe_error = old_error
+            inst._probed_at = old_checked_at
+
+
+# ═════════════════════════════════════════════════════════════════
+# 11. Store 单元测试
+# ═════════════════════════════════════════════════════════════════
+
+class TestStoreHermetic(unittest.TestCase):
+    """Hermetic Store 测试 — 使用 :memory: SQLite。"""
+
+    def setUp(self):
+        from bridge.persistence.store import Store
+        self.store = Store(":memory:")
+
+    def tearDown(self):
+        self.store.close()
+
+    def test_init_db_creates_tables(self):
+        """init_db 建表成功，验证 8 张表（含 _meta）。"""
+        c = self.store._conn.cursor()
+        c.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+        tables = {row[0] for row in c.fetchall()}
+        # 排除 sqlite 内部表（如 sqlite_sequence，由 AUTOINCREMENT 自动创建）
+        tables -= {t for t in tables if t.startswith("sqlite_")}
+        expected = {"sessions", "session_history", "review_history",
+                    "cli_tools", "role_assignments", "prompt_templates",
+                    "recent_paths", "_meta"}
+        self.assertEqual(tables, expected)
+
+    def test_save_and_list_sessions(self):
+        """save_session + list_sessions 往返一致。"""
+        import bridge.session as _bsession
+        tmpdir = _make_scratch_dir("store_test_logs_")
+        if tmpdir is None:
+            self.skipTest("无法创建 scratch 目录")
+        orig_log_dir = _bsession.LOG_DIR
+        _bsession.LOG_DIR = tmpdir
+        try:
+            sess = _bsession.SessionState("s1", "test task", "/tmp", 5)
+            sess.status = "done"
+            sess.current_round = 2
+            sess.consensus = True
+            sess.consensus_round = 2
+            self.store.save_session(sess)
+            rows = self.store.list_sessions()
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["session_id"], "s1")
+            self.assertEqual(rows[0]["final_status"], "done")
+            self.assertTrue(rows[0]["consensus"])
+        finally:
+            _bsession.LOG_DIR = orig_log_dir
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_get_session(self):
+        """get_session 返回正确 dict。"""
+        import bridge.session as _bsession
+        tmpdir = _make_scratch_dir("store_test_logs_")
+        if tmpdir is None:
+            self.skipTest("无法创建 scratch 目录")
+        orig_log_dir = _bsession.LOG_DIR
+        _bsession.LOG_DIR = tmpdir
+        try:
+            sess = _bsession.SessionState("s2", "task2", "/tmp", 3)
+            sess.status = "error"
+            sess.error = "test error"
+            self.store.save_session(sess)
+            row = self.store.get_session("s2")
+            self.assertIsNotNone(row)
+            self.assertEqual(row["task"], "task2")
+            self.assertEqual(row["final_status"], "error")
+            self.assertIsNone(self.store.get_session("nonexistent"))
+        finally:
+            _bsession.LOG_DIR = orig_log_dir
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_save_session_with_history(self):
+        """save_session 含 history 条目。"""
+        import bridge.session as _bsession
+        tmpdir = _make_scratch_dir("store_test_logs_")
+        if tmpdir is None:
+            self.skipTest("无法创建 scratch 目录")
+        orig_log_dir = _bsession.LOG_DIR
+        _bsession.LOG_DIR = tmpdir
+        try:
+            sess = _bsession.SessionState("s3", "task3", "/tmp", 5)
+            sess.status = "done"
+            sess.history = [
+                {"round": 1, "role": "claude", "phase": "方案",
+                 "content": "plan", "timestamp": "2024-01-01T00:00:00"},
+                {"round": 1, "role": "codex", "phase": "审查",
+                 "content": "APPROVED", "timestamp": "2024-01-01T00:01:00"},
+            ]
+            sess.review_history = [
+                {"round": 1, "role": "codex", "phase": "执行审查",
+                 "content": "任务收口成功", "timestamp": "2024-01-01T00:02:00"},
+            ]
+            self.store.save_session(sess)
+            h = self.store.get_session_history("s3")
+            self.assertEqual(len(h), 2)
+            self.assertEqual(h[0]["role"], "claude")
+            rh = self.store.get_session_review_history("s3")
+            self.assertEqual(len(rh), 1)
+            self.assertEqual(rh[0]["content"], "任务收口成功")
+        finally:
+            _bsession.LOG_DIR = orig_log_dir
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_save_session_idempotent(self):
+        """save_session 二次调用不会导致历史重复。"""
+        import bridge.session as _bsession
+        tmpdir = _make_scratch_dir("store_test_logs_")
+        if tmpdir is None:
+            self.skipTest("无法创建 scratch 目录")
+        orig_log_dir = _bsession.LOG_DIR
+        _bsession.LOG_DIR = tmpdir
+        try:
+            sess = _bsession.SessionState("idem1", "task", "/tmp", 3)
+            sess.status = "done"
+            sess.history = [
+                {"round": 1, "role": "claude", "phase": "方案",
+                 "content": "plan", "timestamp": "2024-01-01T00:00:00"},
+            ]
+            sess.review_history = [
+                {"round": 1, "role": "codex", "phase": "执行审查",
+                 "content": "ok", "timestamp": "2024-01-01T00:01:00"},
+            ]
+            self.store.save_session(sess)
+            self.store.save_session(sess)  # 二次保存
+            h = self.store.get_session_history("idem1")
+            self.assertEqual(len(h), 1, "session_history 不应重复")
+            rh = self.store.get_session_review_history("idem1")
+            self.assertEqual(len(rh), 1, "review_history 不应重复")
+        finally:
+            _bsession.LOG_DIR = orig_log_dir
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_list_sessions_keys_match_protocol(self):
+        """list_sessions 返回的 dict 键集合与 ARCHIVED_SESSION_LISTING_KEYS 一致。"""
+        import bridge.session as _bsession
+        tmpdir = _make_scratch_dir("store_test_logs_")
+        if tmpdir is None:
+            self.skipTest("无法创建 scratch 目录")
+        orig_log_dir = _bsession.LOG_DIR
+        _bsession.LOG_DIR = tmpdir
+        try:
+            sess = _bsession.SessionState("keys1", "task", "/tmp", 5)
+            sess.status = "done"
+            self.store.save_session(sess)
+            rows = self.store.list_sessions()
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(set(rows[0].keys()), ARCHIVED_SESSION_LISTING_KEYS)
+        finally:
+            _bsession.LOG_DIR = orig_log_dir
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_save_and_load_prompts(self):
+        """save_prompts + load_prompts 往返一致。"""
+        config = {"claude_first": "test prompt", "codex_first": "another"}
+        self.store.save_prompts(config)
+        loaded = self.store.load_prompts()
+        self.assertEqual(loaded, config)
+
+    def test_save_prompts_overwrites(self):
+        """save_prompts 重复保存覆盖旧值，无重复行。"""
+        self.store.save_prompts({"k1": "v1"})
+        self.store.save_prompts({"k1": "v2", "k2": "v3"})
+        loaded = self.store.load_prompts()
+        self.assertEqual(loaded, {"k1": "v2", "k2": "v3"})
+
+    def test_save_and_load_recent_paths(self):
+        """save_recent_paths + load_recent_paths 顺序保持。"""
+        paths = ["/a", "/b", "/c"]
+        self.store.save_recent_paths(paths)
+        loaded = self.store.load_recent_paths()
+        self.assertEqual(loaded, paths)
+
+    def test_save_recent_paths_replaces(self):
+        """save_recent_paths 替换语义。"""
+        self.store.save_recent_paths(["/a", "/b"])
+        self.store.save_recent_paths(["/c", "/d"])
+        self.assertEqual(self.store.load_recent_paths(), ["/c", "/d"])
+
+    def test_register_and_list_tools(self):
+        """register_tool + list_tools。"""
+        self.store.register_tool(
+            "claude-code", "Claude Code", '{"plan_mode": true}',
+            agent_name="claude", detected_installed=True,
+            executable_path="/mock/claude", version="claude 1.0.0",
+            probe_error=None, last_checked_at="2026-01-01T00:00:00")
+        tools = self.store.list_tools()
+        self.assertEqual(len(tools), 1)
+        self.assertEqual(tools[0]["id"], "claude-code")
+        self.assertEqual(tools[0]["agent_name"], "claude")
+        self.assertTrue(tools[0]["detected_installed"])
+        self.assertEqual(tools[0]["executable_path"], "/mock/claude")
+        self.assertEqual(tools[0]["version"], "claude 1.0.0")
+        self.assertIsNone(tools[0]["probe_error"])
+        self.assertEqual(tools[0]["last_checked_at"], "2026-01-01T00:00:00")
+        self.assertTrue(tools[0]["capabilities"]["plan_mode"])
+
+    def test_register_tool_preserves_probe_timestamp(self):
+        """register_tool 不伪造探测时间，原样保存上游 probe 时间。"""
+        from bridge.persistence.store import Store
+        tmpdir = _make_scratch_dir("store_probe_timestamp_")
+        if tmpdir is None:
+            self.skipTest("无法创建 scratch 目录")
+        db_path = tmpdir / "probe.db"
+        store = Store(str(db_path))
+        try:
+            store.register_tool(
+                "claude-code", "Claude Code", '{}',
+                last_checked_at="2026-01-01T00:00:00")
+            tools = store.list_tools()
+            self.assertEqual(tools[0]["last_checked_at"], "2026-01-01T00:00:00")
+        finally:
+            store.close()
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_existing_db_schema_upgraded_for_cli_tools(self):
+        """旧版 cli_tools / role_assignments schema 启动后自动补列和索引。"""
+        import sqlite3
+        tmpdir = _make_scratch_dir("store_schema_test_")
+        if tmpdir is None:
+            self.skipTest("无法创建 scratch 目录")
+        db_path = tmpdir / "legacy.db"
+        conn = sqlite3.connect(str(db_path))
+        try:
+            conn.executescript(
+                """
+                CREATE TABLE cli_tools (
+                    id TEXT PRIMARY KEY,
+                    display_name TEXT NOT NULL,
+                    installed INTEGER DEFAULT 0,
+                    executable_path TEXT,
+                    version TEXT,
+                    capabilities_json TEXT DEFAULT '{}',
+                    last_checked_at TEXT
+                );
+                CREATE TABLE role_assignments (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL DEFAULT 'default',
+                    planner_tool_id TEXT NOT NULL,
+                    reviewer_tool_id TEXT NOT NULL,
+                    is_active INTEGER DEFAULT 0
+                );
+                """
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        from bridge.persistence.store import Store
+        legacy = Store(str(db_path))
+        try:
+            c = legacy._conn.cursor()
+            c.execute("PRAGMA table_info(cli_tools)")
+            cols = {row[1] for row in c.fetchall()}
+            self.assertTrue({"agent_name", "detected_installed", "probe_error"}.issubset(cols))
+            self.assertNotIn("installed", cols)
+            c.execute("PRAGMA index_list(role_assignments)")
+            indexes = {row[1] for row in c.fetchall()}
+            self.assertIn("idx_role_assignments_name", indexes)
+        finally:
+            legacy.close()
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_migration_markers(self):
+        """is_migration_complete / mark_migration_complete 往返一致。"""
+        self.assertFalse(self.store.is_migration_complete("prompts"))
+        self.store.mark_migration_complete("prompts")
+        self.assertTrue(self.store.is_migration_complete("prompts"))
+        self.assertFalse(self.store.is_migration_complete("recent_paths"))
+
+    def test_concurrent_writes(self):
+        """并发写入不死锁。"""
+        import bridge.session as _bsession
+        tmpdir = _make_scratch_dir("store_test_logs_")
+        if tmpdir is None:
+            self.skipTest("无法创建 scratch 目录")
+        orig_log_dir = _bsession.LOG_DIR
+        _bsession.LOG_DIR = tmpdir
+        errors = []
+        try:
+            def writer(sid):
+                try:
+                    s = _bsession.SessionState(sid, f"task-{sid}", "/tmp", 3)
+                    s.status = "done"
+                    self.store.save_session(s)
+                except Exception as e:
+                    errors.append(e)
+            threads = [threading.Thread(target=writer, args=(f"c{i}",)) for i in range(5)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=5)
+            self.assertEqual(errors, [])
+            self.assertEqual(len(self.store.list_sessions()), 5)
+        finally:
+            _bsession.LOG_DIR = orig_log_dir
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+# ═════════════════════════════════════════════════════════════════
+# 12. 迁移语义测试
+# ═════════════════════════════════════════════════════════════════
+
+class TestMigrationSemantics(unittest.TestCase):
+    """JSON → SQLite 迁移语义：通过 bridge.py 的 init_store / _migrate_json_to_sqlite /
+    load_prompts / load_recent_paths 真实路径验证。"""
+
+    _skip_reason = None
+
+    @classmethod
+    def setUpClass(cls):
+        import bridge.session as _bsession
+        import bridge.orchestration.prompts as _p
+        import bridge.server as _s
+        cls._orig_log_dir = _bsession.LOG_DIR
+        cls._orig_prompts_file = _p.PROMPTS_FILE
+        cls._orig_recent_paths_file = _s.RECENT_PATHS_FILE
+        cls._orig_prompt_config = _p.prompt_config.copy()
+        cls._tmp_dir = _make_scratch_dir("bridge_migration_")
+        cls._tmp_log = _make_scratch_dir("mig_logs_")
+        if cls._tmp_dir is None or cls._tmp_log is None:
+            cls._skip_reason = "无法创建外部 scratch 目录"
+        else:
+            _bsession.LOG_DIR = cls._tmp_log
+
+    @classmethod
+    def tearDownClass(cls):
+        import bridge.session as _bsession
+        import bridge.orchestration.prompts as _p
+        import bridge.server as _s
+        _bsession.LOG_DIR = cls._orig_log_dir
+        _p.PROMPTS_FILE = cls._orig_prompts_file
+        _s.RECENT_PATHS_FILE = cls._orig_recent_paths_file
+        _p.prompt_config.clear()
+        _p.prompt_config.update(cls._orig_prompt_config)
+        if cls._tmp_dir:
+            shutil.rmtree(cls._tmp_dir, ignore_errors=True)
+        if cls._tmp_log:
+            shutil.rmtree(cls._tmp_log, ignore_errors=True)
+
+    def setUp(self):
+        if self._skip_reason:
+            self.skipTest(self._skip_reason)
+
+    def _fresh_mod_with_json(self, subdir, prompts_data=None, paths_data=None):
+        """加载 bridge 模块，patch PROMPTS_FILE/RECENT_PATHS_FILE 到 subdir，返回 mod。"""
+        d = self._tmp_dir / subdir
+        d.mkdir(exist_ok=True)
+        mod = _load_bridge_module()
+        mod.LOG_DIR = self._tmp_log
+        # Patch JSON 文件路径到隔离目录
+        prompts_file = d / "prompts.json"
+        recent_file = d / "recent_paths.json"
+        mod.PROMPTS_FILE = prompts_file
+        mod.RECENT_PATHS_FILE = recent_file
+        # 同步到 _json_load_prompts / _json_load_recent_paths 引用的模块
+        import bridge.orchestration.prompts as _p
+        import bridge.server as _s
+        _p.PROMPTS_FILE = prompts_file
+        _s.RECENT_PATHS_FILE = recent_file
+        if prompts_data is not None:
+            prompts_file.write_text(
+                json.dumps(prompts_data, ensure_ascii=False), encoding="utf-8")
+        if paths_data is not None:
+            recent_file.write_text(
+                json.dumps(paths_data, ensure_ascii=False), encoding="utf-8")
+        _p.prompt_config.clear()
+        _p.prompt_config.update(_p.load_prompts())
+        return mod, d
+
+    def test_migration_success_rebuilds_prompt_config(self):
+        """迁移成功 → init_store 从 DB 重建 prompt_config。"""
+        mod, d = self._fresh_mod_with_json(
+            "success", prompts_data={"claude_first": "from_json"})
+        db_path = d / "test.db"
+        mod.init_store(str(db_path))
+        # init_store 应已迁移并重建 prompt_config
+        self.assertTrue(mod._store.is_migration_complete("prompts"))
+        self.assertEqual(mod.prompt_config.get("claude_first"), "from_json")
+        # bridge.py 的 load_prompts wrapper 应返回 DB 数据
+        self.assertEqual(mod.load_prompts(), {"claude_first": "from_json"})
+
+    def test_migration_failure_preserves_json_fallback(self):
+        """迁移失败 → 无标记 → prompt_config 保留 JSON 值，load_prompts 回退 JSON。"""
+        mod, d = self._fresh_mod_with_json(
+            "fail", prompts_data={"claude_first": "json_value"})
+        db_path = d / "test.db"
+        # 让 save_prompts 在 Store 层抛异常来模拟迁移失败
+        from bridge.persistence.store import Store
+        real_init = Store.__init__
+        def patched_init(self_store, db_path_arg=None):
+            real_init(self_store, db_path_arg)
+            real_save = self_store.save_prompts
+            def failing_save(config):
+                raise RuntimeError("模拟 DB 写入失败")
+            self_store.save_prompts = failing_save
+        Store.__init__ = patched_init
+        try:
+            mod.init_store(str(db_path))
+        finally:
+            Store.__init__ = real_init
+        # 迁移失败 → 无标记 → prompt_config 应保留 import 时的 JSON 值
+        self.assertFalse(mod._store.is_migration_complete("prompts"))
+        self.assertEqual(mod.prompt_config, {"claude_first": "json_value"})
+        # bridge.py 的 load_prompts 应回退 JSON（因为迁移未完成）
+        loaded = mod.load_prompts()
+        self.assertEqual(loaded, {"claude_first": "json_value"})
+
+    def test_migration_retry_on_restart(self):
+        """迁移失败后 "重启"（重新 init_store 同一 DB）→ 无标记 → 重试成功。"""
+        mod, d = self._fresh_mod_with_json(
+            "retry", prompts_data={"k": "original"})
+        db_path = d / "test.db"
+        # 第一次：让迁移失败
+        from bridge.persistence.store import Store
+        real_init = Store.__init__
+        def patched_init(self_store, db_path_arg=None):
+            real_init(self_store, db_path_arg)
+            real_save = self_store.save_prompts
+            def failing_save(config):
+                raise RuntimeError("first attempt fails")
+            self_store.save_prompts = failing_save
+        Store.__init__ = patched_init
+        try:
+            mod.init_store(str(db_path))
+        finally:
+            Store.__init__ = real_init
+        # 迁移失败，应回退 JSON
+        self.assertEqual(mod.load_prompts().get("k"), "original")
+        # 第二次："重启" — 重新加载模块，同一 DB，不再 patch
+        mod2, _ = self._fresh_mod_with_json(
+            "retry", prompts_data={"k": "original"})
+        mod2.init_store(str(db_path))
+        # 这次迁移成功 → prompt_config 从 DB 重建
+        self.assertEqual(mod2.prompt_config.get("k"), "original")
+        self.assertEqual(mod2.load_prompts(), {"k": "original"})
+
+    def test_no_json_marks_complete_blocks_future_import(self):
+        """无 JSON 文件 → init_store 标记迁移完成 → 日后出现的 JSON 不被导入。"""
+        mod, d = self._fresh_mod_with_json("nojson")  # 不传 prompts_data → 无文件
+        db_path = d / "test.db"
+        mod.init_store(str(db_path))
+        # 迁移标记应已写入（无文件可迁移但标记完成）
+        self.assertTrue(mod._store.is_migration_complete("prompts"))
+        # 现在创建一个 prompts.json — 模拟"日后出现"
+        (d / "prompts.json").write_text('{"sneaky": "late"}', encoding="utf-8")
+        # "重启"
+        mod2, _ = self._fresh_mod_with_json("nojson")
+        # 手动写回 JSON（因为 _fresh_mod_with_json 不传 prompts_data 不写文件）
+        mod2.init_store(str(db_path))
+        # 已标记 → 跳过迁移 → sneaky 不应出现在 DB
+        self.assertEqual(mod2.load_prompts(), {})
+
+    def test_recent_paths_migration_success(self):
+        """recent_paths 迁移成功 → load_recent_paths 从 DB 读；
+        迁移独立于 prompts 标记。"""
+        mod, d = self._fresh_mod_with_json(
+            "paths", paths_data=["/a", "/b", "/c"])
+        db_path = d / "test.db"
+        mod.init_store(str(db_path))
+        # recent_paths 已迁移
+        self.assertTrue(mod._store.is_migration_complete("recent_paths"))
+        self.assertEqual(mod.load_recent_paths(), ["/a", "/b", "/c"])
+        # prompts 也应该独立标记完成（无 JSON → 标记完成）
+        self.assertTrue(mod._store.is_migration_complete("prompts"))
+
+    def test_recent_paths_migration_failure_falls_back_to_json(self):
+        """recent_paths 迁移失败 → 无标记 → load_recent_paths 回退 JSON。"""
+        mod, d = self._fresh_mod_with_json(
+            "paths_fail", paths_data=["/x", "/y"])
+        db_path = d / "test.db"
+        from bridge.persistence.store import Store
+        real_init = Store.__init__
+
+        def patched_init(self_store, db_path_arg=None):
+            real_init(self_store, db_path_arg)
+
+            def failing_save(paths):
+                raise RuntimeError("模拟 recent_paths 写入失败")
+
+            self_store.save_recent_paths = failing_save
+
+        Store.__init__ = patched_init
+        try:
+            mod.init_store(str(db_path))
+        finally:
+            Store.__init__ = real_init
+
+        self.assertFalse(mod._store.is_migration_complete("recent_paths"))
+        self.assertEqual(mod.load_recent_paths(), ["/x", "/y"])
+        self.assertTrue(mod._store.is_migration_complete("prompts"))
+
+
+# ═════════════════════════════════════════════════════════════════
+# 13. 持久化集成测试
+# ═════════════════════════════════════════════════════════════════
+
+class TestPersistenceIntegration(unittest.TestCase):
+    """集成测试：会话完成 → 模拟重启 → HTTP 分发层归档可见。"""
+
+    _skip_reason = None
+
+    @classmethod
+    def setUpClass(cls):
+        cls._orig_popen = subprocess.Popen
+        import bridge.plan
+        import bridge.session as _bsession
+        cls._orig_snapshot = bridge.plan.snapshot_plan_files
+        cls._orig_find = bridge.plan.find_new_plan_file
+        cls._orig_log_dir = _bsession.LOG_DIR
+        cls._tmp_db_dir = _make_scratch_dir("bridge_db_")
+        cls._tmp_log_dir = _make_scratch_dir("bridge_test_logs_")
+        if cls._tmp_db_dir is None or cls._tmp_log_dir is None:
+            cls._skip_reason = "无法创建外部 scratch 目录"
+        else:
+            _bsession.LOG_DIR = cls._tmp_log_dir
+
+    @classmethod
+    def tearDownClass(cls):
+        subprocess.Popen = cls._orig_popen
+        import bridge.plan
+        import bridge.session as _bsession
+        bridge.plan.snapshot_plan_files = cls._orig_snapshot
+        bridge.plan.find_new_plan_file = cls._orig_find
+        _bsession.LOG_DIR = cls._orig_log_dir
+        if cls._tmp_db_dir:
+            shutil.rmtree(cls._tmp_db_dir, ignore_errors=True)
+        if cls._tmp_log_dir:
+            shutil.rmtree(cls._tmp_log_dir, ignore_errors=True)
+
+    def setUp(self):
+        if self._skip_reason:
+            self.skipTest(self._skip_reason)
+
+    def test_session_survives_restart_via_http(self):
+        """会话完成 → 重启 → GET /api/archived_sessions 可见。"""
+        tmp_db = self._tmp_db_dir / "test.db"
+
+        # 1. 加载 bridge 模块，init_store 指向临时 DB
+        mod = _load_bridge_module()
+        mod.LOG_DIR = self._tmp_log_dir
+        mod.init_store(str(tmp_db))
+
+        # 2. 安装 Popen stub + plan stub
+        import bridge.plan
+        bridge.plan.snapshot_plan_files = lambda: {}
+        bridge.plan.find_new_plan_file = lambda _: ""
+        subprocess.Popen = _make_popen_factory("plan", "APPROVED\nok")
+        sess = mod.SessionState("persist1", "test task", "/tmp", 1)
+        mod.run_negotiation(sess)
+        self.assertEqual(sess.status, "consensus")
+
+        sess.status = "executing"
+        mod._is_git_repo = lambda cwd: False
+        subprocess.Popen = _make_popen_factory(
+            "executed", "任务收口成功\nall good")
+        mod.run_execution(sess)
+        self.assertEqual(sess.status, "done")
+
+        # 3. "重启"：重新加载 bridge 模块，同一 DB
+        subprocess.Popen = self._orig_popen
+        mod2 = _load_bridge_module()
+        mod2.LOG_DIR = self._tmp_log_dir
+        mod2.init_store(str(tmp_db))
+
+        # 4. 通过 HTTP 分发层验证归档
+        status, data = _dispatch_http_request(
+            mod2, "GET", "/api/archived_sessions")
+        self.assertEqual(status, 200)
+        self.assertIn("sessions", data)
+        sids = [s["session_id"] for s in data["sessions"]]
+        self.assertIn("persist1", sids)
+
+        # 5. 通过 HTTP 分发层验证归档历史
+        status2, hist = _dispatch_http_request(
+            mod2, "GET", "/api/archived_session_history?sid=persist1")
+        self.assertEqual(status2, 200)
+        self.assertEqual(set(hist.keys()), ARCHIVED_HISTORY_RESPONSE_KEYS)
+        self.assertGreater(len(hist["entries"]), 0)
+
+
+class TestAdapterRegistry(unittest.TestCase):
+    def test_register_and_get(self):
+        from bridge.adapters import AdapterRegistry, CodexAdapter
+        reg = AdapterRegistry()
+        reg.register("codex", CodexAdapter)
+        inst = reg.get("codex")
+        self.assertEqual(inst.id, "codex")
+
+    def test_register_with_di(self):
+        from bridge.adapters import AdapterRegistry, ClaudeCodeAdapter
+        reg = AdapterRegistry()
+        reg.register("claude-code", ClaudeCodeAdapter, plan_lock_acquire_fn=lambda p, s: None)
+        inst = reg.get("claude-code")
+        self.assertEqual(inst.id, "claude-code")
+        self.assertIsNotNone(inst._plan_lock_acquire_fn)
+
+    def test_get_unknown_raises(self):
+        from bridge.adapters import AdapterRegistry
+        reg = AdapterRegistry()
+        with self.assertRaises(KeyError):
+            reg.get("nonexistent")
+
+    def test_lazy_singleton(self):
+        from bridge.adapters import AdapterRegistry, CodexAdapter
+        reg = AdapterRegistry()
+        reg.register("codex", CodexAdapter)
+        a = reg.get("codex")
+        b = reg.get("codex")
+        self.assertIs(a, b)
+
+    def test_discover_includes_agent_name(self):
+        from bridge.adapters import AdapterRegistry, CodexAdapter
+        reg = AdapterRegistry()
+        reg.register("codex", CodexAdapter)
+        tools = reg.discover()
+        self.assertEqual(len(tools), 1)
+        self.assertIn("agent_name", tools[0])
+        self.assertEqual(tools[0]["agent_name"], "codex")
+
+    def test_probe_fields_initialized(self):
+        from bridge.adapters import AdapterRegistry, ClaudeCodeAdapter, CodexAdapter
+        reg = AdapterRegistry()
+        reg.register("claude-code", ClaudeCodeAdapter, plan_lock_acquire_fn=lambda p, s: None)
+        reg.register("codex", CodexAdapter)
+        claude = reg.get("claude-code")
+        codex = reg.get("codex")
+        for inst in (claude, codex):
+            self.assertTrue(hasattr(inst, "_probed_path"))
+            self.assertTrue(hasattr(inst, "_probed_version"))
+            self.assertTrue(hasattr(inst, "_probe_error"))
+            self.assertTrue(hasattr(inst, "_probed_at"))
+
+    def test_probe_all_calls_probe(self):
+        from bridge.adapters import AdapterRegistry, CodexAdapter
+        reg = AdapterRegistry()
+        reg.register("codex", CodexAdapter)
+        inst = reg.get("codex")
+        inst.probe = mock.Mock()
+        reg.probe_all()
+        inst.probe.assert_called_once_with()
+
+    def test_discover_reads_cached_probe_fields_without_io(self):
+        from bridge.adapters import AdapterRegistry, CodexAdapter
+        reg = AdapterRegistry()
+        reg.register("codex", CodexAdapter)
+        inst = reg.get("codex")
+        inst._probed_path = "/mock/codex"
+        inst._probed_version = "codex 1.0.0"
+        inst._probe_error = None
+        inst._probed_at = "2026-01-01T00:00:00"
+        with mock.patch("subprocess.run", side_effect=AssertionError("discover should not run subprocess")):
+            tools = reg.discover()
+        self.assertEqual(tools[0]["executable_path"], "/mock/codex")
+        self.assertEqual(tools[0]["version"], "codex 1.0.0")
+        self.assertTrue(tools[0]["detected_installed"])
+        self.assertIsNone(tools[0]["probe_error"])
+        self.assertEqual(tools[0]["last_checked_at"], "2026-01-01T00:00:00")
+
+    def test_check_version_failures_return_none(self):
+        from bridge.adapters import CodexAdapter
+        adapter = CodexAdapter()
+        with mock.patch("subprocess.run", side_effect=FileNotFoundError):
+            self.assertIsNone(adapter.check_version("/missing"))
+        with mock.patch(
+            "subprocess.run",
+            side_effect=subprocess.TimeoutExpired(["codex", "--version"], 5),
+        ):
+            self.assertIsNone(adapter.check_version("/mock/codex"))
+
+    def test_probe_missing_binary_sets_error(self):
+        from bridge.adapters import CodexAdapter
+        adapter = CodexAdapter()
+        with mock.patch("shutil.which", return_value=None):
+            adapter.probe()
+        self.assertIsNone(adapter._probed_path)
+        self.assertIsNone(adapter._probed_version)
+        self.assertEqual(adapter._probe_error, "未找到 'codex' 命令")
+        self.assertIsNotNone(adapter._probed_at)
+
+    def test_probe_version_failure_sets_probe_error(self):
+        from bridge.adapters import CodexAdapter
+        adapter = CodexAdapter()
+        proc = mock.Mock(returncode=1, stdout="", stderr="permission denied")
+        with mock.patch("shutil.which", return_value="/mock/codex"):
+            with mock.patch("subprocess.run", return_value=proc):
+                adapter.probe()
+        self.assertEqual(adapter._probed_path, "/mock/codex")
+        self.assertIsNone(adapter._probed_version)
+        self.assertIn("permission denied", adapter._probe_error)
+        self.assertIsNotNone(adapter._probed_at)
+
+    def test_resolve_executor(self):
+        from bridge.adapters import AdapterRegistry, RoleConfig, ClaudeCodeAdapter, CodexAdapter
+        reg = AdapterRegistry()
+        reg.register("claude-code", ClaudeCodeAdapter, plan_lock_acquire_fn=lambda p, s: None)
+        reg.register("codex", CodexAdapter)
+        # Default: planner has dangerous_mode
+        rc = RoleConfig()
+        self.assertEqual(reg.resolve_executor(rc).id, "claude-code")
+        # Swapped: reviewer (claude) has dangerous_mode
+        rc2 = RoleConfig(planner_tool_id="codex", reviewer_tool_id="claude-code")
+        self.assertEqual(reg.resolve_executor(rc2).id, "claude-code")
+
+
+class TestRoleConfig(unittest.TestCase):
+    def test_default_values(self):
+        from bridge.adapters import RoleConfig
+        rc = RoleConfig()
+        self.assertEqual(rc.planner_tool_id, "claude-code")
+        self.assertEqual(rc.reviewer_tool_id, "codex")
+
+    def test_frozen(self):
+        from bridge.adapters import RoleConfig
+        rc = RoleConfig()
+        with self.assertRaises(Exception):
+            rc.planner_tool_id = "other"
+
+    def test_store_roundtrip(self):
+        from bridge.persistence.store import Store
+        store = Store(":memory:")
+        store.register_tool("claude-code", "Claude Code", '{}')
+        store.register_tool("codex", "Codex", '{}')
+        store.save_role_config("codex", "claude-code")
+        cfg = store.load_role_config()
+        self.assertEqual(cfg["planner_tool_id"], "codex")
+        self.assertEqual(cfg["reviewer_tool_id"], "claude-code")
+        store.close()
+
+
+# ═════════════════════════════════════════════════════════════════
+# 14. 角色互换协商验证 (Step 7)
+# ═════════════════════════════════════════════════════════════════
+
+class TestRoleSwapNegotiation(unittest.TestCase):
+    """角色互换后协商流程正常：Codex=Planner, Claude=Reviewer。
+
+    验证:
+    - history 中 role 为 "planner"/"reviewer"（非 "claude"/"codex"）
+    - reviewer_adapter.detect_approval 被正确调用
+    - 事件 agent 字段为 "planner"/"reviewer"
+    """
+
+    _skip_reason = None
+
+    @classmethod
+    def setUpClass(cls):
+        cls.mod = _load_bridge_module()
+        cls._tmpdir = _patch_log_dir(cls.mod)
+        if cls._tmpdir is None:
+            cls._skip_reason = "无法创建外部 scratch 目录"
+            return
+        cls._orig_popen = subprocess.Popen
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls._skip_reason:
+            return
+        subprocess.Popen = cls._orig_popen
+        _restore_log_dir(cls.mod)
+        if cls._tmpdir:
+            shutil.rmtree(cls._tmpdir, ignore_errors=True)
+
+    def setUp(self):
+        if self._skip_reason:
+            self.skipTest(self._skip_reason)
+        subprocess.Popen = self._orig_popen
+        import bridge.plan
+        bridge.plan.snapshot_plan_files = lambda: {}
+        bridge.plan.find_new_plan_file = lambda _: ""
+
+    def test_swapped_roles_consensus(self):
+        """互换角色: Codex=Planner, Claude=Reviewer → 协商达成共识。"""
+        sess = self.mod.SessionState("swap1", "test task", "/tmp", 3)
+        # 互换角色
+        sess.planner_tool_id = "codex"
+        sess.reviewer_tool_id = "claude-code"
+        sess.init_adapter_state("codex", {"session_resume": True})
+        sess.init_adapter_state("claude-code", {"session_resume": True})
+
+        # Codex 是 planner → 输出方案; Claude 是 reviewer → 输出 APPROVED
+        subprocess.Popen = _make_popen_factory(
+            "APPROVED\nlooks great",   # Claude (reviewer) approves
+            "my codex plan")           # Codex (planner) generates plan
+        # 注意: factory 按 cmd[0] 判断: "claude" → claude_text, "codex" → codex_text
+        # 但角色互换后: planner=Codex → 调 codex CLI → gets "my codex plan"
+        #               reviewer=Claude → 调 claude CLI → gets "APPROVED\nlooks great"
+
+        self.mod.run_negotiation(sess)
+
+        self.assertEqual(sess.status, "consensus")
+        # history 应该用 "planner"/"reviewer"
+        roles = [h["role"] for h in sess.history if h["role"] != "user"]
+        self.assertIn("planner", roles)
+        self.assertIn("reviewer", roles)
+        self.assertNotIn("claude", roles)
+        self.assertNotIn("codex", roles)
+
+        # 事件验证: agent_thinking 应带 "planner"/"reviewer"
+        thinking_agents = [e["data"]["agent"] for e in sess.events
+                           if e["type"] == "agent_thinking"]
+        self.assertIn("planner", thinking_agents)
+        self.assertIn("reviewer", thinking_agents)
+        self.assertNotIn("claude", thinking_agents)
+        self.assertNotIn("codex", thinking_agents)
+
+
+# ═════════════════════════════════════════════════════════════════
+# 15. 执行会话隔离验证 (Step 7)
+# ═════════════════════════════════════════════════════════════════
+
+class TestExecutionSessionIsolation(unittest.TestCase):
+    """执行阶段会话状态隔离验证。
+
+    默认配置: executor 复用协商 session (state_key = tool_id)
+    互换配置: executor 使用独立 session (state_key = "tool_id:exec")
+    多轮 fix cycle: state_key 不变（幂等）
+    """
+
+    def test_default_config_reuses_negotiation_session(self):
+        """默认配置: executor=planner → exec_state_key 是 tool_id 本身。"""
+        mod = _load_bridge_module()
+        sess = mod.SessionState("iso1", "test", "/tmp", 3)
+        # 默认: planner=claude-code, reviewer=codex
+        result = mod._resolve_execution_roles(sess)
+        executor, ep, esk, exec_reviewer, erp, ersk = result
+        self.assertEqual(executor.id, "claude-code")
+        self.assertEqual(ep, "planner")
+        self.assertEqual(esk, "claude-code")  # 复用协商 session
+        self.assertEqual(ersk, "codex")       # 复用协商 session
+
+    def test_swapped_config_creates_isolated_session(self):
+        """互换配置: executor≠planner → 独立 :exec/:exec_review key。"""
+        mod = _load_bridge_module()
+        sess = mod.SessionState("iso2", "test", "/tmp", 3)
+        sess.planner_tool_id = "codex"
+        sess.reviewer_tool_id = "claude-code"
+        sess.init_adapter_state("codex", {"session_resume": True})
+        sess.init_adapter_state("claude-code", {"session_resume": True})
+
+        result = mod._resolve_execution_roles(sess)
+        executor, ep, esk, exec_reviewer, erp, ersk = result
+        self.assertEqual(executor.id, "claude-code")
+        self.assertEqual(ep, "reviewer")
+        self.assertEqual(esk, "claude-code:exec")  # 独立 session
+        self.assertEqual(ersk, "codex:exec_review")
+        # adapter_state 有对应条目
+        self.assertIn("claude-code:exec", sess.adapter_state)
+        self.assertIn("codex:exec_review", sess.adapter_state)
+
+    def test_resolve_is_idempotent(self):
+        """_resolve_execution_roles 多次调用返回相同结果，不覆盖 state。"""
+        mod = _load_bridge_module()
+        sess = mod.SessionState("iso3", "test", "/tmp", 3)
+        sess.planner_tool_id = "codex"
+        sess.reviewer_tool_id = "claude-code"
+        sess.init_adapter_state("codex", {"session_resume": True})
+        sess.init_adapter_state("claude-code", {"session_resume": True})
+
+        r1 = mod._resolve_execution_roles(sess)
+        # 模拟使用: 标记 has_session
+        sess.adapter_state[r1[2]]["has_session"] = True
+        sess.adapter_state[r1[5]]["has_session"] = True
+
+        r2 = mod._resolve_execution_roles(sess)
+        # state_key 不变
+        self.assertEqual(r1[2], r2[2])
+        self.assertEqual(r1[5], r2[5])
+        # has_session 不被覆盖
+        self.assertTrue(sess.adapter_state[r2[2]]["has_session"])
+        self.assertTrue(sess.adapter_state[r2[5]]["has_session"])
+
+
+# ═════════════════════════════════════════════════════════════════
+# 16. 归档归一化验证 (Step 7)
+# ═════════════════════════════════════════════════════════════════
+
+class TestArchiveNormalization(unittest.TestCase):
+    """旧归档 role='claude'/'codex' → API 归一化为 'planner'/'reviewer'。"""
+
+    def test_normalize_old_roles(self):
+        """旧数据 role=claude/codex 归一化为 planner/reviewer。"""
+        mod = _load_bridge_module()
+        mod.init_store(":memory:")
+        # 伪造旧归档: role 是 "claude"/"codex"
+        from bridge.session import SessionState
+        sess = SessionState("arch1", "归档测试", "/tmp", 3)
+        sess.status = "done"
+        sess.consensus = True
+        sess.consensus_round = 1
+        sess.current_round = 1
+        # 旧格式 history: role="claude"/"codex"
+        sess.history = [
+            {"round": 1, "role": "claude", "phase": "方案", "content": "plan", "timestamp": "t"},
+            {"round": 1, "role": "codex", "phase": "审查", "content": "APPROVED", "timestamp": "t"},
+        ]
+        sess.review_history = []
+        mod._store.save_session(sess)
+
+        result = mod.get_archived_session_history("arch1")
+        # 归一化后应该是 planner/reviewer
+        roles = [e["role"] for e in result["entries"]]
+        self.assertIn("planner", roles)
+        self.assertIn("reviewer", roles)
+        self.assertNotIn("claude", roles)
+        self.assertNotIn("codex", roles)
+        # 返回 tool_id 字段
+        self.assertEqual(result["planner_tool_id"], "claude-code")
+        self.assertEqual(result["reviewer_tool_id"], "codex")
+
+    def test_new_roles_pass_through(self):
+        """新数据 role=planner/reviewer 直接透传。"""
+        mod = _load_bridge_module()
+        mod.init_store(":memory:")
+        from bridge.session import SessionState
+        sess = SessionState("arch2", "新格式", "/tmp", 3)
+        sess.status = "done"
+        sess.consensus = True
+        sess.consensus_round = 1
+        sess.current_round = 1
+        sess.history = [
+            {"round": 1, "role": "planner", "phase": "方案", "content": "plan", "timestamp": "t"},
+            {"round": 1, "role": "reviewer", "phase": "审查", "content": "APPROVED", "timestamp": "t"},
+        ]
+        sess.review_history = []
+        mod._store.save_session(sess)
+
+        result = mod.get_archived_session_history("arch2")
+        roles = [e["role"] for e in result["entries"]]
+        self.assertEqual(roles, ["planner", "reviewer"])
+
+
+# ═════════════════════════════════════════════════════════════════
+# Step 8: Desktop Shell Integration Tests
+# ═════════════════════════════════════════════════════════════════
+
+
+class TestLogDirOverride(unittest.TestCase):
+    """--log-dir 参数正确覆盖 session.LOG_DIR，且 bridge.py 的 mkdir 用模块属性。"""
+
+    def test_log_dir_module_attribute_override(self):
+        import bridge.session
+        original = bridge.session.LOG_DIR
+        try:
+            bridge.session.LOG_DIR = Path("/tmp/test-bridge-log-override")
+            self.assertEqual(bridge.session.LOG_DIR, Path("/tmp/test-bridge-log-override"))
+        finally:
+            bridge.session.LOG_DIR = original
+
+    def test_session_uses_module_log_dir(self):
+        import bridge.session
+        original = bridge.session.LOG_DIR
+        try:
+            bridge.session.LOG_DIR = Path("/tmp/test-bridge-session-log")
+            sess = bridge.session.SessionState("test123", "task", "/tmp", 3)
+            self.assertTrue(str(sess.log_dir).startswith("/tmp/test-bridge-session-log"))
+        finally:
+            bridge.session.LOG_DIR = original
+            shutil.rmtree("/tmp/test-bridge-session-log", ignore_errors=True)
+
+    def test_default_log_dir_unchanged(self):
+        import bridge.session
+        self.assertEqual(bridge.session.LOG_DIR, Path("/tmp/bridge-logs"))
+
+
+class TestJsonSingleWrite(unittest.TestCase):
+    """SQLite 可用时 save_prompts/save_recent_paths 不写 JSON。"""
+
+    def setUp(self):
+        self.mod = _load_bridge_module()
+        self.mod._store = self.mod.Store(":memory:")
+        self.mod.init_store.__wrapped__ = True
+
+    def test_save_prompts_no_json_when_sqlite_available(self):
+        calls = []
+        original = self.mod._json_save_prompts
+        self.mod._json_save_prompts = lambda d: calls.append(d)
+        try:
+            self.mod.save_prompts({"test_key": "test_val"})
+            self.assertEqual(calls, [], "JSON write should not happen when SQLite is available")
+        finally:
+            self.mod._json_save_prompts = original
+
+    def test_save_recent_paths_no_json_when_sqlite_available(self):
+        calls = []
+        original = self.mod._json_save_recent_paths
+        self.mod._json_save_recent_paths = lambda d: calls.append(d)
+        try:
+            self.mod.save_recent_paths(["/tmp/test"])
+            self.assertEqual(calls, [], "JSON write should not happen when SQLite is available")
+        finally:
+            self.mod._json_save_recent_paths = original
+
+    def test_save_prompts_falls_back_to_json_without_store(self):
+        self.mod._store = None
+        calls = []
+        original = self.mod._json_save_prompts
+        self.mod._json_save_prompts = lambda d: calls.append(d)
+        try:
+            self.mod.save_prompts({"fallback": "yes"})
+            self.assertEqual(len(calls), 1, "JSON write should happen when no SQLite store")
+        finally:
+            self.mod._json_save_prompts = original
+
+
+class TestTauriBundleConfig(unittest.TestCase):
+    """验证 tauri.conf.json 的 bundle resources 配置。"""
+
+    def setUp(self):
+        conf_path = os.path.join(ROOT, "src-tauri", "tauri.conf.json")
+        with open(conf_path) as f:
+            self.conf = json.load(f)
+
+    def test_prompts_json_bundled_as_seed(self):
+        resources = self.conf["bundle"]["resources"]
+        self.assertIn("../prompts.json", resources)
+
+    def test_recent_paths_not_bundled(self):
+        resources = self.conf["bundle"]["resources"]
+        for key in resources:
+            self.assertNotIn("recent_paths", key,
+                             "recent_paths.json must not be bundled (contains build-machine paths)")
+
+    def test_bridge_module_bundled(self):
+        resources = self.conf["bundle"]["resources"]
+        self.assertIn("../bridge", resources)
+
+    def test_schema_sql_exists_under_bridge(self):
+        schema = os.path.join(ROOT, "bridge", "persistence", "schema.sql")
+        self.assertTrue(os.path.exists(schema),
+                        "schema.sql must exist under bridge/persistence/ for bundle inclusion")
+
+    def test_before_dev_command_builds_frontend(self):
+        cmd = self.conf["build"]["beforeDevCommand"]
+        self.assertTrue(cmd, "beforeDevCommand must not be empty — cargo tauri dev needs frontend build")
+        self.assertIn("npm run build", cmd)
 
 
 if __name__ == "__main__":

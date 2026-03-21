@@ -9,23 +9,13 @@ Universal DI Rule:
   bridge.py 定义同签名薄 wrapper，从自身 globals() 注入。
 
 DI 参数清单:
-  - build_claude_first_prompt:              _detect_claude_md=None
+  - build_claude_first_prompt:              _detect_context=None, _adapter=None
   - _build_diff_section:                    _capture_diff=None
   - build_codex_post_review_prompt:         _capture_diff=None (透传)
   - build_codex_post_review_followup_prompt: _capture_diff=None (透传)
 
-11 个提示词配置键 (与 protocol.PROMPT_KEYS 一致):
-  1. claude_first          — Claude 首轮方案
-  2. claude_revise         — Claude 修订
-  3. codex_first           — Codex 首轮审查
-  4. codex_review          — Codex 后续审查
-  5. execution             — 执行 (APPROVED)
-  6. execution_unapproved  — 执行 (未 APPROVED)
-  7. codex_post_review     — 执行后 Codex 审查
-  8. claude_post_fix       — Claude 修复
-  9. codex_post_review_followup — Codex 再评审
-  10. user_inject_label_claude  — 用户注入标签 (Claude)
-  11. user_inject_label_codex   — 用户注入标签 (Codex)
+Step 7: detect_claude_md → detect_project_context (adapter-aware)
+        模板变量增加 {planner_name} / {reviewer_name}
 """
 
 import json
@@ -59,26 +49,41 @@ prompt_config = load_prompts()
 # Prompt Templates
 # ═════════════════════════════════════════════════════════════════
 
-def detect_claude_md(cwd):
-    """检测项目 CLAUDE.md 并返回内容 (前 2000 字符)。"""
-    p = Path(cwd) / "CLAUDE.md"
-    if p.exists():
-        content = p.read_text(encoding="utf-8")[:2000]
-        return f"\n\n## 项目开发规范 (CLAUDE.md)\n{content}"
-    return ""
+def detect_project_context(cwd, adapter=None):
+    """检测项目上下文文件。
 
-
-def build_claude_first_prompt(task, cwd, _detect_claude_md=None):
-    """构建 Claude 首轮方案提示。
-
-    DI: _detect_claude_md — bridge.py wrapper 注入以支持 monkey-patch。
+    adapter 提供时使用其 context_files 属性，否则 fallback 到 CLAUDE.md。
     """
-    if _detect_claude_md is None:
-        _detect_claude_md = detect_claude_md
-    claude_md = _detect_claude_md(cwd)
+    filenames = getattr(adapter, 'context_files', None) or ["CLAUDE.md"]
+    context = ""
+    for filename in filenames:
+        p = Path(cwd) / filename
+        if p.exists():
+            content = p.read_text(encoding="utf-8")[:2000]
+            context += f"\n\n## 项目开发规范 ({filename})\n{content}"
+    return context
+
+
+# 向后兼容别名
+detect_claude_md = detect_project_context
+
+
+def build_claude_first_prompt(task, cwd, planner_name="Claude Code",
+                               _detect_context=None, _adapter=None):
+    """构建 Planner 首轮方案提示。
+
+    注意：claude_* / codex_* 是历史 key，当前分别服务 planner / reviewer 阶段。
+    DI: _detect_context — bridge.py wrapper 注入以支持 monkey-patch。
+    """
+    if _detect_context is None:
+        _detect_context = detect_project_context
+    context = _detect_context(cwd, _adapter)
     tpl = prompt_config.get("claude_first", "## 任务\n{task}")
-    body = tpl.format(task=task)
-    return f"{claude_md}\n\n{body}"
+    try:
+        body = tpl.format(task=task, planner_name=planner_name)
+    except KeyError:
+        body = tpl.format(task=task)
+    return f"{context}\n\n{body}"
 
 
 def collect_user_injects(history):
@@ -94,7 +99,7 @@ def collect_user_injects(history):
 
 
 def build_claude_revise_prompt(codex_feedback, user_injects=None):
-    """构建 Claude 修订提示。"""
+    """构建 Planner 修订提示。"""
     inject_section = ""
     if user_injects:
         joined = "\n".join(f"- {m}" for m in user_injects)
@@ -106,21 +111,21 @@ def build_claude_revise_prompt(codex_feedback, user_injects=None):
 
 
 def build_codex_first_prompt(task, claude_plan):
-    """构建 Codex 首轮审查提示。"""
+    """构建 Reviewer 首轮审查提示。历史 key: codex_first。"""
     tpl = prompt_config.get("codex_first",
-        "对于以下方案有什么看法？\n\n## 原始任务\n{task}\n\n## Claude 的方案\n{claude_plan}")
+        "对于以下方案有什么看法？\n\n## 原始任务\n{task}\n\n## Planner 的方案\n{claude_plan}")
     return tpl.format(task=task, claude_plan=claude_plan)
 
 
 def build_codex_review_prompt(claude_revision, user_injects=None):
-    """构建 Codex 后续审查提示。"""
+    """构建 Reviewer 后续审查提示。历史 key: codex_review。"""
     inject_section = ""
     if user_injects:
         joined = "\n".join(f"- {m}" for m in user_injects)
         label = prompt_config.get("user_inject_label_codex", "用户补充的约束和意见（审查时必须考虑）")
         inject_section = f"\n\n## {label}\n{joined}"
     tpl = prompt_config.get("codex_review",
-        "Claude 修订了方案。\n\n## Claude 的修订方案\n{claude_revision}{inject_section}")
+        "Planner 修订了方案。\n\n## Planner 的修订方案\n{claude_revision}{inject_section}")
     return tpl.format(claude_revision=claude_revision, inject_section=inject_section)
 
 
@@ -151,10 +156,7 @@ def build_execution_prompt(task, final_plan="", approved=True):
 
 def _build_diff_section(cwd, baseline_ref, is_git_repo, baseline_untracked=None,
                         _capture_diff=None):
-    """格式化 diff 为 markdown 区块嵌入 prompt。
-
-    DI: _capture_diff — bridge.py wrapper 注入以支持 monkey-patch。
-    """
+    """格式化 diff 为 markdown 区块嵌入 prompt。"""
     if _capture_diff is None:
         _capture_diff = _default_capture_diff
     if not is_git_repo:
@@ -167,10 +169,7 @@ def _build_diff_section(cwd, baseline_ref, is_git_repo, baseline_untracked=None,
 
 def build_codex_post_review_prompt(sess, task, approved_plan, execution_result,
                                    _capture_diff=None):
-    """构建执行后 Codex 审查提示 (带 git diff)。
-
-    DI: _capture_diff — 透传给 _build_diff_section。
-    """
+    """构建执行后审查提示 (带 git diff)。"""
     diff_section = _build_diff_section(
         sess.project_path, sess.exec_baseline_ref, sess.is_git_repo,
         sess.exec_baseline_untracked, _capture_diff=_capture_diff)
@@ -180,16 +179,13 @@ def build_codex_post_review_prompt(sess, task, approved_plan, execution_result,
 
 
 def build_claude_post_fix_prompt(review_feedback):
-    """构建 Claude 修复提示。"""
+    """构建修复提示。"""
     tpl = prompt_config.get("claude_post_fix", "请修复以下问题...")
     return tpl.format(review_feedback=review_feedback)
 
 
 def build_codex_post_review_followup_prompt(sess, fix_result, _capture_diff=None):
-    """构建 Codex 再评审提示。
-
-    DI: _capture_diff — 透传给 _build_diff_section。
-    """
+    """构建再评审提示。"""
     diff_section = _build_diff_section(
         sess.project_path, sess.exec_baseline_ref, sess.is_git_repo,
         sess.exec_baseline_untracked, _capture_diff=_capture_diff)

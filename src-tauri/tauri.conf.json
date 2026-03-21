@@ -1,0 +1,33 @@
+{
+  "$schema": "https://v2.tauri.app/schema",
+  "productName": "Bridge",
+  "version": "0.1.0",
+  "identifier": "com.bridge.app",
+  "build": {
+    "frontendDist": "./frontend-stub",
+    "beforeDevCommand": "cd ../frontend && npm install && npm run build",
+    "beforeBuildCommand": "cd ../frontend && npm install && npm run build"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Claude \u2194 Codex Bridge",
+        "width": 1400,
+        "height": 900,
+        "minWidth": 800,
+        "minHeight": 600
+      }
+    ]
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["dmg", "app"],
+    "icon": ["icons/icon.png"],
+    "resources": {
+      "../bridge.py": "bridge.py",
+      "../bridge": "bridge",
+      "../prompts.json": "prompts.json",
+      "../frontend/dist": "frontend/dist"
+    }
+  }
+}
