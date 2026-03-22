@@ -1,28 +1,18 @@
 """
 Claude Code CLI 适配器
 =====================
-封装 call_claude_streaming 的完整逻辑。
-
-Step 3 从 bridge.py 迁入:
-  - build_command: L139-150 (命令构造)
-  - parse_stream_line: L194-238 (stream-json 解析 + STREAM_DEBUG 采样)
-  - plan 检测: L155-161, L164-168, L248-259 (锁/快照/差集校验)
-  - run() override: 包裹 plan 检测完整流程
+封装 call_claude_streaming 的 CLI 差异。
 
 Claude Code 特有功能:
   - stream-json 流格式 (text_delta 事件)
   - --session-id / --resume 会话绑定
   - --permission-mode plan (协商阶段)
   - --dangerously-skip-permissions (执行阶段)
-  - Plan 文件快照差集检测
   - stderr MCP 噪音过滤
 """
 
 import json
 import os
-
-import bridge.plan
-from bridge.session import add_event
 
 from .base import CLIAdapter
 
@@ -31,10 +21,6 @@ _STREAM_DEBUG = os.environ.get("BRIDGE_DEBUG_STREAM") == "1"
 
 class ClaudeCodeAdapter(CLIAdapter):
     """Claude Code CLI 适配器。"""
-
-    def __init__(self, plan_lock_acquire_fn=None):
-        super().__init__()
-        self._plan_lock_acquire_fn = plan_lock_acquire_fn
 
     # ── 身份 ──
 
@@ -141,54 +127,3 @@ class ClaudeCodeAdapter(CLIAdapter):
 
     def format_not_found_error(self):
         return "未找到 'claude' 命令。请安装: npm install -g @anthropic-ai/claude-code"
-
-    # ── Plan 后处理 ──
-
-    def post_process_output(self, output, plan_snapshot, sess):
-        """Plan 文件差集校验 — 从 bridge.py L248-259 迁入。"""
-        plan_content = bridge.plan.find_new_plan_file(plan_snapshot)
-        if plan_content and bridge.plan.validate_plan_relevance(plan_content, sess.task):
-            return plan_content
-        if plan_content:
-            add_event(sess, "warning", {
-                "msg": "检测到 plan 文件内容与当前任务不相关，已忽略（可能来自外部 Claude 进程）",
-                "msg_key": "be.plan_irrelevant",
-            })
-        return output
-
-    # ── run() override — 包裹 plan 检测完整流程 ──
-
-    def run(self, prompt, cwd, sess, log_tag=None, agent_label=None, **kwargs):
-        skip_plan_detection = kwargs.pop("skip_plan_detection", False)
-
-        lock = None
-        if not skip_plan_detection:
-            if self._plan_lock_acquire_fn is None:
-                raise RuntimeError(
-                    "ClaudeCodeAdapter: plan_lock_acquire_fn 未注入，"
-                    "无法安全执行 plan 检测。请通过构造器注入或使用 skip_plan_detection=True")
-            lock = self._plan_lock_acquire_fn(sess.project_path, sess.stop_flag)
-            if lock is None:
-                return "(已中止)"
-        try:
-            # 拿到锁后立即检查 stop_flag（保留原始 bridge.py L164 语义）
-            if sess.stop_flag.is_set():
-                return "(已中止)"
-
-            # 运行时读 bridge.plan 模块属性（test monkeypatch 生效）
-            plan_snapshot = bridge.plan.snapshot_plan_files() if not skip_plan_detection else None
-
-            output = super().run(prompt, cwd, sess, log_tag=log_tag,
-                                 agent_label=agent_label, **kwargs)
-
-            # stop guard: 已中止则跳过 plan 差集检测（保留原始 bridge.py L244 语义）
-            if sess.stop_flag.is_set():
-                return output
-
-            if plan_snapshot is not None:
-                output = self.post_process_output(output, plan_snapshot, sess)
-
-            return output
-        finally:
-            if lock is not None:
-                lock.release()

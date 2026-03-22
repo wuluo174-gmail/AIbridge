@@ -1,15 +1,15 @@
 <script lang="ts">
   import { store } from '../lib/store.svelte.js'
-  import { isClosureText } from '../lib/protocol.js'
-  import type { ArchivedSession, ArchivedHistoryResponse } from '../lib/types.js'
+  import type { HistoryResponse, SessionSummary } from '../lib/types.js'
 
   let { open = $bindable(false) }: { open: boolean } = $props()
 
-  let sessions = $state<ArchivedSession[]>([])
-  let detail = $state<ArchivedHistoryResponse | null>(null)
+  let sessions = $state<SessionSummary[]>([])
+  let detail = $state<HistoryResponse | null>(null)
   let selectedSid = $state<string | null>(null)
   let offset = $state(0)
   const limit = 20
+  const selectedSession = $derived(sessions.find((session) => session.session_id === selectedSid) ?? null)
 
   export async function openModal() {
     open = true; offset = 0; detail = null; selectedSid = null
@@ -17,27 +17,35 @@
   }
 
   async function loadPage() {
-    const r = await store.loadArchivedSessions(limit, offset)
+    const r = await store.loadSessionIndex(limit, offset)
     sessions = r.sessions ?? []
+    if (sessions.length && !selectedSid) await selectSession(sessions[0].session_id)
   }
 
   async function selectSession(sid: string) {
     selectedSid = sid
-    detail = await store.loadArchivedHistory(sid)
+    detail = await store.loadSessionHistory(sid)
   }
 
   function prevPage() { if (offset >= limit) { offset -= limit; loadPage() } }
   function nextPage() { if (sessions.length >= limit) { offset += limit; loadPage() } }
   function onClose() { open = false }
   function formatTime(ts: string): string { if (!ts) return ''; return new Date(ts).toLocaleString() }
+  function roundValue(session: SessionSummary): number { return session.round }
 
   function roleName(role: string): string {
-    if (!detail) return store.t(`role.${role}`)
+    if (!selectedSession) return store.t(`role.${role}`)
     let toolId: string | undefined
-    if (role === 'planner') toolId = detail.planner_tool_id
-    else if (role === 'reviewer') toolId = detail.reviewer_tool_id
+    if (role === 'planner') toolId = selectedSession.planner_tool_id
+    else if (role === 'reviewer') toolId = selectedSession.reviewer_tool_id
     if (toolId) return store.toolMap[toolId]?.display_name ?? store.t(`role.${role}`)
     return role
+  }
+
+  async function openSelected(autoResume = false) {
+    if (!selectedSession) return
+    await store.openSession(selectedSession, autoResume)
+    open = false
   }
 </script>
 
@@ -57,8 +65,8 @@
               onclick={() => selectSession(s.session_id)}>
               <div class="hist-task">{s.task}</div>
               <div class="hist-meta">
-                <span class="pill pill-{s.final_status}" style="font-size:10px;padding:1px 6px">{store.t('status.' + s.final_status)}</span>
-                R{s.current_round}/{s.max_rounds} · {formatTime(s.created_at)}
+                <span class="pill pill-{s.status}" style="font-size:10px;padding:1px 6px">{store.t('status.' + s.status)}</span>
+                R{roundValue(s)}/{s.max_rounds} · {formatTime(s.updated_at || s.created_at)}
               </div>
             </div>
           {/each}
@@ -71,7 +79,29 @@
           </div>
         </div>
         <div class="hist-detail" style="flex:1;overflow-y:auto;padding:14px">
-          {#if detail}
+          {#if detail && selectedSession}
+            <div class="history-toolbar">
+              <div class="history-summary">
+                <div class="hist-task">{selectedSession.task}</div>
+                <div class="hist-meta">
+                  <span class="pill pill-{selectedSession.status}" style="font-size:10px;padding:1px 6px">
+                    {store.t('status.' + selectedSession.status)}
+                  </span>
+                  R{roundValue(selectedSession)}/{selectedSession.max_rounds}
+                  · {store.t('history.updated')}: {formatTime(selectedSession.updated_at || selectedSession.created_at)}
+                  {#if selectedSession.interrupt_reason}
+                    · {store.t('history.interrupt_reason')}: {selectedSession.interrupt_reason}
+                  {/if}
+                </div>
+              </div>
+              <div class="history-actions">
+                <button class="btn btn-cfg" onclick={() => openSelected(false)}>{store.t('common.open')}</button>
+                {#if selectedSession.resume_available}
+                  <button class="btn btn-cont" onclick={() => openSelected(true)}>{store.t('ctrl.resume')}</button>
+                {/if}
+              </div>
+            </div>
+
             <div class="hist-section">{store.t('history.negotiation')}</div>
             {#each detail.entries as entry}
               <div style="margin-bottom:12px">

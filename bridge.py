@@ -5,11 +5,10 @@ Claude ↔ Codex 协商桥梁 v3 — 薄兼容 facade
 所有实现已迁入 bridge/ 子模块。
 本文件保留:
   1. 模块级 re-exports（测试 self.mod.X 兼容）
-  2. Plan 文件并发锁（测试直接 patch PLAN_LOCK_ACQUIRE_TIMEOUT）
-  3. AdapterRegistry + 低层 adapter 单例 + CLI wrappers
-  4. 高层角色 caller + 编排 wrappers（Step 7 角色化）
-  5. Prompt DI wrappers（Universal DI Rule: 注入可 patch 的 helper）
-  6. _BridgeProxy 接线 + main()
+  2. AdapterRegistry + 低层 adapter 单例 + CLI wrappers
+  3. 高层角色 caller + 编排 wrappers（Step 7 角色化）
+  4. Prompt DI wrappers（Universal DI Rule: 注入可 patch 的 helper）
+  5. _BridgeProxy 接线 + main()
 
 用法:
   python3 bridge.py                            # Web UI 模式 (默认)
@@ -25,6 +24,7 @@ import threading
 import time
 import uuid as _uuid_mod
 import urllib.parse
+from datetime import datetime
 from pathlib import Path
 
 # ── re-exports: bridge.protocol ──
@@ -37,7 +37,7 @@ from bridge.protocol import (
 # ── re-exports: bridge.session ──
 from bridge.session import (
     LOG_DIR, SessionState, sessions, sessions_lock,
-    get_session, add_event, add_history_event,
+    get_session, add_event, add_history_event, set_persist_hook,
 )
 
 # ── re-exports: bridge.git ──
@@ -53,7 +53,7 @@ from bridge.orchestration.prompts import (
     save_prompts as _json_save_prompts,
     PROMPTS_FILE,
     detect_project_context, collect_user_injects,
-    build_claude_revise_prompt, build_codex_first_prompt,
+    build_codex_first_prompt,
     build_codex_review_prompt, build_execution_prompt,
     build_claude_post_fix_prompt,
 )
@@ -68,37 +68,8 @@ from bridge.server import (
     RECENT_PATHS_FILE,
 )
 
-# ── Plan 文件可靠关联 ──
-import bridge.plan                                              # noqa: F401
-
 # ── Orchestration engine ──
 from bridge.orchestration import engine as _engine
-
-
-# ═════════════════════════════════════════════════════════════════
-# Plan 文件并发锁 — per-project 锁注册表
-# ═════════════════════════════════════════════════════════════════
-plan_file_locks = {}
-plan_file_locks_lock = threading.Lock()
-PLAN_LOCK_ACQUIRE_TIMEOUT = 0.1
-
-
-def _get_plan_file_lock(project_path):
-    with plan_file_locks_lock:
-        lock = plan_file_locks.get(project_path)
-        if lock is None:
-            lock = threading.Lock()
-            plan_file_locks[project_path] = lock
-        return lock
-
-
-def _acquire_plan_file_lock(project_path, stop_flag):
-    lock = _get_plan_file_lock(project_path)
-    while True:
-        if lock.acquire(timeout=PLAN_LOCK_ACQUIRE_TIMEOUT):
-            return lock
-        if stop_flag.is_set():
-            return None
 
 
 # ═════════════════════════════════════════════════════════════════
@@ -110,8 +81,7 @@ from bridge.adapters import (                                    # noqa: E402
 )
 
 _registry = AdapterRegistry()
-_registry.register("claude-code", ClaudeCodeAdapter,
-                    plan_lock_acquire_fn=_acquire_plan_file_lock)
+_registry.register("claude-code", ClaudeCodeAdapter)
 _registry.register("codex", CodexAdapter)
 
 # adapter 单例 — 立即从 registry 取，与原 bridge.py:101-104 相同时序
@@ -126,14 +96,12 @@ _role_config = RoleConfig()  # 默认: planner=claude-code, reviewer=codex
 # ═════════════════════════════════════════════════════════════════
 
 def call_claude_streaming(prompt, cwd, sess, continue_session=False,
-                          bypass_permissions=False, log_tag="claude",
-                          skip_plan_detection=False):
+                          bypass_permissions=False, log_tag="claude"):
     return _claude_adapter.run(
         prompt, cwd, sess, log_tag=log_tag,
         continue_session=continue_session,
         bypass_permissions=bypass_permissions,
         session_id=sess.claude_session_id,
-        skip_plan_detection=skip_plan_detection,
     )
 
 
@@ -187,6 +155,8 @@ def create_session(sid, task, project, rounds):
     )
     sess.init_adapter_state(sess.planner_state_key, planner.capabilities)
     sess.init_adapter_state(sess.reviewer_state_key, reviewer.capabilities)
+    sess.phase = "negotiation"
+    sess.interrupt_reason = None
     return sess
 
 
@@ -195,13 +165,34 @@ def get_role_config():
     return dataclasses.asdict(_role_config)
 
 
+def _is_valid_role_config(cfg):
+    """角色配置必须引用已注册工具，且至少一个工具具备执行能力。"""
+    try:
+        planner = _registry.get(cfg.planner_tool_id)
+        reviewer = _registry.get(cfg.reviewer_tool_id)
+    except KeyError:
+        return False
+    return any(
+        adapter.capabilities.get("dangerous_mode")
+        for adapter in (planner, reviewer)
+    )
+
+
 def _load_role_config():
     """从 SQLite 加载角色配置。"""
     global _role_config
     if _store is not None:
         cfg = _store.load_role_config()
         if cfg:
-            _role_config = RoleConfig(**cfg)
+            loaded = RoleConfig(**cfg)
+            if _is_valid_role_config(loaded):
+                _role_config = loaded
+            else:
+                _role_config = RoleConfig()
+                _store.save_role_config(
+                    _role_config.planner_tool_id,
+                    _role_config.reviewer_tool_id,
+                )
 
 
 def _update_role_config(planner_id, reviewer_id):
@@ -246,6 +237,14 @@ def _resolve_execution_roles(sess):
         )
 
     rc = RoleConfig(sess.planner_tool_id, sess.reviewer_tool_id)
+    if not sess.planner_state_key:
+        sess.planner_state_key = sess.planner_tool_id
+    if not sess.reviewer_state_key:
+        sess.reviewer_state_key = (
+            sess.reviewer_tool_id
+            if sess.reviewer_tool_id != sess.planner_tool_id
+            else sess.planner_state_key
+        )
     executor = _registry.resolve_executor(rc)
     exec_reviewer_id = (sess.reviewer_tool_id
                         if executor.id == sess.planner_tool_id
@@ -321,6 +320,7 @@ def init_store(db_path=None):
     if _store is not None:
         _store.close()
     _store = Store(db_path)
+    set_persist_hook(_persist_session)
     old_tool_snapshots = _store.list_tools()
     _registry.probe_all()
     tool_snapshots = _registry.discover()
@@ -341,6 +341,7 @@ def init_store(db_path=None):
     _load_role_config()
     # JSON → SQLite 迁移（每个域独立，仅未完成时尝试）
     _migrate_json_to_sqlite()
+    _store.mark_incomplete_sessions_interrupted()
     # 从权威源重建 prompt_config 内存状态
     if _store.is_migration_complete("prompts"):
         prompt_config.clear()
@@ -372,13 +373,19 @@ def _migrate_json_to_sqlite():
             pass
 
 
+def _persist_session(sess):
+    """将 session 快照写入统一会话账本。"""
+    if _store is None:
+        return
+    try:
+        _store.save_session(sess)
+    except Exception:
+        pass
+
+
 def _try_persist(sess):
-    """终态时持久化到 SQLite。失败不阻断主流程。"""
-    if _store is not None and sess.status in ("done", "error"):
-        try:
-            _store.save_session(sess)
-        except Exception:
-            pass
+    """兼容旧调用点，统一落到全生命周期持久化。"""
+    _persist_session(sess)
 
 
 # ── load/save wrappers：基于 is_migration_complete 判定权威源 ──
@@ -415,60 +422,168 @@ def save_recent_paths(paths):
 
 # ── 归档查询 ──
 
-def list_archived_sessions(limit=50, offset=0):
-    if _store is None:
-        return []
-    return _store.list_sessions(limit=limit, offset=offset)
-
-
-def get_archived_session_history(session_id):
-    if _store is None:
-        return {"entries": [], "execution_result": None,
-                "review_entries": [], "review_round": 0,
-                "review_status": None, "event_cursor": 0,
-                "planner_tool_id": "claude-code", "reviewer_tool_id": "codex"}
-    sess_row = _store.get_session(session_id)
-    raw_entries = _store.get_session_history(session_id)
-    raw_review = _store.get_session_review_history(session_id)
-
-    ptid = sess_row.get("planner_tool_id", "claude-code") if sess_row else "claude-code"
-    rtid = sess_row.get("reviewer_tool_id", "codex") if sess_row else "codex"
-
-    agent_to_tool = _build_agent_to_tool_map()
-
-    def normalize_role(h):
-        role = h["role"]
-        if role in ("planner", "reviewer", "user"):
-            return role
-        # 旧数据: role 是 agent_name (如 "claude"/"codex")
-        # 通过 registry 动态映射 agent_name → tool_id → planner/reviewer
-        tid = agent_to_tool.get(role, role)
-        if tid == ptid:
-            return "planner"
-        if tid == rtid:
-            return "reviewer"
+def _normalize_role(role, planner_tool_id, reviewer_tool_id):
+    if role in ("planner", "reviewer", "user"):
         return role
+    agent_to_tool = _build_agent_to_tool_map()
+    tid = agent_to_tool.get(role, role)
+    if tid == planner_tool_id:
+        return "planner"
+    if tid == reviewer_tool_id:
+        return "reviewer"
+    return role
 
-    entries = [{"round": h["round"], "role": normalize_role(h),
-                "phase": h["phase"], "content": h["content"]}
-               for h in raw_entries if h["role"] not in ("user",)]
-    review_entries = [{"round": h["round"], "role": normalize_role(h),
-                       "phase": h["phase"], "content": h["content"]}
-                      for h in raw_review]
-    review_round = max((h["round"] for h in raw_review), default=0)
+
+def _session_history_payload(sess):
+    ptid = getattr(sess, "planner_tool_id", "claude-code")
+    rtid = getattr(sess, "reviewer_tool_id", "codex")
+    entries = [{
+        "round": h["round"],
+        "role": _normalize_role(h["role"], ptid, rtid),
+        "phase": h["phase"],
+        "content": h["content"],
+    } for h in sess.history if h["role"] not in ("user",)]
+    review_entries = [{
+        "round": h["round"],
+        "role": _normalize_role(h["role"], ptid, rtid),
+        "phase": h["phase"],
+        "content": h["content"],
+    } for h in sess.review_history]
     review_status = None
-    if review_round > 0 and sess_row:
-        review_status = {"round": review_round, "status": sess_row["final_status"]}
+    if sess.phase == "review" or sess.review_round > 0 or str(sess.status).startswith("review_"):
+        review_status = {"round": sess.review_round, "status": sess.status}
     return {
         "entries": entries,
-        "execution_result": sess_row.get("execution_result") if sess_row else None,
+        "execution_result": sess.execution_result,
         "review_entries": review_entries,
-        "review_round": review_round,
+        "review_round": sess.review_round,
         "review_status": review_status,
-        "event_cursor": 0,
+        "event_cursor": len(sess.events),
         "planner_tool_id": ptid,
         "reviewer_tool_id": rtid,
     }
+
+
+def _serialize_session_state(sess):
+    return {
+        "status": sess.status,
+        "round": sess.current_round,
+        "max_rounds": sess.max_rounds,
+        "consensus": sess.consensus,
+        "consensus_round": sess.consensus_round,
+        "history_len": len(sess.history),
+        "error": sess.error,
+        "planner_tool_id": sess.planner_tool_id,
+        "reviewer_tool_id": sess.reviewer_tool_id,
+        "executor_panel": _resolve_executor_panel(sess),
+        "review_round": sess.review_round,
+        "max_review_rounds": sess.max_review_rounds,
+        "phase": getattr(sess, "phase", "negotiation"),
+        "updated_at": getattr(sess, "updated_at", None),
+        "finished_at": getattr(sess, "finished_at", None),
+        "interrupt_reason": getattr(sess, "interrupt_reason", None),
+        "resume_available": getattr(sess, "resume_available", False),
+    }
+
+
+def _restore_session(session_id):
+    if _store is None:
+        return None
+    row = _store.get_session(session_id)
+    if row is None:
+        return None
+
+    sess = SessionState(row["id"], row["task"], row["project_path"], row["max_rounds"])
+    sess.status = row.get("status") or "done"
+    sess.phase = row.get("phase") or "negotiation"
+    sess.current_round = row.get("current_round", 0)
+    sess.consensus = bool(row.get("consensus"))
+    sess.consensus_round = row.get("consensus_round", 0)
+    sess.execution_result = row.get("execution_result")
+    sess.error = row.get("error")
+    sess.review_round = row.get("review_round", 0)
+    sess.max_review_rounds = row.get("max_review_rounds", 3)
+    sess.interrupt_reason = row.get("interrupt_reason")
+    sess.created_at = row.get("created_at") or sess.created_at
+    sess.updated_at = row.get("updated_at") or sess.created_at
+    sess.finished_at = row.get("finished_at")
+    sess.planner_tool_id = row.get("planner_tool_id", "claude-code")
+    sess.reviewer_tool_id = row.get("reviewer_tool_id", "codex")
+    sess.planner_state_key = sess.planner_tool_id
+    sess.reviewer_state_key = (
+        f"{sess.reviewer_tool_id}:reviewer"
+        if sess.reviewer_tool_id == sess.planner_tool_id else sess.reviewer_tool_id
+    )
+    adapter_state_raw = row.get("adapter_state_json") or "{}"
+    try:
+        sess.adapter_state = _json_mod.loads(adapter_state_raw)
+    except Exception:
+        sess.adapter_state = {}
+    if sess.planner_state_key not in sess.adapter_state:
+        sess.init_adapter_state(sess.planner_state_key, _registry.get(sess.planner_tool_id).capabilities)
+    if sess.reviewer_state_key not in sess.adapter_state:
+        sess.init_adapter_state(sess.reviewer_state_key, _registry.get(sess.reviewer_tool_id).capabilities)
+    sess.history = _store.get_session_history(session_id)
+    sess.review_history = _store.get_session_review_history(session_id)
+    sess.events = _store.get_session_events(session_id)
+    return sess
+
+
+def get_or_load_session(session_id, cache=True):
+    if not session_id:
+        return None
+    sess = get_session(session_id)
+    if sess is not None:
+        return sess
+    sess = _restore_session(session_id)
+    if sess is not None and cache:
+        with sessions_lock:
+            sessions[session_id] = sess
+    return sess
+
+
+def list_sessions(limit=50, offset=0):
+    if _store is None:
+        with sessions_lock:
+            return [{
+                "session_id": s.session_id,
+                "task": s.task,
+                "project_path": s.project_path,
+                "status": s.status,
+                "phase": getattr(s, "phase", "negotiation"),
+                "round": s.current_round,
+                "max_rounds": s.max_rounds,
+                "updated_at": getattr(s, "updated_at", s.created_at),
+                "finished_at": getattr(s, "finished_at", None),
+                "interrupt_reason": getattr(s, "interrupt_reason", None),
+                "resume_available": getattr(s, "resume_available", False),
+                "planner_tool_id": s.planner_tool_id,
+                "reviewer_tool_id": s.reviewer_tool_id,
+                "consensus": s.consensus,
+                "consensus_round": s.consensus_round,
+                "created_at": s.created_at,
+            } for s in sessions.values()]
+    rows = []
+    for row in _store.list_sessions(limit=limit, offset=offset):
+        rows.append({
+            "session_id": row["session_id"],
+            "task": row["task"],
+            "project_path": row["project_path"],
+            "status": row["status"],
+            "phase": row["phase"],
+            "round": row["round"],
+            "max_rounds": row["max_rounds"],
+            "updated_at": row["updated_at"],
+            "finished_at": row["finished_at"],
+            "interrupt_reason": row["interrupt_reason"],
+            "resume_available": row["resume_available"],
+            "planner_tool_id": row["planner_tool_id"],
+            "reviewer_tool_id": row["reviewer_tool_id"],
+            "consensus": row["consensus"],
+            "consensus_round": row["consensus_round"],
+            "created_at": row["created_at"],
+        })
+    return rows
 
 
 # ═════════════════════════════════════════════════════════════════
@@ -476,6 +591,7 @@ def get_archived_session_history(session_id):
 # ═════════════════════════════════════════════════════════════════
 from bridge.orchestration.prompts import (                      # noqa: E402
     build_claude_first_prompt as _prompts_build_claude_first_prompt,
+    build_claude_revise_prompt as _prompts_build_claude_revise_prompt,
     build_codex_post_review_prompt as _prompts_build_codex_post_review_prompt,
     build_codex_post_review_followup_prompt as _prompts_build_codex_post_review_followup_prompt,
 )
@@ -486,6 +602,14 @@ def build_claude_first_prompt(task, cwd):
     return _prompts_build_claude_first_prompt(
         task, cwd,
         planner_name=adapter.display_name,
+        _detect_context=detect_project_context,
+        _adapter=adapter)
+
+
+def build_claude_revise_prompt(codex_feedback, user_injects=None, cwd=None):
+    adapter = _registry.get(_role_config.planner_tool_id)
+    return _prompts_build_claude_revise_prompt(
+        codex_feedback, user_injects=user_injects, cwd=cwd,
         _detect_context=detect_project_context,
         _adapter=adapter)
 
@@ -564,6 +688,123 @@ def run_review_fix_cycle(sess):
         build_followup_prompt=build_codex_post_review_followup_prompt,
     )
     _try_persist(sess)
+
+
+def _latest_planner_plan(sess):
+    for h in reversed(sess.history):
+        if h["role"] == "planner":
+            return h["content"]
+    return ""
+
+
+def run_first_review_only(sess):
+    (_, _, _, exec_reviewer, erp, ersk) = _resolve_execution_roles(sess)
+    _engine.run_first_review(
+        sess,
+        _latest_planner_plan(sess),
+        call_exec_reviewer=_make_role_caller(exec_reviewer, erp, ersk),
+        exec_reviewer_panel=erp,
+        exec_reviewer_adapter=exec_reviewer,
+        build_post_review_prompt=build_codex_post_review_prompt,
+    )
+    _try_persist(sess)
+
+
+def run_review_followup_only(sess):
+    (_, _, _, exec_reviewer, erp, ersk) = _resolve_execution_roles(sess)
+    try:
+        with sess.status_lock:
+            sess.status = "review_pending"
+            sess.phase = "review"
+            sess.interrupt_reason = None
+        add_event(sess, "status_change", {
+            "status": "review_pending",
+            "msg": f"审查修复轮 {sess.review_round}...",
+            "msg_key": "be.review_fix_round",
+            "msg_params": {"round": sess.review_round},
+        })
+        add_event(sess, "agent_thinking", {"agent": erp, "round": sess.review_round})
+        review = _make_role_caller(exec_reviewer, erp, ersk)(
+            build_codex_post_review_followup_prompt(sess, sess.execution_result or ""),
+            sess.project_path,
+            sess,
+            log_tag=f"exec_reviewer_{sess.review_round}",
+        )
+        if sess.stop_flag.is_set():
+            return
+        review_entry = {
+            "round": sess.review_round,
+            "role": erp,
+            "phase": "执行审查",
+            "content": review,
+            "timestamp": datetime.now().isoformat(),
+        }
+        add_history_event(sess, sess.review_history, review_entry, "review_response")
+        if exec_reviewer.detect_closure(review):
+            with sess.status_lock:
+                sess.status = "done"
+                sess.phase = "review"
+            add_event(sess, "review_done", {
+                "round": sess.review_round,
+                "msg": f"第 {sess.review_round} 轮确认任务收口成功。",
+                "success": True,
+                "msg_key": "be.closure_round_ok",
+                "msg_params": {"round": sess.review_round},
+            })
+        else:
+            with sess.status_lock:
+                sess.status = "review_fix"
+                sess.phase = "review"
+            add_event(sess, "review_needs_fix", {
+                "round": sess.review_round,
+                "msg": "仍发现问题，等待你确认是否继续修复。",
+                "review": review,
+                "msg_key": "be.still_needs_fix",
+            })
+    except Exception as e:
+        with sess.status_lock:
+            sess.status = "error"
+            sess.error = str(e)
+            sess.phase = "review"
+        add_event(sess, "error", {
+            "msg": f"修复阶段出错: {e}",
+            "msg_key": "be.error_fix",
+            "msg_params": {"detail": str(e)},
+        })
+    _try_persist(sess)
+
+
+def resume_session(sess):
+    """恢复 paused / interrupted 会话到最近的可执行检查点。"""
+    if sess.status not in {"paused", "interrupted"}:
+        raise RuntimeError("当前会话不可恢复")
+
+    sess.stop_flag.clear()
+    sess.interrupt_reason = None
+
+    if sess.phase == "negotiation":
+        start_round = max(1, last_complete_round(sess.history) + 1)
+        threading.Thread(
+            target=run_negotiation,
+            args=(sess,),
+            kwargs={"start_round": start_round},
+            daemon=True,
+        ).start()
+        return
+
+    if sess.phase == "execution":
+        threading.Thread(target=run_execution, args=(sess,), daemon=True).start()
+        return
+
+    if sess.phase == "review":
+        last_review_entry = sess.review_history[-1] if sess.review_history else None
+        if last_review_entry and last_review_entry["role"] == "planner":
+            threading.Thread(target=run_review_followup_only, args=(sess,), daemon=True).start()
+        else:
+            threading.Thread(target=run_first_review_only, args=(sess,), daemon=True).start()
+        return
+
+    raise RuntimeError(f"未知会话阶段: {sess.phase}")
 
 
 # ═════════════════════════════════════════════════════════════════

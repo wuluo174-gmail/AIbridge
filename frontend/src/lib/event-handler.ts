@@ -172,8 +172,12 @@ export function handleEvent(e: BridgeEvent, state: AppState, names: DisplayNames
     }
 
     case 'status_change': {
-      if (e.data.status === 'stopped') {
-        pushBothLogs(state, { kind: 'separator', level: 'sys', text: '⏹ 已中止' })
+      if (['paused', 'aborted', 'interrupted'].includes(e.data.status)) {
+        pushBothLogs(state, {
+          kind: 'separator',
+          level: 'sys',
+          text: e.data.msg || '⏹ 已中止',
+        })
       }
       break
     }

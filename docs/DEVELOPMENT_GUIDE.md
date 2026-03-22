@@ -87,11 +87,12 @@
 
 ### 关键注意事项
 - `_stderr_reader` (L178-196) 是两个 wrapper 共享的，应放在 base 或 session 模块
-- plan 文件检测逻辑 (L133-172) 是 Claude 特有的，应放在 ClaudeCodeAdapter 内
-- `plan_file_lock` 全局锁需要在 adapter 层可访问
+- Claude planner 的 canonical 输出应直接使用 headless `stream-json` 的 `result` 文本
+- 不要再把 `~/.claude/plans/` 文件差集当作运行时数据源
+- `CLAUDE.md` 只能向 Planner 注入分析原则/思考维度，不能原样注入“我是linus”“【结论】”“请确认我的理解”等输出格式指令
 
 ### 不回归验证
-- NR-3 (协商引擎), NR-4 (会话绑定), NR-8 (Plan 文件归属)
+- NR-3 (协商引擎), NR-4 (会话绑定), NR-8 (Planner 输出源)
 - `python3 -m unittest discover -s tests -v`
 
 ### 提示词
@@ -113,7 +114,7 @@
 2. 从 bridge.py 提取 call_claude_streaming (L199-335) → ClaudeCodeAdapter
 3. 从 bridge.py 提取 call_codex_streaming (L337-437) → CodexAdapter
 4. _stderr_reader (L178-196) 放入合适位置（两个 adapter 共享）
-5. plan 文件检测逻辑 (L133-172) 放入 ClaudeCodeAdapter
+5. Claude planner 输出直接取 `stream-json` 的最终 `result`
 6. bridge.py 改为通过 adapter 实例调用
 7. 验证：python bridge.py 功能不变 + python3 -m unittest discover -s tests -v 通过
 ```
@@ -185,7 +186,7 @@
 2. Git 工具函数 (baseline 捕获/diff) → bridge/orchestration/prompts.py 或独立文件
 3. HTTP Server (BridgeHandler, ThreadedHTTPServer) → bridge/server.py
 4. bridge.py 缩减为入口脚本：解析参数 + 启动 server
-5. HTML_UI 字符串保留在 server.py 中（前端迁移留给 Step 9）
+5. server.py 负责根入口分发；存在 `frontend/dist` 时伺服构建产物，否则返回构建引导页
 
 目标：bridge.py 从 2167 行缩减到 ~50 行，但 python bridge.py 行为完全不变。
 ```
@@ -195,7 +196,7 @@
 ## Step 6: SQLite 持久化
 
 ### 目标
-引入 SQLite 持久化层 (Python sqlite3 标准库)，保存已完成会话历史、提示词配置、最近路径。
+引入 SQLite 持久化层 (Python sqlite3 标准库)，建立统一会话账本，保存会话全生命周期、提示词配置、最近路径。
 
 ### 前置条件
 - Step 5 完成 (模块化拆分完成)
@@ -203,17 +204,18 @@
 ### 具体文件改动
 1. **bridge/persistence/store.py**: 实现 Store 类 (init_db, save_session, list_sessions, get_session_history, save_prompts, load_prompts, save_recent_paths, load_recent_paths)
 2. **bridge/persistence/schema.sql**: 已有，作为建表参考
-3. **bridge/server.py**: 在会话完成时 (status → done/error) 调用 store.save_session()
-4. **新增 API**: GET /api/archived_sessions — 查看历史会话
+3. **bridge/server.py**: 会话创建即持久化，后续状态/历史持续更新
+4. **新增 API**: `GET /api/sessions` / `GET /api/history` — 统一读取会话索引与历史
 
 ### 关键约束
-- **活动会话仍然是内存态** — SQLite 只存终态快照
-- **重启后活动会话标记为"中断"** — 不尝试恢复
+- **SQLite 是统一会话账本** — 不是归档快照仓库
+- **纯内存运行态不持久化** — 进程句柄/锁不落库，但逻辑状态与历史落库
+- **重启后活动会话标记为 `interrupted`** — 允许基于账本恢复
 - prompts.json 和 recent_paths.json 保持向后兼容 (首次启动时迁移到 SQLite)
 
 ### 不回归验证
 - 所有 NR 项 (既有功能不受影响)
-- 新增测试: 会话完成 → 重启 → GET /api/archived_sessions 可见
+- 新增测试: 会话完成 → 重启 → `GET /api/sessions` 与 `GET /api/history` 可见
 
 ### 提示词
 
@@ -223,12 +225,13 @@
 使用 Python sqlite3 标准库，零外部依赖。
 - 实现 bridge/persistence/store.py
 - 参考 bridge/persistence/schema.sql 建表
-- 会话完成时 (done/error) 保存快照到 SQLite
-- 添加 GET /api/archived_sessions 端点
+- 从 `POST /api/start` 起即保存会话生命周期快照到 SQLite
+- 追加保存 `session_events`、协商历史、审查历史
+- 添加 `GET /api/sessions` / `GET /api/history`
 - prompts.json → SQLite 迁移（首次启动时自动导入）
 - recent_paths.json → SQLite 迁移
 
-关键：活动会话仍在内存，SQLite 只存终态。重启后活动会话不可恢复。
+关键：SQLite 维护统一会话账本；纯内存运行态不入库。重启后活动会话标记为 `interrupted` 并允许恢复。
 ```
 
 ---
@@ -246,7 +249,7 @@
 2. **bridge/server.py**: 新增 API
    - GET /api/tools — 列出已安装工具 + 能力矩阵
    - POST /api/role_config — 设置 planner/reviewer
-3. **前端 (HTML_UI)**: 在控制栏添加 Planner/Reviewer 下拉选择
+3. **前端**: 在控制栏添加 Planner/Reviewer 选择；当前实现位于 `frontend/`
 
 ### 不回归验证
 - 默认配置 (Claude=Planner, Codex=Reviewer) 必须与当前行为一致
@@ -304,11 +307,11 @@ Bridge 项目已完成 Python 内核模块化（Step 1-7）。现在需要选择
 
 ### 实施结果
 - 11 个 Svelte 5 组件，3 层状态模型 (store.svelte.ts)
-- 纯函数事件处理器 (event-handler.ts)，20/20 事件类型全覆盖
+- 纯函数事件处理器 (event-handler.ts)，21/21 事件类型全覆盖
 - 页面刷新恢复 (hydrator.ts)，完整 TypeScript 类型 (types.ts)
-- 45 个前端单元测试 (vitest)
+- 61 个前端单元测试 (vitest)
 - NR-10 全部 12 项功能已实现
-- server.py 保留 HTML_UI 冻结快照作为无构建环境降级
+- server.py 在无构建产物时只返回构建引导页，避免维护第二套前端
 - Tauri beforeBuildCommand / beforeDevCommand 自动编译前端
 
 ---

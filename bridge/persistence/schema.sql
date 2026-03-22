@@ -1,24 +1,31 @@
 -- Bridge SQLite Schema
 -- ====================
--- 只含可持久化项。活动会话的运行态 (stop_flag, active_proc,
--- claude_session_id 等) 不可持久化，重启后不可续接。
+-- 只含可持久化项。线程锁、进程句柄等纯内存运行态不可持久化，
+-- 重启后由统一会话账本重建可恢复会话。
 --
 -- Step 6 时由 Python sqlite3 执行建表。
 
--- 已完成会话快照
+-- 会话账本快照（创建即写入，生命周期内持续更新）
 CREATE TABLE IF NOT EXISTS sessions (
     id TEXT PRIMARY KEY,
     task TEXT NOT NULL,
     project_path TEXT NOT NULL,
     max_rounds INTEGER DEFAULT 5,
-    final_status TEXT NOT NULL,            -- 只存终态: done / error
+    status TEXT NOT NULL DEFAULT 'running',
+    phase TEXT NOT NULL DEFAULT 'negotiation',
     current_round INTEGER DEFAULT 0,
     consensus INTEGER DEFAULT 0,
     consensus_round INTEGER DEFAULT 0,
     planner_tool_id TEXT DEFAULT 'claude-code',
     reviewer_tool_id TEXT DEFAULT 'codex',
     execution_result TEXT,
+    error TEXT,
+    review_round INTEGER DEFAULT 0,
+    max_review_rounds INTEGER DEFAULT 3,
+    interrupt_reason TEXT,
+    adapter_state_json TEXT DEFAULT '{}',
     created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
     finished_at TEXT
 );
 
@@ -45,6 +52,18 @@ CREATE TABLE IF NOT EXISTS review_history (
     timestamp TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_review_history_sid ON review_history(session_id);
+
+-- 事件日志（用于状态/历史回放）
+CREATE TABLE IF NOT EXISTS session_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL REFERENCES sessions(id),
+    event_index INTEGER NOT NULL,
+    type TEXT NOT NULL,
+    data_json TEXT NOT NULL,
+    timestamp TEXT NOT NULL,
+    UNIQUE(session_id, event_index)
+);
+CREATE INDEX IF NOT EXISTS idx_session_events_sid ON session_events(session_id);
 
 -- CLI 工具注册
 CREATE TABLE IF NOT EXISTS cli_tools (

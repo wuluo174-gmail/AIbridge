@@ -140,12 +140,12 @@ describe('handleEvent', () => {
     expect(s.activeVer.planner).toBe(-1)
   })
 
-  it('status_change stopped appends to both', () => {
-    const s = handle({ type: 'status_change', data: { status: 'stopped', msg: '' } })
-    expect(s.logs.planner[0]).toMatchObject({ kind: 'separator', text: '⏹ 已中止' })
+  it('status_change paused appends backend message to both', () => {
+    const s = handle({ type: 'status_change', data: { status: 'paused', msg: '用户中断' } })
+    expect(s.logs.planner[0]).toMatchObject({ kind: 'separator', text: '用户中断' })
   })
 
-  it('status_change non-stopped is no-op', () => {
+  it('status_change active-state is no-op', () => {
     const s = handle({ type: 'status_change', data: { status: 'running', msg: '' } })
     expect(s.logs.planner).toHaveLength(0)
   })

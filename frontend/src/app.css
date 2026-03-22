@@ -4,6 +4,16 @@
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:'SF Mono','Fira Code','Menlo',monospace;background:var(--bg);color:var(--text);height:100vh;display:flex;flex-direction:column;overflow:hidden}
 
+/* ── 全局顶栏 ── */
+.app-header{background:linear-gradient(90deg,rgba(124,92,252,.14),rgba(16,163,127,.08));border-bottom:1px solid var(--border);padding:10px 16px;display:flex;align-items:center;justify-content:space-between;gap:12px;flex-shrink:0}
+.app-brand{display:flex;align-items:baseline;gap:10px;min-width:0}
+.app-title{font-family:-apple-system,sans-serif;font-size:15px;font-weight:700;letter-spacing:.02em}
+.app-subtitle{font-family:-apple-system,sans-serif;font-size:12px;color:var(--dim);white-space:nowrap}
+.app-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap;justify-content:flex-end}
+.locale-switch{display:flex;align-items:center;border:1px solid var(--border);border-radius:999px;padding:2px;background:rgba(255,255,255,.03)}
+.locale-btn{background:transparent;border:none;color:var(--dim);padding:5px 10px;border-radius:999px;font-size:12px;font-weight:600;font-family:-apple-system,sans-serif;cursor:pointer}
+.locale-btn.active{background:var(--border);color:var(--text)}
+
 /* ── 控制栏 ── */
 .controls{background:var(--surface);border-bottom:1px solid var(--border);padding:12px 16px;display:flex;flex-direction:column;gap:10px;flex-shrink:0}
 .controls-config{display:flex;flex-wrap:wrap;gap:10px;align-items:flex-end}
@@ -27,6 +37,7 @@ body{font-family:'SF Mono','Fira Code','Menlo',monospace;background:var(--bg);co
 .controls .f-task textarea{min-height:80px;max-height:200px;resize:vertical}
 .controls .f-rounds{flex:0 0 60px}
 .controls .f-rounds input{width:60px;text-align:center}
+.controls .f-role-actions{flex:1 1 220px;min-width:220px}
 
 .btn{padding:6px 14px;border:none;border-radius:4px;cursor:pointer;font-size:13px;font-weight:600;font-family:-apple-system,sans-serif;transition:all .15s}
 .btn:disabled{opacity:.35;cursor:not-allowed}
@@ -61,6 +72,10 @@ body{font-family:'SF Mono','Fira Code','Menlo',monospace;background:var(--bg);co
 .controls .f-role{flex:0 0 140px}
 .role-select{background:var(--bg);border:1px solid var(--border);border-radius:4px;color:var(--text);padding:6px 10px;font-size:13px;font-family:inherit;outline:none;width:100%}
 .role-select:focus{border-color:var(--claude)}
+.role-actions{display:flex;align-items:center;gap:10px;min-height:34px}
+.role-actions-label{font-size:11px;color:var(--dim);font-weight:600;text-transform:uppercase;letter-spacing:.5px;font-family:-apple-system,sans-serif}
+.role-apply-btn{white-space:nowrap}
+.role-hint{font-size:11px;color:var(--dim);font-family:-apple-system,sans-serif;line-height:1.4}
 .exec-note{font-size:11px;color:var(--user);font-family:-apple-system,sans-serif}
 .dot-planner{background:var(--claude)} .dot-reviewer{background:var(--codex)}
 .tab-group{margin-left:auto;display:flex;gap:2px}
@@ -159,3 +174,15 @@ body{font-family:'SF Mono','Fira Code','Menlo',monospace;background:var(--bg);co
 .hist-meta{font-size:11px;color:var(--dim);margin-top:4px;display:flex;align-items:center;gap:6px}
 .hist-detail{font-size:13px;line-height:1.6;color:var(--text)}
 .hist-section{color:var(--dim);font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;margin:16px 0 8px;padding-bottom:4px;border-bottom:1px solid var(--border)}
+.history-toolbar{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:12px}
+.history-summary{min-width:0}
+.history-actions{display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end}
+
+@media (max-width: 900px){
+  .app-header{align-items:flex-start;flex-direction:column}
+  .controls-config{align-items:stretch}
+  .controls .f-path,.controls .f-task,.controls .f-rounds,.controls .f-role,.controls .f-role-actions{flex:1 1 100%}
+  .controls .f-rounds input{width:100%;text-align:left}
+  .history-toolbar{flex-direction:column}
+  .history-actions{justify-content:flex-start}
+}

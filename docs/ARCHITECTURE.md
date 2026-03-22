@@ -20,7 +20,7 @@ bridge/                          ← Python 后端模块
 ├── adapters/                      CLI 适配器 (claude, codex)
 ├── orchestration/                 编排引擎 + 提示词构建
 ├── persistence/                   SQLite store + schema
-├── server.py                      HTTP Server (9 GET + 8 POST) + HTML_UI 冻结快照
+├── server.py                      HTTP Server + no-dist bootstrap 页
 └── session.py                     SessionState + 事件管理
 
 frontend/                        ← Svelte 5 + TypeScript 前端 (Vite 构建)
@@ -35,13 +35,19 @@ src-tauri/                       ← Tauri v2 桌面壳 (Rust)
 └── tauri.conf.json                构建/dev 配置
 
 bridge.py                        ← 薄 facade + main() 入口
-tests/test_contract.py           ← 合同测试 (199 cases)
+tests/test_contract.py           ← 合同测试 (197 cases)
 ```
 
 ### 数据流
 
 ```
-用户输入 ──POST /api/start──► SessionState (内存)
+用户输入 ──POST /api/start──► SessionState (内存会话)
+                                    │
+                                    ├── _persist_session() ──► SQLite 会话账本
+                                    │                           ├ sessions
+                                    │                           ├ session_events
+                                    │                           ├ session_history
+                                    │                           └ review_history
                                     │
                               ┌─────▼─────┐
                               │ 编排引擎    │
@@ -51,28 +57,23 @@ tests/test_contract.py           ← 合同测试 (199 cases)
                          ┌──────────┼──────────┐
                          ▼                     ▼
                    call_claude_streaming  call_codex_streaming
-                   (subprocess.Popen)    (subprocess.Popen)
                          │                     │
                          ▼                     ▼
-                   add_event(sess, ...)   add_event(sess, ...)
-                         │                     │
-                         └──────────┬──────────┘
-                                    ▼
-                              sess.events[]
-                                    │
-                              GET /api/events
-                              (300ms 轮询)
-                                    │
-                                    ▼
-                              前端 handle(e)
+                   add_event / add_history_event
+                         │
+                         ├── sess.events[] ──► GET /api/events
+                         └── SQLite 统一账本 ─► GET /api/state /history /sessions
+                                                   │
+                                                   ▼
+                                              前端 hydrate / handle(e)
 ```
 
 ### 关键耦合点
 
-1. **CLI Wrapper ↔ 编排引擎**: call_claude_streaming 内部含 plan 文件检测逻辑，不是纯 I/O
-2. **前端 ↔ 事件协议**: handle(e) 的 20 个 switch case 与 add_event 调用一一对应
-3. **前端 ↔ HTTP API**: 轮询逻辑和状态恢复与 /api/state, /api/history, /api/events 结构强绑定
-4. **会话绑定 ↔ CLI flags**: claude_has_session 决定 --session-id vs --resume
+1. **CLI Wrapper ↔ 编排引擎**: call_claude_streaming 的 canonical 输出就是 CLI `result` 文本，wrapper 保持纯 I/O
+2. **前端 ↔ 事件协议**: handle(e) 的事件分支与 add_event 调用一一对应
+3. **前端 ↔ HTTP API**: 历史查看、恢复、轮询都建立在 /api/state, /api/history, /api/events, /api/sessions 上
+4. **会话绑定 ↔ CLI flags**: adapter_state 决定首次会话与 resume 行为
 
 ---
 
@@ -98,8 +99,8 @@ tests/test_contract.py           ← 合同测试 (199 cases)
 │                                               │
 │  ┌──────────────────────────────────────────┐ │
 │  │ Persistence (Python sqlite3)             │ │
-│  │ 已完成会话快照 / 提示词 / 最近路径         │ │
-│  │ ※活动会话运行态不可持久化                  │ │
+│  │ 统一会话账本 / 提示词 / 最近路径 / 工具注册 │ │
+│  │ ※纯内存运行态不可持久化，逻辑状态可恢复     │ │
 │  └──────────────────────────────────────────┘ │
 └───────────────────────────────────────────────┘
 ```
@@ -161,11 +162,13 @@ class CLIAdapter(ABC):
 
 | 类别 | 可持久化 | 说明 |
 |------|---------|------|
-| 已完成会话快照 | ✓ | task, project_path, history, review_history, execution_result, 终态 |
+| 会话全生命周期快照 | ✓ | 从 start 创建即写入，持续更新 status / phase / updated_at / finished_at |
+| 事件日志 | ✓ | `session_events` 用于状态与历史回放 |
+| 协商/审查历史 | ✓ | `session_history` / `review_history` |
 | 提示词模板 | ✓ | 11 个键 + 未来按工具覆盖 |
 | 最近路径 | ✓ | ≤10 条 |
 | CLI 工具注册 | ✓ | 安装路径、版本、能力快照 |
-| **活动会话运行态** | ✗ | stop_flag, active_proc, claude_session_id, *_has_session, exec_baseline_*, event_lock 等纯内存状态。**重启后不可续接** |
+| **纯内存运行态** | ✗ | stop_flag, active_proc, active_pgid, event_lock 等。重启后不恢复对象本身，但依据账本重建可恢复会话 |
 
 ---
 
@@ -190,7 +193,7 @@ Linux 可从此 POC 延伸（同为 POSIX），Windows 为独立后续步骤。
 
 - 编译时优化，包体极小，Svelte 5 runes 提供细粒度响应式
 - frontend/ 为独立 Vite 项目，Tauri beforeBuildCommand / beforeDevCommand 自动编译
-- server.py 保留 HTML_UI 冻结快照供无构建环境降级
+- server.py 在无 dist 时只返回构建引导页，不再维护第二套前端快照
 
 ### 4.3 持久化
 

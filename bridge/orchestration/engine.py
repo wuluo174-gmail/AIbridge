@@ -16,6 +16,14 @@ from datetime import datetime
 from bridge.session import add_event, add_history_event
 
 
+def _preserve_or_mark_interrupted(sess, phase):
+    with sess.status_lock:
+        sess.phase = phase
+        if sess.status not in {"paused", "interrupted", "aborted"}:
+            sess.status = "interrupted"
+            sess.interrupt_reason = "unexpected_stop"
+
+
 # ═════════════════════════════════════════════════════════════════
 # 纯函数 — 无外部依赖
 # ═════════════════════════════════════════════════════════════════
@@ -61,13 +69,13 @@ def run_negotiation(sess, *, start_round=1,
     try:
         with sess.status_lock:
             sess.status = "running"
+            sess.phase = "negotiation"
+            sess.interrupt_reason = None
         add_event(sess, "status_change", {"status": "running", "msg": "协商开始", "msg_key": "be.negotiation_start"})
 
         for rnd in range(start_round, max_rounds + 1):
             if sess.stop_flag.is_set():
-                with sess.status_lock:
-                    sess.status = "idle"
-                add_event(sess, "status_change", {"status": "stopped", "msg": "用户中止", "msg_key": "be.user_stopped"})
+                _preserve_or_mark_interrupted(sess, "negotiation")
                 return
 
             sess.current_round = rnd
@@ -85,7 +93,7 @@ def run_negotiation(sess, *, start_round=1,
                         last_review = h["content"]
                         break
                 user_injects = collect_user_injects(sess.history)
-                prompt_c = build_planner_revise_prompt(last_review, user_injects)
+                prompt_c = build_planner_revise_prompt(last_review, user_injects, cwd)
 
             plan = call_planner(prompt_c, cwd, sess)
 
@@ -121,6 +129,8 @@ def run_negotiation(sess, *, start_round=1,
                     sess.consensus = True
                     sess.consensus_round = rnd
                     sess.status = "consensus"
+                    sess.phase = "negotiation"
+                    sess.interrupt_reason = None
                 add_event(sess, "consensus_reached", {
                     "round": rnd,
                     "msg": f"Reviewer 在第 {rnd} 轮认可了方案，等待你确认执行或继续协商。",
@@ -130,6 +140,8 @@ def run_negotiation(sess, *, start_round=1,
 
         with sess.status_lock:
             sess.status = "max_rounds"
+            sess.phase = "negotiation"
+            sess.interrupt_reason = None
         add_event(sess, "max_rounds_reached", {
             "round": max_rounds,
             "msg": f"已完成 {max_rounds} 轮协商（未获 APPROVED），可选择执行当前方案或继续协商。",
@@ -156,6 +168,7 @@ def run_negotiation(sess, *, start_round=1,
 
             with sess.status_lock:
                 sess.status = "max_rounds"
+                sess.phase = "negotiation"
             add_event(sess, "rollback", {
                 "round": lcr,
                 "max": lcr,
@@ -182,6 +195,9 @@ def run_execution(sess, *,
     3. 自动触发 _run_first_review
     """
     try:
+        with sess.status_lock:
+            sess.phase = "execution"
+            sess.interrupt_reason = None
         add_event(sess, "status_change", {"status": "executing", "msg": "正在执行...", "msg_key": "be.executing"})
 
         sess.is_git_repo = _is_git_repo(sess.project_path)
@@ -201,15 +217,13 @@ def run_execution(sess, *,
             prompt, sess.project_path, sess,
             bypass_permissions=True,
             log_tag="executor",
-            skip_plan_detection=True,
         )
 
         sess.execution_result = result
         add_event(sess, "execution_done", {"result": result, "executor_panel": executor_panel})
 
         if sess.stop_flag.is_set():
-            with sess.status_lock:
-                sess.status = "done"
+            _preserve_or_mark_interrupted(sess, "execution")
             return
 
         _run_first_review(sess, final_plan)
@@ -229,6 +243,8 @@ def run_first_review(sess, approved_plan, *,
     try:
         with sess.status_lock:
             sess.status = "review_pending"
+            sess.phase = "review"
+            sess.interrupt_reason = None
         sess.review_round = 1
         add_event(sess, "status_change", {"status": "review_pending", "msg": "正在评审执行结果...", "msg_key": "be.reviewing"})
         add_event(sess, "review_start", {"round": 1, "max": sess.max_review_rounds})
@@ -250,10 +266,12 @@ def run_first_review(sess, approved_plan, *,
         if exec_reviewer_adapter.detect_closure(review):
             with sess.status_lock:
                 sess.status = "done"
+                sess.phase = "review"
             add_event(sess, "review_done", {"round": 1, "msg": "执行审查确认任务收口成功。", "success": True, "msg_key": "be.closure_ok"})
         else:
             with sess.status_lock:
                 sess.status = "review_fix"
+                sess.phase = "review"
             add_event(sess, "review_needs_fix", {"round": 1, "msg": "执行审查发现问题，等待你确认是否修复。", "review": review, "msg_key": "be.needs_fix"})
 
     except Exception as e:
@@ -275,6 +293,7 @@ def run_review_fix_cycle(sess, *,
         if rr > sess.max_review_rounds:
             with sess.status_lock:
                 sess.status = "review_max_rounds"
+                sess.phase = "review"
             add_event(sess, "review_max_rounds_reached", {
                 "round": rr - 1,
                 "msg": f"已完成 {sess.max_review_rounds} 轮审查修复（问题仍存），可选择继续审查或跳过。",
@@ -285,6 +304,8 @@ def run_review_fix_cycle(sess, *,
         sess.review_round = rr
         with sess.status_lock:
             sess.status = "review_pending"
+            sess.phase = "review"
+            sess.interrupt_reason = None
         add_event(sess, "status_change", {"status": "review_pending", "msg": f"审查修复轮 {rr}...", "msg_key": "be.review_fix_round", "msg_params": {"round": rr}})
         add_event(sess, "review_round_start", {"round": rr, "max": sess.max_review_rounds})
 
@@ -297,7 +318,7 @@ def run_review_fix_cycle(sess, *,
         fix_result = call_executor(
             build_fix_prompt(last_review), sess.project_path, sess,
             bypass_permissions=True,
-            log_tag=f"executor_fix_{rr}", skip_plan_detection=True)
+            log_tag=f"executor_fix_{rr}")
 
         if sess.stop_flag.is_set():
             return
@@ -327,10 +348,12 @@ def run_review_fix_cycle(sess, *,
         if exec_reviewer_adapter.detect_closure(review):
             with sess.status_lock:
                 sess.status = "done"
+                sess.phase = "review"
             add_event(sess, "review_done", {"round": rr, "msg": f"第 {rr} 轮确认任务收口成功。", "success": True, "msg_key": "be.closure_round_ok", "msg_params": {"round": rr}})
         else:
             with sess.status_lock:
                 sess.status = "review_fix"
+                sess.phase = "review"
             add_event(sess, "review_needs_fix", {"round": rr, "msg": "仍发现问题，等待你确认是否继续修复。", "review": review, "msg_key": "be.still_needs_fix"})
 
     except Exception as e:

@@ -4,10 +4,8 @@
   import RoleSelect from './RoleSelect.svelte'
   import StatusPill from './StatusPill.svelte'
 
-  let { onBrowse, onOpenPrompts, onOpenHistory }: {
+  let { onBrowse }: {
     onBrowse: () => void
-    onOpenPrompts: () => void
-    onOpenHistory: () => void
   } = $props()
 </script>
 
@@ -34,7 +32,9 @@
   </div>
   <div class="controls-actions">
     <button class="btn btn-go" disabled={!store.canStart} onclick={() => store.doStart(store.projectPath, store.taskValue, store.roundsValue)}>{store.t('ctrl.start')}</button>
-    <button class="btn btn-stop" disabled={!store.canStop} onclick={() => store.doStop()}>{store.t('ctrl.stop')}</button>
+    <button class="btn btn-stop" disabled={!store.canPause} onclick={() => store.doPause()}>{store.t('ctrl.pause')}</button>
+    <button class="btn btn-cont" disabled={!store.canResume} onclick={() => store.doResume()}>{store.t('ctrl.resume')}</button>
+    <button class="btn btn-stop" disabled={!store.canAbort} onclick={() => store.doAbort()}>{store.t('ctrl.abort')}</button>
     <button class="btn btn-exec" disabled={!store.canExecute} onclick={() => store.doExec()}>{store.t('ctrl.exec')}</button>
     {#if store.canContinue}
       <button class="btn btn-cont" onclick={() => store.doContinue(store.extraRounds)}>{store.t('ctrl.continue')}</button>
@@ -51,9 +51,5 @@
       <input type="number" bind:value={store.extraRounds} min="1" max="20"
         title={store.t('ctrl.extra_rounds')} style="width:50px;text-align:center;background:var(--bg);border:1px solid var(--border);border-radius:4px;color:var(--text);padding:6px;font-size:13px" />
     {/if}
-    <button class="btn btn-cfg" onclick={() => store.toggleTheme()}>{store.theme === 'dark' ? '☀' : '🌙'}</button>
-    <button class="btn btn-cfg" onclick={() => store.switchLocale()}>{store.getLocale() === 'zh-CN' ? 'EN' : '中'}</button>
-    <button class="btn btn-cfg" onclick={onOpenHistory}>{store.t('ctrl.history')}</button>
-    <button class="btn btn-cfg" onclick={onOpenPrompts}>{store.t('ctrl.prompts')}</button>
   </div>
 </div>

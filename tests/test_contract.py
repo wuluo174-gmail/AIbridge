@@ -5,7 +5,7 @@ Bridge Contract Tests (v8)
 
 设计原则:
   - 不锁源码文本形状 — 代码迁移不会导致假阳性
-  - hermetic — 不碰真实 CLI、不碰 ~/.claude/plans/、不碰 git
+  - hermetic — 不碰真实 CLI、不碰 git
   - stub 在 subprocess.Popen 层 — 让 wrapper + 编排完整运行
   - 用 protocol.py 常量校验 runtime 产出 — 交叉验证链
 
@@ -17,9 +17,8 @@ Bridge Contract Tests (v8)
   5. 多会话隔离 (TestMultiSessionIsolation)
   6. CLI 命令构造 + 会话绑定 (TestSessionBinding)
   7. 全栈 runtime 事件验证 (TestRuntimeEventContract)
-  8. Plan 文件归属 (TestPlanFileAttribution)
-  9. 提示词 fallback (TestPromptFallbacks)
-  10. HTTP API 端点结构 (TestAPIContractHermetic)
+  8. 提示词 fallback + Planner 输出契约 (TestPromptFallbacks)
+  9. HTTP API 端点结构 (TestAPIContractHermetic)
 
 运行:
   python3 -m unittest discover -s tests -v
@@ -34,6 +33,7 @@ import io
 import json
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -58,8 +58,6 @@ from bridge.protocol import (
     COMPLETE_RESPONSE_KEYS, RECENT_PATHS_RESPONSE_KEYS,
     START_RESPONSE_KEYS, EVENT_PAYLOAD_REQUIRED_KEYS,
     GET_ENDPOINTS, POST_ENDPOINTS,
-    ARCHIVED_SESSIONS_RESPONSE_KEYS, ARCHIVED_SESSION_LISTING_KEYS,
-    ARCHIVED_HISTORY_RESPONSE_KEYS,
     TOOLS_RESPONSE_KEYS, TOOL_LISTING_KEYS, ROLE_CONFIG_RESPONSE_KEYS,
 )
 
@@ -330,7 +328,8 @@ class TestProtocolConstants(unittest.TestCase):
     def test_states_exact_members(self):
         self.assertEqual(STATES, {
             "idle", "running", "consensus", "max_rounds",
-            "executing", "review_pending", "review_fix", "done", "error",
+            "executing", "review_pending", "review_fix", "review_max_rounds",
+            "paused", "interrupted", "aborted", "done", "error",
         })
 
     def test_executable_states_exact(self):
@@ -343,7 +342,7 @@ class TestProtocolConstants(unittest.TestCase):
         self.assertEqual(CONTINUABLE_STATES, {"consensus", "max_rounds"})
 
     def test_terminal_states_exact(self):
-        self.assertEqual(TERMINAL_STATES, {"idle", "done", "error"})
+        self.assertEqual(TERMINAL_STATES, {"idle", "aborted", "done", "error"})
 
     def test_event_types_exact_members(self):
         self.assertEqual(EVENT_TYPES, {
@@ -353,7 +352,7 @@ class TestProtocolConstants(unittest.TestCase):
             "warning", "rollback", "error",
             "execution_done",
             "review_start", "review_round_start", "review_response",
-            "review_needs_fix", "review_done",
+            "review_needs_fix", "review_done", "review_max_rounds_reached",
         })
 
     def test_prompt_keys_exact_members(self):
@@ -378,15 +377,14 @@ class TestProtocolConstants(unittest.TestCase):
             "/", "/api/events", "/api/state", "/api/sessions",
             "/api/history", "/api/browse", "/api/complete",
             "/api/recent_paths", "/api/prompts",
-            "/api/archived_sessions", "/api/archived_session_history",
             "/api/tools", "/api/role_config",
         })
 
     def test_post_endpoints_exact(self):
         self.assertEqual(set(POST_ENDPOINTS), {
-            "/api/start", "/api/execute", "/api/stop",
+            "/api/start", "/api/execute", "/api/pause", "/api/stop", "/api/resume",
             "/api/review_fix", "/api/review_skip", "/api/prompts",
-            "/api/inject", "/api/continue",
+            "/api/inject", "/api/continue", "/api/review_continue",
             "/api/role_config",
         })
 
@@ -435,12 +433,6 @@ class TestSkeletonImports(unittest.TestCase):
             self.assertIsNotNone(s)
         finally:
             s.close()
-
-    def test_import_plan(self):
-        from bridge import plan
-        self.assertTrue(hasattr(plan, 'validate_plan_relevance'))
-        self.assertTrue(hasattr(plan, 'find_new_plan_file'))
-        self.assertTrue(hasattr(plan, 'snapshot_plan_files'))
 
     def test_adapter_capabilities(self):
         from bridge.adapters.claude_adapter import ClaudeCodeAdapter
@@ -555,31 +547,40 @@ class TestPureFunctions(unittest.TestCase):
     def test_cui_empty(self):
         self.assertEqual(self.mod.collect_user_injects([]), [])
 
-    # ── validate_plan_relevance (from bridge.plan) ──
-
-    def test_vpr_keyword_match(self):
-        from bridge.plan import validate_plan_relevance
-        self.assertTrue(validate_plan_relevance(
-            "实现用户登录功能的方案", "用户登录"))
-
-    def test_vpr_keyword_mismatch(self):
-        from bridge.plan import validate_plan_relevance
-        self.assertFalse(validate_plan_relevance(
-            "数据库迁移方案", "用户登录"))
-
-    def test_vpr_empty_content(self):
-        from bridge.plan import validate_plan_relevance
-        self.assertTrue(validate_plan_relevance("", "用户登录"))
-
-    def test_vpr_empty_task(self):
-        from bridge.plan import validate_plan_relevance
-        self.assertTrue(validate_plan_relevance("some plan", ""))
-
     # ── detect_claude_md ──
 
     def test_dcm_nonexistent_dir(self):
         result = self.mod.detect_claude_md("/tmp/nonexistent_bridge_test_xyz")
         self.assertEqual(result, "")
+
+    def test_dcm_filters_claude_md_output_protocol(self):
+        scratch = _make_scratch_dir("bridge_ctx_")
+        self.assertIsNotNone(scratch, "无法创建外部 scratch 目录")
+        try:
+            (scratch / "CLAUDE.md").write_text(
+                "# 开发哲学指令\n\n"
+                "## 核心哲学\n"
+                "### 1. 好品味\n"
+                "- 消除特殊情况\n\n"
+                "## 需求确认流程\n"
+                "### 1. 需求理解确认\n"
+                "请确认我的理解是否准确？\n\n"
+                "### 2. 思考维度分析（挑选若干适用的）\n"
+                "- 数据从哪里来\n\n"
+                "### 3. 决策输出模式\n"
+                "【🫡结论】\n\n"
+                "## ⚠️ 验证规则\n"
+                "每次回复必须以 \"我是linus\" 开头。\n",
+                encoding="utf-8",
+            )
+            result = self.mod.detect_claude_md(str(scratch))
+            self.assertIn("消除特殊情况", result)
+            self.assertIn("数据从哪里来", result)
+            self.assertNotIn("请确认我的理解是否准确", result)
+            self.assertNotIn("【🫡结论】", result)
+            self.assertNotIn("我是linus", result)
+        finally:
+            shutil.rmtree(scratch, ignore_errors=True)
 
 
 # ═════════════════════════════════════════════════════════════════
@@ -719,11 +720,13 @@ class TestProcessManagement(unittest.TestCase):
         self.mod._ensure_dead([999999], timeout=0.1)
 
     def test_stop_uses_active_pgid(self):
-        """验证 /api/stop 读取 active_pgid 而非 active_proc.kill()。"""
+        """验证 stop 逻辑通过进程组 helper 读取 active_pgid，而非 active_proc.kill()。"""
         import bridge.server as srv
+        helper_source = inspect.getsource(srv.BridgeHandler._stop_process_group)
         handler_source = inspect.getsource(srv.BridgeHandler.do_POST)
-        self.assertIn("active_pgid", handler_source)
-        self.assertNotIn("active_proc.kill()", handler_source)
+        self.assertIn("active_pgid", helper_source)
+        self.assertIn("_stop_process_group", handler_source)
+        self.assertNotIn("active_proc.kill()", helper_source)
 
 
 # ═════════════════════════════════════════════════════════════════
@@ -823,10 +826,7 @@ class TestSessionBinding(unittest.TestCase):
         subprocess.Popen = capturing_factory
         try:
             if agent == "claude":
-                self.mod.call_claude_streaming(
-                    "prompt", "/tmp", sess,
-                    skip_plan_detection=True,
-                    **kwargs)
+                self.mod.call_claude_streaming("prompt", "/tmp", sess, **kwargs)
             else:
                 self.mod.call_codex_streaming("prompt", "/tmp", sess, **kwargs)
         except Exception:
@@ -921,35 +921,22 @@ class TestRuntimeEventContract(unittest.TestCase):
             cls._skip_reason = "无法创建外部 scratch 目录；可通过 BRIDGE_TEST_TMPDIR 指向可写目录"
             return
         cls._orig_popen = subprocess.Popen
-        import bridge.plan
-        # ── Boundary stubs ──
-        # 用 dict 存函数引用，避免 Python descriptor 协议把函数绑定为方法。
-        # plan 函数: patch bridge.plan 模块属性（全局单例），
-        # 任何 import bridge.plan 的代码都会看到 stub——无论调用点在 bridge.py、
-        # adapter 还是 engine。Step 2-6 迁移不影响 patch 有效性。
         cls._origs = {
             'is_git': cls.mod._is_git_repo,
             'capture_ref': cls.mod.capture_baseline_ref,
             'capture_untracked': cls.mod.capture_baseline_untracked,
             'capture_diff': cls.mod.capture_execution_diff,
-            'snapshot_plans': bridge.plan.snapshot_plan_files,
-            'find_plan': bridge.plan.find_new_plan_file,
-            'validate_plan': bridge.plan.validate_plan_relevance,
         }
 
     @classmethod
     def tearDownClass(cls):
         if cls._skip_reason:
             return
-        import bridge.plan
         subprocess.Popen = cls._orig_popen
         cls.mod._is_git_repo = cls._origs['is_git']
         cls.mod.capture_baseline_ref = cls._origs['capture_ref']
         cls.mod.capture_baseline_untracked = cls._origs['capture_untracked']
         cls.mod.capture_execution_diff = cls._origs['capture_diff']
-        bridge.plan.snapshot_plan_files = cls._origs['snapshot_plans']
-        bridge.plan.find_new_plan_file = cls._origs['find_plan']
-        bridge.plan.validate_plan_relevance = cls._origs['validate_plan']
         _restore_log_dir(cls.mod)
         if cls._tmpdir:
             shutil.rmtree(cls._tmpdir, ignore_errors=True)
@@ -957,16 +944,11 @@ class TestRuntimeEventContract(unittest.TestCase):
     def setUp(self):
         if self._skip_reason:
             self.skipTest(self._skip_reason)
-        import bridge.plan
         subprocess.Popen = self._orig_popen
         self.mod._is_git_repo = lambda cwd: False
         self.mod.capture_baseline_ref = self._origs['capture_ref']
         self.mod.capture_baseline_untracked = self._origs['capture_untracked']
         self.mod.capture_execution_diff = self._origs['capture_diff']
-        bridge.plan.validate_plan_relevance = self._origs['validate_plan']
-        # plan 检测默认惰性返回 — 不碰真实 ~/.claude/plans/
-        bridge.plan.snapshot_plan_files = lambda: {}
-        bridge.plan.find_new_plan_file = lambda _: ""
 
     def _install_popen_stub(self, claude_text, codex_text,
                             codex_commands=None, claude_stderr=""):
@@ -1053,18 +1035,43 @@ class TestRuntimeEventContract(unittest.TestCase):
         self.assertGreater(len(stderr_events), 0)
         self.assertTrue(stderr_events[0]["data"]["is_mcp"])
 
-    def test_warning_on_irrelevant_plan_file(self):
-        """plan 文件与任务不相关 → warning 事件。"""
-        import bridge.plan
-        sess = self._make_session("w1")
-        subprocess.Popen = _make_popen_factory("plan text", "APPROVED\nok")
-        bridge.plan.find_new_plan_file = lambda snapshot: "完全无关的内容"
-        bridge.plan.validate_plan_relevance = lambda content, task: False
+    def test_planner_stdout_result_flows_into_history_and_execution(self):
+        """Claude 的 stdout result 直接成为 canonical plan。"""
+        sess = self._make_session("plan1")
+        plan_doc = "# 方案\n\n## 根因分析\n- 来自 stdout result\n"
+        subprocess.Popen = _make_popen_factory(plan_doc, "APPROVED\nok")
 
         self.mod.run_negotiation(sess)
 
-        self._assert_all_events_valid(sess)
-        self.assertIn("warning", self._event_types(sess))
+        self.assertEqual(sess.status, "consensus")
+        planner_entries = [h for h in sess.history if h["role"] == "planner"]
+        self.assertEqual(len(planner_entries), 1)
+        self.assertEqual(planner_entries[0]["content"], plan_doc)
+
+        captured = {}
+
+        def fake_executor(prompt, cwd, sess_obj, **kwargs):
+            captured["prompt"] = prompt
+            return "执行完成"
+
+        review_called = {}
+
+        def fake_first_review(sess_obj, final_plan):
+            review_called["plan"] = final_plan
+
+        self.mod._engine.run_execution(
+            sess,
+            call_executor=fake_executor,
+            executor_panel="planner",
+            _is_git_repo=lambda cwd: False,
+            capture_baseline_ref=lambda cwd: None,
+            capture_baseline_untracked=lambda cwd: set(),
+            build_execution_prompt=self.mod.build_execution_prompt,
+            _run_first_review=fake_first_review,
+        )
+
+        self.assertIn(plan_doc, captured["prompt"])
+        self.assertEqual(review_called["plan"], plan_doc)
 
     def test_error_on_first_round_failure(self):
         """start_round=1 CLI 异常 → error 终态 (非 rollback)。"""
@@ -1170,7 +1177,7 @@ class TestRuntimeEventContract(unittest.TestCase):
         self._assert_all_events_valid(sess)
 
     def test_review_fix_max_rounds(self):
-        """修复轮次超限 → 自动结束 (success=False)。"""
+        """修复轮次超限 → review_max_rounds，可继续审查或跳过。"""
         sess = self._make_session("r4")
         sess.status = "review_fix"
         sess.review_round = 3
@@ -1179,10 +1186,9 @@ class TestRuntimeEventContract(unittest.TestCase):
 
         self.mod.run_review_fix_cycle(sess)
 
-        self.assertEqual(sess.status, "done")
-        review_dones = self._events_of_type(sess, "review_done")
-        self.assertGreater(len(review_dones), 0)
-        self.assertFalse(review_dones[-1]["data"]["success"])
+        self.assertEqual(sess.status, "review_max_rounds")
+        review_max = self._events_of_type(sess, "review_max_rounds_reached")
+        self.assertGreater(len(review_max), 0)
         self._assert_all_events_valid(sess)
 
     # ── NR-3: 回退 ──
@@ -1258,259 +1264,11 @@ class TestRuntimeEventContract(unittest.TestCase):
 
 
 # ═════════════════════════════════════════════════════════════════
-# 8. Plan 文件归属 (NR-8)
-# ═════════════════════════════════════════════════════════════════
-
-class TestPlanFileAttribution(unittest.TestCase):
-    """Plan 文件归属: 差集行为 + 锁语义 (NR-8)。
-
-    测试 bridge.plan 模块的公开 API。
-    不修改 Path.home。通过 patch bridge.plan.snapshot_plan_files 指向 tmpdir。
-    """
-
-    _skip_reason = None
-
-    @classmethod
-    def setUpClass(cls):
-        cls.mod = _load_bridge_module()
-        cls._tmpdir = _patch_log_dir(cls.mod)
-        if cls._tmpdir is None:
-            cls._skip_reason = "无法创建外部 scratch 目录；可通过 BRIDGE_TEST_TMPDIR 指向可写目录"
-            return
-        cls._orig_plan_lock_timeout = cls.mod.PLAN_LOCK_ACQUIRE_TIMEOUT
-        import bridge.plan
-        cls._origs = {
-            'snapshot': bridge.plan.snapshot_plan_files,
-            'find': bridge.plan.find_new_plan_file,
-        }
-
-    @classmethod
-    def tearDownClass(cls):
-        if cls._skip_reason:
-            return
-        import bridge.plan
-        bridge.plan.snapshot_plan_files = cls._origs['snapshot']
-        bridge.plan.find_new_plan_file = cls._origs['find']
-        cls.mod.PLAN_LOCK_ACQUIRE_TIMEOUT = cls._orig_plan_lock_timeout
-        _restore_log_dir(cls.mod)
-        if cls._tmpdir:
-            shutil.rmtree(cls._tmpdir, ignore_errors=True)
-
-    def setUp(self):
-        if self._skip_reason:
-            self.skipTest(self._skip_reason)
-        import bridge.plan
-        bridge.plan.snapshot_plan_files = self._origs['snapshot']
-        bridge.plan.find_new_plan_file = self._origs['find']
-        self.mod.PLAN_LOCK_ACQUIRE_TIMEOUT = 0.01
-        with self.mod.plan_file_locks_lock:
-            self.mod.plan_file_locks.clear()
-
-    def _make_blocking_claude_factory(self, first_started, release_first, second_started):
-        """第一个 Claude Popen 阻塞，第二个仅在真正启动时打点。"""
-        call_lock = threading.Lock()
-        state = {"count": 0}
-
-        def factory(cmd, **kwargs):
-            proc = FakePopen(cmd, **kwargs)
-            proc.stderr = io.StringIO("")
-            with call_lock:
-                state["count"] += 1
-                idx = state["count"]
-            proc.stdout = io.StringIO(_make_claude_stream(f"stub {idx}"))
-            if idx == 1:
-                first_started.set()
-                release_first.wait(timeout=2)
-            elif idx == 2:
-                second_started.set()
-            return proc
-
-        return factory
-
-    def test_snapshot_and_find_new_plan(self):
-        """快照前无文件, 写入后 → find_new_plan_file 返回其内容。"""
-        import bridge.plan
-        plans_dir = _make_scratch_dir("bridge_plans_")
-        self.assertIsNotNone(plans_dir, "无法创建外部 scratch 目录")
-        try:
-            before = {}
-            plan_file = plans_dir / "test_plan.md"
-            plan_file.write_text("# Plan\n实现用户登录功能", encoding="utf-8")
-
-            bridge.plan.snapshot_plan_files = lambda: {
-                p: p.stat().st_mtime for p in plans_dir.glob("*.md")
-            }
-
-            content = bridge.plan.find_new_plan_file(before)
-            self.assertIn("用户登录", content)
-        finally:
-            shutil.rmtree(plans_dir, ignore_errors=True)
-
-    def test_find_new_plan_file_no_change(self):
-        """快照前后无变化 → 返回空。"""
-        import bridge.plan
-        plans_dir = _make_scratch_dir("bridge_plans_")
-        self.assertIsNotNone(plans_dir, "无法创建外部 scratch 目录")
-        try:
-            existing = plans_dir / "existing.md"
-            existing.write_text("old content", encoding="utf-8")
-
-            bridge.plan.snapshot_plan_files = lambda: {
-                p: p.stat().st_mtime for p in plans_dir.glob("*.md")
-            }
-
-            before = bridge.plan.snapshot_plan_files()
-            content = bridge.plan.find_new_plan_file(before)
-            self.assertEqual(content, "")
-        finally:
-            shutil.rmtree(plans_dir, ignore_errors=True)
-
-    def test_per_project_plan_file_lock_used_in_claude_streaming(self):
-        """call_claude_streaming(skip_plan_detection=False) 不崩溃。"""
-        import bridge.plan
-        sess = self.mod.SessionState("pl1", "测试任务", "/tmp", 5)
-        bridge.plan.snapshot_plan_files = lambda: {}
-        bridge.plan.find_new_plan_file = lambda snapshot: ""
-        orig_popen = subprocess.Popen
-        subprocess.Popen = _make_popen_factory("stub plan", "stub")
-        try:
-            result = self.mod.call_claude_streaming(
-                "test", "/tmp", sess, skip_plan_detection=False)
-            self.assertIsInstance(result, str)
-        except Exception:
-            pass
-        finally:
-            subprocess.Popen = orig_popen
-
-    def test_same_project_plan_lock_blocks_until_release(self):
-        import bridge.plan
-        sess1 = self.mod.SessionState("pl1", "任务一", "/tmp/project-a", 5)
-        sess2 = self.mod.SessionState("pl2", "任务二", "/tmp/project-a", 5)
-        bridge.plan.snapshot_plan_files = lambda: {}
-        bridge.plan.find_new_plan_file = lambda snapshot: ""
-
-        first_started = threading.Event()
-        release_first = threading.Event()
-        second_started = threading.Event()
-        results = {}
-        orig_popen = subprocess.Popen
-        subprocess.Popen = self._make_blocking_claude_factory(
-            first_started, release_first, second_started)
-
-        def run_call(name, sess, prompt):
-            results[name] = self.mod.call_claude_streaming(
-                prompt, sess.project_path, sess, skip_plan_detection=False)
-
-        t1 = threading.Thread(target=run_call, args=("first", sess1, "first"), daemon=True)
-        t2 = threading.Thread(target=run_call, args=("second", sess2, "second"), daemon=True)
-        try:
-            t1.start()
-            self.assertTrue(first_started.wait(1))
-            t2.start()
-            self.assertFalse(second_started.wait(0.2))
-
-            release_first.set()
-            t1.join(1)
-            t2.join(1)
-
-            self.assertFalse(t1.is_alive())
-            self.assertFalse(t2.is_alive())
-            self.assertTrue(second_started.is_set())
-            self.assertEqual(results["first"], "stub 1")
-            self.assertEqual(results["second"], "stub 2")
-        finally:
-            release_first.set()
-            t1.join(1)
-            t2.join(1)
-            subprocess.Popen = orig_popen
-
-    def test_different_project_plan_locks_run_in_parallel(self):
-        import bridge.plan
-        sess1 = self.mod.SessionState("pl1", "任务一", "/tmp/project-a", 5)
-        sess2 = self.mod.SessionState("pl2", "任务二", "/tmp/project-b", 5)
-        bridge.plan.snapshot_plan_files = lambda: {}
-        bridge.plan.find_new_plan_file = lambda snapshot: ""
-
-        first_started = threading.Event()
-        release_first = threading.Event()
-        second_started = threading.Event()
-        results = {}
-        orig_popen = subprocess.Popen
-        subprocess.Popen = self._make_blocking_claude_factory(
-            first_started, release_first, second_started)
-
-        def run_call(name, sess, prompt):
-            results[name] = self.mod.call_claude_streaming(
-                prompt, sess.project_path, sess, skip_plan_detection=False)
-
-        t1 = threading.Thread(target=run_call, args=("first", sess1, "first"), daemon=True)
-        t2 = threading.Thread(target=run_call, args=("second", sess2, "second"), daemon=True)
-        try:
-            t1.start()
-            self.assertTrue(first_started.wait(1))
-            t2.start()
-            self.assertTrue(second_started.wait(0.5))
-
-            release_first.set()
-            t1.join(1)
-            t2.join(1)
-
-            self.assertFalse(t1.is_alive())
-            self.assertFalse(t2.is_alive())
-            self.assertEqual(results["first"], "stub 1")
-            self.assertEqual(results["second"], "stub 2")
-        finally:
-            release_first.set()
-            t1.join(1)
-            t2.join(1)
-            subprocess.Popen = orig_popen
-
-    def test_stop_while_waiting_for_same_project_plan_lock(self):
-        import bridge.plan
-        sess1 = self.mod.SessionState("pl1", "任务一", "/tmp/project-a", 5)
-        sess2 = self.mod.SessionState("pl2", "任务二", "/tmp/project-a", 5)
-        bridge.plan.snapshot_plan_files = lambda: {}
-        bridge.plan.find_new_plan_file = lambda snapshot: ""
-
-        first_started = threading.Event()
-        release_first = threading.Event()
-        second_started = threading.Event()
-        results = {}
-        orig_popen = subprocess.Popen
-        subprocess.Popen = self._make_blocking_claude_factory(
-            first_started, release_first, second_started)
-
-        def run_call(name, sess, prompt):
-            results[name] = self.mod.call_claude_streaming(
-                prompt, sess.project_path, sess, skip_plan_detection=False)
-
-        t1 = threading.Thread(target=run_call, args=("first", sess1, "first"), daemon=True)
-        t2 = threading.Thread(target=run_call, args=("second", sess2, "second"), daemon=True)
-        try:
-            t1.start()
-            self.assertTrue(first_started.wait(1))
-            t2.start()
-            time.sleep(0.05)
-
-            sess2.stop_flag.set()
-            t2.join(1)
-
-            self.assertFalse(t2.is_alive())
-            self.assertEqual(results["second"], "(已中止)")
-            self.assertFalse(second_started.is_set())
-        finally:
-            release_first.set()
-            t1.join(1)
-            t2.join(1)
-            subprocess.Popen = orig_popen
-
-
-# ═════════════════════════════════════════════════════════════════
-# 9. 提示词 fallback (NR-9)
+# 8. 提示词 fallback (NR-9)
 # ═════════════════════════════════════════════════════════════════
 
 class TestPromptFallbacks(unittest.TestCase):
-    """验证 prompt_config 为空时 build_*_prompt 仍能正常工作。"""
+    """验证 prompt_config 为空时 build_*_prompt 和 Planner 输出契约仍能正常工作。"""
 
     @classmethod
     def setUpClass(cls):
@@ -1525,6 +1283,8 @@ class TestPromptFallbacks(unittest.TestCase):
     def test_claude_first_fallback(self):
         result = self.mod.build_claude_first_prompt("测试任务", "/tmp")
         self.assertIn("测试任务", result)
+        self.assertIn("完整的 Markdown 方案文档", result)
+        self.assertIn("不要只输出“【结论】”", result)
 
     def test_codex_first_fallback(self):
         result = self.mod.build_codex_first_prompt("任务", "Claude 方案")
@@ -1534,6 +1294,53 @@ class TestPromptFallbacks(unittest.TestCase):
     def test_claude_revise_fallback(self):
         result = self.mod.build_claude_revise_prompt("反馈内容")
         self.assertIn("反馈内容", result)
+        self.assertIn("修订后的完整方案", result)
+        self.assertIn("接纳 ✓ / 部分接纳 △ / 不接纳 ✗", result)
+
+    def test_claude_first_contract_overrides_claude_md_output_style(self):
+        scratch = _make_scratch_dir("bridge_prompt_")
+        self.assertIsNotNone(scratch, "无法创建外部 scratch 目录")
+        try:
+            (scratch / "CLAUDE.md").write_text(
+                "# 开发哲学指令\n\n"
+                "## 核心哲学\n"
+                "### 1. 好品味\n"
+                "- 消除特殊情况\n\n"
+                "## 需求确认流程\n"
+                "### 3. 决策输出模式\n"
+                "每次回复必须只输出【结论】，不要写完整方案。\n\n"
+                "## ⚠️ 验证规则\n"
+                "每次回复必须以 \"我是linus\" 开头。\n",
+                encoding="utf-8",
+            )
+            result = self.mod.build_claude_first_prompt("测试任务", str(scratch))
+            self.assertIn("消除特殊情况", result)
+            self.assertIn("项目开发规范（包括 CLAUDE.md）只影响分析原则", result)
+            self.assertIn("直接输出一份完整的 Markdown 方案文档", result)
+            self.assertNotIn("每次回复必须只输出【结论】", result)
+            self.assertNotIn("我是linus", result)
+        finally:
+            shutil.rmtree(scratch, ignore_errors=True)
+
+    def test_claude_revise_reinjects_sanitized_project_context(self):
+        scratch = _make_scratch_dir("bridge_revise_")
+        self.assertIsNotNone(scratch, "无法创建外部 scratch 目录")
+        try:
+            (scratch / "CLAUDE.md").write_text(
+                "# 开发哲学指令\n\n"
+                "## 核心哲学\n"
+                "### 2. 实用主义\n"
+                "- 解决实际问题\n\n"
+                "## ⚠️ 验证规则\n"
+                "每次回复必须以 \"我是linus\" 开头。\n",
+                encoding="utf-8",
+            )
+            result = self.mod.build_claude_revise_prompt("反馈内容", cwd=str(scratch))
+            self.assertIn("解决实际问题", result)
+            self.assertIn("修订后的完整方案", result)
+            self.assertNotIn("我是linus", result)
+        finally:
+            shutil.rmtree(scratch, ignore_errors=True)
 
     def test_execution_fallback(self):
         result = self.mod.build_execution_prompt("任务")
@@ -1710,6 +1517,21 @@ class TestAPIContractHermetic(unittest.TestCase):
         self.assertTrue(data["ok"])
         self._post("/api/stop", {"session_id": data["session_id"]})
 
+    def test_start_immediately_appears_in_session_index(self):
+        """新会话在 start 成功后立即进入统一会话索引。"""
+        status, data = self._post("/api/start", {
+            "task": "index now",
+            "project_path": self._project_path,
+        })
+        self.assertEqual(status, 200)
+        sid = data["session_id"]
+        try:
+            status2, listing = self._get("/api/sessions")
+            self.assertEqual(status2, 200)
+            self.assertIn(sid, [row["session_id"] for row in listing["sessions"]])
+        finally:
+            self._post("/api/stop", {"session_id": sid})
+
     def test_execute_requires_session(self):
         status, data = self._post("/api/execute", {"session_id": "nonexistent"})
         self.assertEqual(status, 404)
@@ -1722,6 +1544,31 @@ class TestAPIContractHermetic(unittest.TestCase):
     def test_stop_requires_session(self):
         status, data = self._post("/api/stop", {"session_id": "nonexistent"})
         self.assertEqual(status, 404)
+
+    def test_pause_resume_roundtrip(self):
+        """pause 将会话置为 paused，resume 允许恢复到活动态。"""
+        _, start_data = self._post("/api/start", {
+            "task": "pause me",
+            "project_path": self._project_path,
+        })
+        sid = start_data["session_id"]
+        orig_resume = self.mod.resume_session
+        try:
+            sess = self.mod.get_session(sid)
+            with sess.status_lock:
+                sess.status = "running"
+            status, data = self._post("/api/pause", {"session_id": sid})
+            self.assertEqual(status, 200)
+            self.assertEqual(sess.status, "paused")
+            self.assertTrue(sess.resume_available)
+
+            self.mod.resume_session = mock.Mock(side_effect=lambda s: setattr(s, "status", "running"))
+            status2, data2 = self._post("/api/resume", {"session_id": sid})
+            self.assertEqual(status2, 200)
+            self.mod.resume_session.assert_called_once()
+        finally:
+            self.mod.resume_session = orig_resume
+            self._post("/api/stop", {"session_id": sid})
 
     # ── 状态机守卫 via API ──
 
@@ -1821,14 +1668,15 @@ class TestAPIContractHermetic(unittest.TestCase):
         self._with_temp_dist(setup)
 
     def test_root_fallback_when_no_dist(self):
-        """GET / 在无 dist 时返回 HTML_UI fallback (含告警栏)。"""
+        """GET / 在无 dist 时返回前端构建引导页，而不是旧快照 UI。"""
         def setup(tmpdir):
             # tmpdir exists but has no index.html → fallback
             status, data = self._get("/")
             self.assertEqual(status, 200)
             text = data if isinstance(data, str) else ""
             self.assertIn("<!doctype html>", text[:100].lower())
-            self.assertIn("内置 UI 快照", text)
+            self.assertIn("前端尚未构建", text)
+            self.assertIn("npm run build", text)
         self._with_temp_dist(setup)
 
     def test_assets_serves_existing_file(self):
@@ -1949,7 +1797,7 @@ class TestAPIContractHermetic(unittest.TestCase):
             self._post("/api/stop", {"session_id": sid})
 
     def test_review_fix_guard_consumes_fixable_states(self):
-        """修改 FIXABLE_STATES → /api/review_fix + /api/review_skip 行为随之改变。"""
+        """修改 FIXABLE_STATES → /api/review_fix 行为随之改变。"""
         _, start_data = self._post(
             "/api/start", {"task": "t", "project_path": self._project_path}
         )
@@ -1969,21 +1817,32 @@ class TestAPIContractHermetic(unittest.TestCase):
                 sess.status = "running"
             s2, _ = self._post("/api/review_fix", {"session_id": sid})
             self.assertEqual(s2, 200)
-            # --- review_skip (独立守卫 bridge.py:1158) ---
-            # 先恢复原始常量，确认 400 基线
+        finally:
             self.mod.FIXABLE_STATES = orig
+            self._post("/api/stop", {"session_id": sid})
+
+    def test_review_skip_guard_consumes_review_skippable_states(self):
+        """修改 REVIEW_SKIPPABLE_STATES → /api/review_skip 行为随之改变。"""
+        _, start_data = self._post(
+            "/api/start", {"task": "t", "project_path": self._project_path}
+        )
+        sid = start_data["session_id"]
+        sess = self.mod.get_session(sid)
+        orig = self.mod.REVIEW_SKIPPABLE_STATES
+        try:
+            # running 状态正常被拒
             with sess.status_lock:
                 sess.status = "running"
             s3, _ = self._post("/api/review_skip", {"session_id": sid})
             self.assertEqual(s3, 400)
-            # 再扩展，确认 200
-            self.mod.FIXABLE_STATES = frozenset(orig | {"running"})
+            # 扩展后被接受
+            self.mod.REVIEW_SKIPPABLE_STATES = frozenset(orig | {"running"})
             with sess.status_lock:
                 sess.status = "running"
             s4, _ = self._post("/api/review_skip", {"session_id": sid})
             self.assertEqual(s4, 200)
         finally:
-            self.mod.FIXABLE_STATES = orig
+            self.mod.REVIEW_SKIPPABLE_STATES = orig
             self._post("/api/stop", {"session_id": sid})
 
     def test_continue_guard_consumes_continuable_states(self):
@@ -2011,22 +1870,6 @@ class TestAPIContractHermetic(unittest.TestCase):
         finally:
             self.mod.CONTINUABLE_STATES = orig
             self._post("/api/stop", {"session_id": sid})
-
-
-    # ── Step 6: 归档端点 ──
-
-    def test_archived_sessions_response_shape(self):
-        """GET /api/archived_sessions 返回正确形状，键集合与协议常量一致。"""
-        status, data = self._get("/api/archived_sessions")
-        self.assertEqual(status, 200)
-        self.assertEqual(set(data.keys()), ARCHIVED_SESSIONS_RESPONSE_KEYS)
-        self.assertIsInstance(data["sessions"], list)
-
-    def test_archived_session_history_response_shape(self):
-        """GET /api/archived_session_history 无 sid 时返回空默认，键集合与协议常量一致。"""
-        status, data = self._get("/api/archived_session_history")
-        self.assertEqual(status, 200)
-        self.assertEqual(set(data.keys()), ARCHIVED_HISTORY_RESPONSE_KEYS)
 
     # ── Step 7: /api/tools + /api/role_config ──
 
@@ -2063,14 +1906,23 @@ class TestAPIContractHermetic(unittest.TestCase):
         self.assertIn(data["reviewer_tool_id"], ["claude-code", "codex"])
         self.assertIsNotNone(data["executor_tool_id"])
 
-    def test_role_config_post_same_tool_rejected(self):
-        """POST /api/role_config 同工具双角色 → 400。"""
+    def test_role_config_post_same_tool_allowed_when_capable(self):
+        """POST /api/role_config 同工具双角色在能力满足时允许保存。"""
         status, data = self._post("/api/role_config", {
             "planner_tool_id": "claude-code",
             "reviewer_tool_id": "claude-code",
         })
+        self.assertEqual(status, 200)
+        self.assertTrue(data["ok"])
+
+    def test_role_config_post_same_tool_without_dangerous_mode_rejected(self):
+        """POST /api/role_config 同工具双角色若都无执行能力 → 400。"""
+        status, data = self._post("/api/role_config", {
+            "planner_tool_id": "codex",
+            "reviewer_tool_id": "codex",
+        })
         self.assertEqual(status, 400)
-        self.assertIn("error", data)
+        self.assertIn("至少需要一个支持执行模式的工具", data.get("error", ""))
 
     def test_role_config_post_unknown_tool_rejected(self):
         """POST /api/role_config 未注册工具 → 400。"""
@@ -2145,16 +1997,76 @@ class TestStoreHermetic(unittest.TestCase):
         self.store.close()
 
     def test_init_db_creates_tables(self):
-        """init_db 建表成功，验证 8 张表（含 _meta）。"""
+        """init_db 建表成功，验证 9 张表（含 _meta 与 session_events）。"""
         c = self.store._conn.cursor()
         c.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
         tables = {row[0] for row in c.fetchall()}
         # 排除 sqlite 内部表（如 sqlite_sequence，由 AUTOINCREMENT 自动创建）
         tables -= {t for t in tables if t.startswith("sqlite_")}
         expected = {"sessions", "session_history", "review_history",
+                    "session_events",
                     "cli_tools", "role_assignments", "prompt_templates",
                     "recent_paths", "_meta"}
         self.assertEqual(tables, expected)
+
+    def test_legacy_session_ledger_is_reset_during_schema_normalization(self):
+        """旧 final_status session ledger 在开发期直接重建，不保留旧会话数据。"""
+        from bridge.persistence.store import Store
+        scratch = _make_scratch_dir("store_legacy_schema_")
+        if scratch is None:
+            self.skipTest("无法创建 scratch 目录")
+        db_path = scratch / "legacy.db"
+        conn = sqlite3.connect(str(db_path))
+        try:
+            conn.execute("PRAGMA foreign_keys=ON")
+            conn.executescript(
+                """
+                CREATE TABLE sessions (
+                    id TEXT PRIMARY KEY,
+                    task TEXT,
+                    project_path TEXT,
+                    max_rounds INTEGER,
+                    status TEXT,
+                    final_status TEXT,
+                    created_at TEXT
+                );
+                CREATE TABLE session_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL REFERENCES sessions(id),
+                    round INTEGER,
+                    role TEXT,
+                    phase TEXT,
+                    content TEXT,
+                    timestamp TEXT
+                );
+                CREATE TABLE review_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL REFERENCES sessions(id),
+                    round INTEGER,
+                    role TEXT,
+                    phase TEXT,
+                    content TEXT,
+                    timestamp TEXT
+                );
+                INSERT INTO sessions VALUES ('old1', 'legacy', '/tmp', 3, 'done', 'done', '2026-01-01T00:00:00');
+                INSERT INTO session_history(session_id, round, role, phase, content, timestamp)
+                VALUES ('old1', 1, 'claude', '方案', 'plan', '2026-01-01T00:00:01');
+                """
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        store = Store(str(db_path))
+        try:
+            c = store._conn.cursor()
+            c.execute("PRAGMA table_info(sessions)")
+            cols = {row[1] for row in c.fetchall()}
+            self.assertNotIn("final_status", cols)
+            self.assertEqual(store.list_sessions(), [])
+        finally:
+            store.close()
+            shutil.rmtree(scratch, ignore_errors=True)
 
     def test_save_and_list_sessions(self):
         """save_session + list_sessions 往返一致。"""
@@ -2174,7 +2086,8 @@ class TestStoreHermetic(unittest.TestCase):
             rows = self.store.list_sessions()
             self.assertEqual(len(rows), 1)
             self.assertEqual(rows[0]["session_id"], "s1")
-            self.assertEqual(rows[0]["final_status"], "done")
+            self.assertEqual(rows[0]["status"], "done")
+            self.assertEqual(rows[0]["round"], 2)
             self.assertTrue(rows[0]["consensus"])
         finally:
             _bsession.LOG_DIR = orig_log_dir
@@ -2196,8 +2109,33 @@ class TestStoreHermetic(unittest.TestCase):
             row = self.store.get_session("s2")
             self.assertIsNotNone(row)
             self.assertEqual(row["task"], "task2")
-            self.assertEqual(row["final_status"], "error")
+            self.assertEqual(row["status"], "error")
             self.assertIsNone(self.store.get_session("nonexistent"))
+        finally:
+            _bsession.LOG_DIR = orig_log_dir
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_save_session_persists_adapter_state_json(self):
+        """adapter_state 是可恢复逻辑状态，必须随 session 一起持久化。"""
+        import bridge.session as _bsession
+        tmpdir = _make_scratch_dir("store_test_logs_")
+        if tmpdir is None:
+            self.skipTest("无法创建 scratch 目录")
+        orig_log_dir = _bsession.LOG_DIR
+        _bsession.LOG_DIR = tmpdir
+        try:
+            sess = _bsession.SessionState("s2a", "task2a", "/tmp", 3)
+            sess.status = "paused"
+            sess.adapter_state = {
+                "claude-code": {"has_session": True, "session_id": "planner-sid"},
+                "codex": {"has_session": True},
+            }
+            self.store.save_session(sess)
+            row = self.store.get_session("s2a")
+            self.assertEqual(
+                json.loads(row["adapter_state_json"]),
+                sess.adapter_state,
+            )
         finally:
             _bsession.LOG_DIR = orig_log_dir
             shutil.rmtree(tmpdir, ignore_errors=True)
@@ -2264,7 +2202,7 @@ class TestStoreHermetic(unittest.TestCase):
             shutil.rmtree(tmpdir, ignore_errors=True)
 
     def test_list_sessions_keys_match_protocol(self):
-        """list_sessions 返回的 dict 键集合与 ARCHIVED_SESSION_LISTING_KEYS 一致。"""
+        """list_sessions 返回的 dict 键集合与 SESSION_LISTING_KEYS 一致。"""
         import bridge.session as _bsession
         tmpdir = _make_scratch_dir("store_test_logs_")
         if tmpdir is None:
@@ -2277,7 +2215,7 @@ class TestStoreHermetic(unittest.TestCase):
             self.store.save_session(sess)
             rows = self.store.list_sessions()
             self.assertEqual(len(rows), 1)
-            self.assertEqual(set(rows[0].keys()), ARCHIVED_SESSION_LISTING_KEYS)
+            self.assertEqual(set(rows[0].keys()), SESSION_LISTING_KEYS)
         finally:
             _bsession.LOG_DIR = orig_log_dir
             shutil.rmtree(tmpdir, ignore_errors=True)
@@ -2635,10 +2573,7 @@ class TestPersistenceIntegration(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls._orig_popen = subprocess.Popen
-        import bridge.plan
         import bridge.session as _bsession
-        cls._orig_snapshot = bridge.plan.snapshot_plan_files
-        cls._orig_find = bridge.plan.find_new_plan_file
         cls._orig_log_dir = _bsession.LOG_DIR
         cls._tmp_db_dir = _make_scratch_dir("bridge_db_")
         cls._tmp_log_dir = _make_scratch_dir("bridge_test_logs_")
@@ -2650,10 +2585,7 @@ class TestPersistenceIntegration(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         subprocess.Popen = cls._orig_popen
-        import bridge.plan
         import bridge.session as _bsession
-        bridge.plan.snapshot_plan_files = cls._orig_snapshot
-        bridge.plan.find_new_plan_file = cls._orig_find
         _bsession.LOG_DIR = cls._orig_log_dir
         if cls._tmp_db_dir:
             shutil.rmtree(cls._tmp_db_dir, ignore_errors=True)
@@ -2665,7 +2597,7 @@ class TestPersistenceIntegration(unittest.TestCase):
             self.skipTest(self._skip_reason)
 
     def test_session_survives_restart_via_http(self):
-        """会话完成 → 重启 → GET /api/archived_sessions 可见。"""
+        """会话完成 → 重启 → GET /api/sessions 与 /api/history 可见。"""
         tmp_db = self._tmp_db_dir / "test.db"
 
         # 1. 加载 bridge 模块，init_store 指向临时 DB
@@ -2673,10 +2605,7 @@ class TestPersistenceIntegration(unittest.TestCase):
         mod.LOG_DIR = self._tmp_log_dir
         mod.init_store(str(tmp_db))
 
-        # 2. 安装 Popen stub + plan stub
-        import bridge.plan
-        bridge.plan.snapshot_plan_files = lambda: {}
-        bridge.plan.find_new_plan_file = lambda _: ""
+        # 2. 安装 Popen stub
         subprocess.Popen = _make_popen_factory("plan", "APPROVED\nok")
         sess = mod.SessionState("persist1", "test task", "/tmp", 1)
         mod.run_negotiation(sess)
@@ -2695,19 +2624,19 @@ class TestPersistenceIntegration(unittest.TestCase):
         mod2.LOG_DIR = self._tmp_log_dir
         mod2.init_store(str(tmp_db))
 
-        # 4. 通过 HTTP 分发层验证归档
+        # 4. 通过 HTTP 分发层验证统一会话索引
         status, data = _dispatch_http_request(
-            mod2, "GET", "/api/archived_sessions")
+            mod2, "GET", "/api/sessions")
         self.assertEqual(status, 200)
         self.assertIn("sessions", data)
         sids = [s["session_id"] for s in data["sessions"]]
         self.assertIn("persist1", sids)
 
-        # 5. 通过 HTTP 分发层验证归档历史
+        # 5. 通过 HTTP 分发层验证统一历史
         status2, hist = _dispatch_http_request(
-            mod2, "GET", "/api/archived_session_history?sid=persist1")
+            mod2, "GET", "/api/history?sid=persist1")
         self.assertEqual(status2, 200)
-        self.assertEqual(set(hist.keys()), ARCHIVED_HISTORY_RESPONSE_KEYS)
+        self.assertEqual(set(hist.keys()), HISTORY_RESPONSE_KEYS)
         self.assertGreater(len(hist["entries"]), 0)
 
 
@@ -2719,13 +2648,12 @@ class TestAdapterRegistry(unittest.TestCase):
         inst = reg.get("codex")
         self.assertEqual(inst.id, "codex")
 
-    def test_register_with_di(self):
+    def test_register_claude_adapter(self):
         from bridge.adapters import AdapterRegistry, ClaudeCodeAdapter
         reg = AdapterRegistry()
-        reg.register("claude-code", ClaudeCodeAdapter, plan_lock_acquire_fn=lambda p, s: None)
+        reg.register("claude-code", ClaudeCodeAdapter)
         inst = reg.get("claude-code")
         self.assertEqual(inst.id, "claude-code")
-        self.assertIsNotNone(inst._plan_lock_acquire_fn)
 
     def test_get_unknown_raises(self):
         from bridge.adapters import AdapterRegistry
@@ -2753,7 +2681,7 @@ class TestAdapterRegistry(unittest.TestCase):
     def test_probe_fields_initialized(self):
         from bridge.adapters import AdapterRegistry, ClaudeCodeAdapter, CodexAdapter
         reg = AdapterRegistry()
-        reg.register("claude-code", ClaudeCodeAdapter, plan_lock_acquire_fn=lambda p, s: None)
+        reg.register("claude-code", ClaudeCodeAdapter)
         reg.register("codex", CodexAdapter)
         claude = reg.get("claude-code")
         codex = reg.get("codex")
@@ -2825,7 +2753,7 @@ class TestAdapterRegistry(unittest.TestCase):
     def test_resolve_executor(self):
         from bridge.adapters import AdapterRegistry, RoleConfig, ClaudeCodeAdapter, CodexAdapter
         reg = AdapterRegistry()
-        reg.register("claude-code", ClaudeCodeAdapter, plan_lock_acquire_fn=lambda p, s: None)
+        reg.register("claude-code", ClaudeCodeAdapter)
         reg.register("codex", CodexAdapter)
         # Default: planner has dangerous_mode
         rc = RoleConfig()
@@ -2833,6 +2761,8 @@ class TestAdapterRegistry(unittest.TestCase):
         # Swapped: reviewer (claude) has dangerous_mode
         rc2 = RoleConfig(planner_tool_id="codex", reviewer_tool_id="claude-code")
         self.assertEqual(reg.resolve_executor(rc2).id, "claude-code")
+        with self.assertRaises(ValueError):
+            reg.resolve_executor(RoleConfig(planner_tool_id="codex", reviewer_tool_id="codex"))
 
 
 class TestRoleConfig(unittest.TestCase):
@@ -2858,6 +2788,20 @@ class TestRoleConfig(unittest.TestCase):
         self.assertEqual(cfg["planner_tool_id"], "codex")
         self.assertEqual(cfg["reviewer_tool_id"], "claude-code")
         store.close()
+
+    def test_invalid_persisted_config_resets_to_default(self):
+        mod = _load_bridge_module()
+        mod.init_store(":memory:")
+        mod._store.save_role_config("codex", "codex")
+        mod._load_role_config()
+        self.assertEqual(
+            mod.get_role_config(),
+            {"planner_tool_id": "claude-code", "reviewer_tool_id": "codex"},
+        )
+        self.assertEqual(
+            mod._store.load_role_config(),
+            {"planner_tool_id": "claude-code", "reviewer_tool_id": "codex"},
+        )
 
 
 # ═════════════════════════════════════════════════════════════════
@@ -2897,9 +2841,6 @@ class TestRoleSwapNegotiation(unittest.TestCase):
         if self._skip_reason:
             self.skipTest(self._skip_reason)
         subprocess.Popen = self._orig_popen
-        import bridge.plan
-        bridge.plan.snapshot_plan_files = lambda: {}
-        bridge.plan.find_new_plan_file = lambda _: ""
 
     def test_swapped_roles_consensus(self):
         """互换角色: Codex=Planner, Claude=Reviewer → 协商达成共识。"""
@@ -3004,11 +2945,11 @@ class TestExecutionSessionIsolation(unittest.TestCase):
 
 
 # ═════════════════════════════════════════════════════════════════
-# 16. 归档归一化验证 (Step 7)
+# 16. 会话历史归一化验证 (Step 7)
 # ═════════════════════════════════════════════════════════════════
 
-class TestArchiveNormalization(unittest.TestCase):
-    """旧归档 role='claude'/'codex' → API 归一化为 'planner'/'reviewer'。"""
+class TestSessionHistoryNormalization(unittest.TestCase):
+    """旧会话 history role='claude'/'codex' → 统一历史 API 归一化为 'planner'/'reviewer'。"""
 
     def test_normalize_old_roles(self):
         """旧数据 role=claude/codex 归一化为 planner/reviewer。"""
@@ -3029,7 +2970,7 @@ class TestArchiveNormalization(unittest.TestCase):
         sess.review_history = []
         mod._store.save_session(sess)
 
-        result = mod.get_archived_session_history("arch1")
+        result = mod._session_history_payload(mod.get_or_load_session("arch1", cache=False))
         # 归一化后应该是 planner/reviewer
         roles = [e["role"] for e in result["entries"]]
         self.assertIn("planner", roles)
@@ -3057,9 +2998,41 @@ class TestArchiveNormalization(unittest.TestCase):
         sess.review_history = []
         mod._store.save_session(sess)
 
-        result = mod.get_archived_session_history("arch2")
+        result = mod._session_history_payload(mod.get_or_load_session("arch2", cache=False))
         roles = [e["role"] for e in result["entries"]]
         self.assertEqual(roles, ["planner", "reviewer"])
+
+
+# ═════════════════════════════════════════════════════════════════
+# 17. 会话恢复语义验证
+# ═════════════════════════════════════════════════════════════════
+
+class TestSessionRestoreSemantics(unittest.TestCase):
+    """统一会话账本恢复时，adapter_state 必须完整往返。"""
+
+    def test_get_or_load_session_restores_adapter_state(self):
+        mod = _load_bridge_module()
+        mod.init_store(":memory:")
+        original_cfg = mod.get_role_config()
+        try:
+            mod._update_role_config("claude-code", "claude-code")
+            sess = mod.create_session("restore1", "恢复测试", "/tmp", 3)
+            sess.status = "paused"
+            sess.adapter_state[sess.planner_state_key]["has_session"] = True
+            sess.adapter_state[sess.reviewer_state_key]["has_session"] = True
+            mod._store.save_session(sess)
+
+            restored = mod.get_or_load_session("restore1", cache=False)
+            self.assertIsNotNone(restored)
+            self.assertEqual(restored.planner_state_key, "claude-code")
+            self.assertEqual(restored.reviewer_state_key, "claude-code:reviewer")
+            self.assertEqual(restored.adapter_state, sess.adapter_state)
+            self.assertTrue(restored.resume_available)
+        finally:
+            mod._update_role_config(
+                original_cfg["planner_tool_id"],
+                original_cfg["reviewer_tool_id"],
+            )
 
 
 # ═════════════════════════════════════════════════════════════════

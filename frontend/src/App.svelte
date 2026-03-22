@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte'
   import { store } from './lib/store.svelte.js'
+  import AppHeader from './components/AppHeader.svelte'
   import TabBar from './components/TabBar.svelte'
   import ControlBar from './components/ControlBar.svelte'
   import AgentPanel from './components/AgentPanel.svelte'
@@ -41,8 +42,9 @@
   }
 </script>
 
+<AppHeader onOpenPrompts={openPrompts} onOpenHistory={openHistory} />
 <TabBar />
-<ControlBar onBrowse={openBrowse} onOpenPrompts={openPrompts} onOpenHistory={openHistory} />
+<ControlBar onBrowse={openBrowse} />
 
 <div class="panels">
   <AgentPanel agent="planner" />

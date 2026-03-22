@@ -21,7 +21,10 @@ function makeState(overrides: Partial<SessionState> = {}): SessionState {
   return {
     status: 'running', round: 3, max_rounds: 5, consensus: false, consensus_round: 0,
     history_len: 6, error: null, planner_tool_id: 'claude-code', reviewer_tool_id: 'codex',
-    executor_panel: 'planner', review_round: 0, max_review_rounds: 3, ...overrides,
+    executor_panel: 'planner', review_round: 0, max_review_rounds: 3,
+    phase: 'negotiation', updated_at: null, finished_at: null,
+    interrupt_reason: null, resume_available: false,
+    ...overrides,
   }
 }
 

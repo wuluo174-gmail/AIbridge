@@ -19,6 +19,7 @@ Step 7: detect_claude_md → detect_project_context (adapter-aware)
 """
 
 import json
+import re
 from pathlib import Path
 
 from bridge.git import capture_execution_diff as _default_capture_diff
@@ -44,10 +45,133 @@ def save_prompts(data):
 
 prompt_config = load_prompts()
 
+_PROJECT_CONTEXT_CHAR_LIMIT = 2000
+_CLAUDE_BLOCKED_TOKENS = (
+    "请确认我的理解是否准确",
+    "【🫡结论】",
+    "【方案】",
+    "【反驳】",
+    "【需要澄清】",
+    "我是linus",
+    "每次回复必须",
+    "只选一个",
+)
+
+_PLANNER_FIRST_OUTPUT_CONTRACT = """## 最终输出要求（必须遵守）
+- 项目开发规范（包括 CLAUDE.md）只影响分析原则、代码品味和审查方式，不改变本轮最终输出格式。
+- 不要只输出“【结论】”、不要先请求用户确认、不要只列选项或澄清问题。
+- 直接输出一份完整的 Markdown 方案文档。
+- 文档至少包含：根因分析、数据流分析（数据从哪里来/到哪里去/中间经历了什么变换）、详细实施步骤、风险点、验证方法。
+- 如果存在不确定项，直接写入风险点或假设，不要把整份输出退化成请求补充信息。"""
+
+_PLANNER_REVISE_OUTPUT_CONTRACT = """## 最终输出要求（必须遵守）
+- 项目开发规范（包括 CLAUDE.md）只影响分析原则、代码品味和审查方式，不改变本轮最终输出格式。
+- 不要只回复“接纳/不接纳”列表，也不要只输出结论或澄清问题。
+- 先逐条回应审查反馈：对每条标记 接纳 ✓ / 部分接纳 △ / 不接纳 ✗，并说明理由。
+- 然后输出“修订后的完整方案”，并保持完整 Markdown 文档结构。
+- 修订后的完整方案至少包含：根因分析、数据流分析（数据从哪里来/到哪里去/中间经历了什么变换）、详细实施步骤、风险点、验证方法。"""
+
 
 # ═════════════════════════════════════════════════════════════════
 # Prompt Templates
 # ═════════════════════════════════════════════════════════════════
+
+
+def _clip_context(text, limit=_PROJECT_CONTEXT_CHAR_LIMIT):
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + "\n...(truncated)\n"
+
+
+def _trim_blank_lines(lines):
+    start = 0
+    end = len(lines)
+    while start < end and not lines[start].strip():
+        start += 1
+    while end > start and not lines[end - 1].strip():
+        end -= 1
+    return lines[start:end]
+
+
+def _parse_markdown_sections(text):
+    sections = []
+    stack = []
+    current_path = None
+    current_lines = []
+
+    for line in text.splitlines():
+        match = re.match(r"^(#{1,6})\s+(.*)$", line)
+        if match:
+            if current_path is not None:
+                sections.append((tuple(current_path), "\n".join(current_lines).strip()))
+            level = len(match.group(1))
+            title = match.group(2).strip()
+            stack = stack[:level - 1] + [title]
+            current_path = list(stack)
+            current_lines = []
+            continue
+        if current_path is not None:
+            current_lines.append(line)
+
+    if current_path is not None:
+        sections.append((tuple(current_path), "\n".join(current_lines).strip()))
+    return sections
+
+
+def _filter_context_body(body):
+    if not body:
+        return ""
+    kept = []
+    for line in body.splitlines():
+        stripped = line.strip()
+        if any(token in stripped for token in _CLAUDE_BLOCKED_TOKENS):
+            continue
+        kept.append(line)
+    trimmed = _trim_blank_lines(kept)
+    return "\n".join(trimmed).strip()
+
+
+def _render_context_group(title, entries):
+    if not entries:
+        return ""
+    lines = [f"### {title}"]
+    for subtitle, body in entries:
+        lines.append(f"#### {subtitle}")
+        if body:
+            lines.append(body)
+    return "\n".join(lines).strip()
+
+
+def _normalize_claude_md(content):
+    groups = {
+        "核心哲学": [],
+        "协作风格": [],
+        "思考维度": [],
+    }
+
+    for path, body in _parse_markdown_sections(content):
+        cleaned = _filter_context_body(body)
+        if len(path) >= 2 and path[-2] == "核心哲学":
+            groups["核心哲学"].append((path[-1], cleaned))
+        elif len(path) >= 2 and path[-2] == "沟通协作原则" and path[-1] == "基础交流规范":
+            groups["协作风格"].append((path[-1], cleaned))
+        elif len(path) >= 2 and path[-2] == "需求确认流程" and path[-1].startswith("2. 思考维度分析"):
+            groups["思考维度"].append((path[-1], cleaned))
+
+    parts = [
+        "以下内容只保留分析原则、协作风格和思考维度；已过滤固定输出模板、确认流程和验证口令。",
+    ]
+    for group_name in ("核心哲学", "协作风格", "思考维度"):
+        section = _render_context_group(group_name, groups[group_name])
+        if section:
+            parts.append(section)
+    return "\n\n".join(part for part in parts if part).strip()
+
+
+def _normalize_context_file(filename, content):
+    if filename == "CLAUDE.md":
+        return _normalize_claude_md(content)
+    return content.strip()
 
 def detect_project_context(cwd, adapter=None):
     """检测项目上下文文件。
@@ -59,13 +183,19 @@ def detect_project_context(cwd, adapter=None):
     for filename in filenames:
         p = Path(cwd) / filename
         if p.exists():
-            content = p.read_text(encoding="utf-8")[:2000]
-            context += f"\n\n## 项目开发规范 ({filename})\n{content}"
+            raw = p.read_text(encoding="utf-8")
+            content = _clip_context(_normalize_context_file(filename, raw))
+            if content:
+                context += f"\n\n## 项目开发规范 ({filename})\n{content}"
     return context
 
 
 # 向后兼容别名
 detect_claude_md = detect_project_context
+
+
+def _join_prompt_sections(*sections):
+    return "\n\n".join(s.strip() for s in sections if s and s.strip())
 
 
 def build_claude_first_prompt(task, cwd, planner_name="Claude Code",
@@ -83,7 +213,7 @@ def build_claude_first_prompt(task, cwd, planner_name="Claude Code",
         body = tpl.format(task=task, planner_name=planner_name)
     except KeyError:
         body = tpl.format(task=task)
-    return f"{context}\n\n{body}"
+    return _join_prompt_sections(context, body, _PLANNER_FIRST_OUTPUT_CONTRACT)
 
 
 def collect_user_injects(history):
@@ -98,8 +228,14 @@ def collect_user_injects(history):
     return injects
 
 
-def build_claude_revise_prompt(codex_feedback, user_injects=None):
+def build_claude_revise_prompt(codex_feedback, user_injects=None, cwd=None,
+                               _detect_context=None, _adapter=None):
     """构建 Planner 修订提示。"""
+    context = ""
+    if cwd:
+        if _detect_context is None:
+            _detect_context = detect_project_context
+        context = _detect_context(cwd, _adapter)
     inject_section = ""
     if user_injects:
         joined = "\n".join(f"- {m}" for m in user_injects)
@@ -107,7 +243,8 @@ def build_claude_revise_prompt(codex_feedback, user_injects=None):
         inject_section = f"\n\n## {label}\n{joined}"
     tpl = prompt_config.get("claude_revise",
         "以上是你之前的方案。\n\n## 审查者反馈\n{codex_feedback}{inject_section}\n\n请修订方案。")
-    return tpl.format(codex_feedback=codex_feedback, inject_section=inject_section)
+    body = tpl.format(codex_feedback=codex_feedback, inject_section=inject_section)
+    return _join_prompt_sections(context, body, _PLANNER_REVISE_OUTPUT_CONTRACT)
 
 
 def build_codex_first_prompt(task, claude_plan):

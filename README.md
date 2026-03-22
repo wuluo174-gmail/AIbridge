@@ -96,9 +96,9 @@ Both CLIs maintain persistent conversations across rounds:
 
 Each round only sends the other agent's latest reply — no history re-injection.
 
-### Reliable Plan File Association
+### Canonical Planner Output
 
-Claude Code's plan-mode output is associated via snapshot-diff: snapshot `~/.claude/plans/` before each call, diff after to find new files. Concurrent negotiations never cross-contaminate.
+Claude Code's canonical planning output is the final `result` text returned by headless `--output-format stream-json`. Bridge writes that text directly into session history and passes it to the reviewer and executor unchanged.
 
 ---
 
@@ -179,7 +179,9 @@ python3 bridge.py --port 9090
 
 **人工干预** — 协商过程中在 UI 底部输入意见，下一轮会以「用户约束（必须优先考虑）」的形式同时发给双方。
 
-**Plan 文件可靠关联** — Claude Code 在 plan 模式下生成的计划文档通过快照差集方案关联，多个协商并发时不会抓错。
+**Planner 输出唯一来源** — Claude Code 在 headless plan 模式下的 canonical 输出就是 `stream-json` 的最终 `result` 文本。Bridge 直接把它写入会话历史并传给审查者/执行者，不再依赖 `~/.claude/plans/` 文件差集。
+
+**项目规范净化注入** — `CLAUDE.md` 不再原样塞进 Planner prompt。Bridge 会先提炼其中的分析原则、协作风格和思考维度，再注入到每轮 Planner 提示词，过滤掉“结论模板”“固定开头”“确认流程”这类输出壳子指令。
 
 **提示词可配置** — 通过 UI 的「提示词」按钮实时编辑 8 个阶段的提示词模板，保存到 `prompts.json`。
 

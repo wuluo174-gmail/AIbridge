@@ -32,14 +32,43 @@
   })
 
   let el: HTMLDivElement | undefined = $state()
+  let followTail = $state(true)
+  let previousLength = $state(0)
+
+  const FOLLOW_THRESHOLD_PX = 120
+
+  function distanceFromBottom(node: HTMLDivElement): number {
+    return node.scrollHeight - node.scrollTop - node.clientHeight
+  }
+
+  function nearBottom(node: HTMLDivElement): boolean {
+    return distanceFromBottom(node) <= FOLLOW_THRESHOLD_PX
+  }
+
+  function onScroll() {
+    if (!el) return
+    followTail = nearBottom(el)
+  }
 
   $effect(() => {
     void entries.length
-    if (el) el.scrollTop = el.scrollHeight
+    if (!el) return
+    const hasNewEntries = entries.length > previousLength
+    previousLength = entries.length
+    if (hasNewEntries && active && followTail) {
+      el.scrollTop = el.scrollHeight
+    }
+  })
+
+  $effect(() => {
+    if (!el) return
+    if (active && followTail) {
+      el.scrollTop = el.scrollHeight
+    }
   })
 </script>
 
-<div class="term tab-pane" class:active bind:this={el}>
+<div class="term tab-pane" class:active bind:this={el} onscroll={onScroll}>
   {#each renderItems as item}
     {#if item.kind === 'text'}
       {item.text}

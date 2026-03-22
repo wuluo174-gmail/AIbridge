@@ -34,7 +34,7 @@ class AdapterRegistry:
     - register(): 注册 adapter 类 + DI 依赖，不立即实例化
     - get(): 懒实例化 + 缓存 + 线程安全
     - discover(): 返回所有工具信息（含 agent_name、安装状态、能力矩阵）
-    - resolve_executor(): 返回具有 dangerous_mode 能力的 adapter
+    - resolve_executor(): 返回具有 dangerous_mode 能力的 adapter；若不存在则直接报错
     """
 
     def __init__(self):
@@ -85,4 +85,7 @@ class AdapterRegistry:
             a = self.get(tid)
             if a.capabilities.get("dangerous_mode"):
                 return a
-        return self.get(role_config.planner_tool_id)  # fallback
+        raise ValueError(
+            "角色配置缺少支持执行模式的工具: "
+            f"{role_config.planner_tool_id}, {role_config.reviewer_tool_id}"
+        )

@@ -11,4 +11,4 @@ libc = "0.2"
 tauri-plugin-window-state = "2"
 
 [build-dependencies]
-tauri-build = "2"
+tauri-build = { version = "2", features = [] }

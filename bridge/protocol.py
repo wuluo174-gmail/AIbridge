@@ -14,7 +14,7 @@ import re
 
 
 # ═════════════════════════════════════════════════════════════════
-# 状态枚举 (9 种) — bridge.py L1891
+# 状态枚举 (13 种) — bridge.py / server.py / frontend 类型共享
 # ═════════════════════════════════════════════════════════════════
 
 STATES = frozenset({
@@ -26,6 +26,9 @@ STATES = frozenset({
     "review_pending",
     "review_fix",
     "review_max_rounds",
+    "paused",
+    "interrupted",
+    "aborted",
     "done",
     "error",
 })
@@ -42,8 +45,11 @@ CONTINUABLE_STATES = frozenset({"consensus", "max_rounds"})
 REVIEW_CONTINUABLE_STATES = frozenset({"review_max_rounds"})
 REVIEW_SKIPPABLE_STATES = frozenset({"review_fix", "review_max_rounds"})
 
-# 终态 (轮询停止)
-TERMINAL_STATES = frozenset({"idle", "done", "error"})
+# 可恢复中断态
+RESUMABLE_STATES = frozenset({"paused", "interrupted"})
+
+# 真正终态
+TERMINAL_STATES = frozenset({"idle", "aborted", "done", "error"})
 
 
 # ═════════════════════════════════════════════════════════════════
@@ -67,7 +73,7 @@ def is_closure(text):
 
 
 # ═════════════════════════════════════════════════════════════════
-# 事件类型 (20 种) — bridge.py add_event() 调用 + 前端 handle(e)
+# 事件类型 (21 种) — bridge.py add_event() 调用 + 前端 handle(e)
 # ═════════════════════════════════════════════════════════════════
 
 EVENT_TYPES = frozenset({
@@ -135,8 +141,6 @@ GET_ENDPOINTS = (
     "/api/complete",        # 路径补全
     "/api/recent_paths",    # 最近路径
     "/api/prompts",         # 提示词配置
-    "/api/archived_sessions",         # 已归档会话列表
-    "/api/archived_session_history",  # 已归档会话详细历史
     "/api/tools",           # Step 7: 已注册工具列表
     "/api/role_config",     # Step 7: 角色配置
 )
@@ -144,12 +148,14 @@ GET_ENDPOINTS = (
 POST_ENDPOINTS = (
     "/api/start",           # 启动协商
     "/api/execute",         # 触发执行
+    "/api/pause",           # 中断/暂停
     "/api/stop",            # 停止
     "/api/review_fix",      # 确认修复
     "/api/review_skip",     # 跳过修复
     "/api/review_continue", # 继续审查
     "/api/prompts",         # 更新提示词
     "/api/inject",          # 注入反馈
+    "/api/resume",          # 恢复中断/暂停会话
     "/api/continue",        # 继续协商
     "/api/role_config",     # Step 7: 更新角色配置
 )
@@ -164,6 +170,8 @@ STATE_RESPONSE_KEYS = frozenset({
     "consensus_round", "history_len", "error",
     "planner_tool_id", "reviewer_tool_id", "executor_panel",
     "review_round", "max_review_rounds",
+    "phase", "updated_at", "finished_at", "interrupt_reason",
+    "resume_available",
 })
 
 HISTORY_RESPONSE_KEYS = frozenset({
@@ -176,7 +184,11 @@ EVENTS_RESPONSE_KEYS = frozenset({"events", "next"})
 SESSIONS_RESPONSE_KEYS = frozenset({"sessions"})
 
 SESSION_LISTING_KEYS = frozenset({
-    "session_id", "task", "project_path", "status", "round", "max_rounds",
+    "session_id", "task", "project_path", "status", "phase",
+    "round", "max_rounds", "updated_at", "finished_at",
+    "interrupt_reason", "resume_available",
+    "planner_tool_id", "reviewer_tool_id",
+    "consensus", "consensus_round", "created_at",
 })
 
 BROWSE_RESPONSE_KEYS = frozenset({
@@ -188,21 +200,6 @@ COMPLETE_RESPONSE_KEYS = frozenset({"suggestions"})
 RECENT_PATHS_RESPONSE_KEYS = frozenset({"paths"})
 
 START_RESPONSE_KEYS = frozenset({"ok", "session_id"})
-
-ARCHIVED_SESSIONS_RESPONSE_KEYS = frozenset({"sessions"})
-
-ARCHIVED_SESSION_LISTING_KEYS = frozenset({
-    "session_id", "task", "project_path", "final_status",
-    "current_round", "max_rounds", "consensus", "consensus_round",
-    "planner_tool_id", "reviewer_tool_id",
-    "created_at", "finished_at",
-})
-
-ARCHIVED_HISTORY_RESPONSE_KEYS = frozenset({
-    "entries", "execution_result", "review_entries",
-    "review_round", "review_status", "event_cursor",
-    "planner_tool_id", "reviewer_tool_id",
-})
 
 # Step 7: 工具/角色配置响应键
 TOOLS_RESPONSE_KEYS = frozenset({"tools"})

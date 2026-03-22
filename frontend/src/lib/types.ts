@@ -4,17 +4,19 @@
 
 export type AgentPanel = 'planner' | 'reviewer'
 
-// 9 session states (protocol.py L20-30)
+// Session states (protocol.py)
 export type SessionStatus =
   | 'idle' | 'running' | 'consensus' | 'max_rounds'
   | 'executing' | 'review_pending' | 'review_fix' | 'review_max_rounds'
+  | 'paused' | 'interrupted' | 'aborted'
   | 'done' | 'error'
 
-export const TERMINAL_STATES: ReadonlySet<SessionStatus> = new Set(['idle', 'done', 'error'])
+export const RESUMABLE_STATES: ReadonlySet<SessionStatus> = new Set(['paused', 'interrupted'])
+export const TERMINAL_STATES: ReadonlySet<SessionStatus> = new Set(['idle', 'aborted', 'done', 'error'])
 export const EXECUTABLE_STATES: ReadonlySet<SessionStatus> = new Set(['consensus', 'max_rounds'])
 export const CONTINUABLE_STATES: ReadonlySet<SessionStatus> = new Set(['consensus', 'max_rounds'])
 
-// 20 event types — discriminated union (protocol.py L61-87, L211-232)
+// 21 event types — discriminated union (protocol.py L61-87, L211-232)
 export type BridgeEvent =
   | { type: 'status_change'; data: { status: string; msg: string; msg_key?: string; msg_params?: Record<string, string | number> } }
   | { type: 'round_start'; data: { round: number; max: number } }
@@ -79,6 +81,11 @@ export interface SessionState {
   executor_panel: AgentPanel
   review_round: number
   max_review_rounds: number
+  phase: string
+  updated_at: string | null
+  finished_at: string | null
+  interrupt_reason: string | null
+  resume_available: boolean
 }
 
 export interface HistoryEntry {
@@ -183,6 +190,9 @@ export function createEmptyState(): AppState {
       planner_tool_id: 'claude-code', reviewer_tool_id: 'codex',
       executor_panel: 'planner',
       review_round: 0, max_review_rounds: 3,
+      phase: 'negotiation',
+      updated_at: null, finished_at: null,
+      interrupt_reason: null, resume_available: false,
     },
     logs: { planner: [], reviewer: [] },
     versions: { planner: [], reviewer: [] },
@@ -211,28 +221,21 @@ export interface TabData {
   injectValue: string
 }
 
-export interface ArchivedSession {
+export interface SessionSummary {
   session_id: string
   task: string
   project_path: string
-  final_status: string
-  current_round: number
+  status: SessionStatus
+  phase: string
+  round: number
   max_rounds: number
   consensus: boolean
   consensus_round: number
   planner_tool_id: string
   reviewer_tool_id: string
   created_at: string
-  finished_at: string
-}
-
-export interface ArchivedHistoryResponse {
-  entries: HistoryEntry[]
-  execution_result: string | null
-  review_entries: ReviewEntry[]
-  review_round: number
-  review_status: { status: string; round: number } | null
-  event_cursor: number
-  planner_tool_id: string
-  reviewer_tool_id: string
+  updated_at: string
+  finished_at: string | null
+  interrupt_reason: string | null
+  resume_available: boolean
 }

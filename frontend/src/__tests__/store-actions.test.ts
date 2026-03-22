@@ -29,6 +29,9 @@ async function setupSession(status: string = 'consensus') {
       history_len: 6, error: null,
       planner_tool_id: 'claude-code', reviewer_tool_id: 'codex',
       executor_panel: 'planner',
+      review_round: 0, max_review_rounds: 3,
+      phase: 'negotiation', updated_at: null, finished_at: null,
+      interrupt_reason: null, resume_available: false,
     })
   await vi.advanceTimersByTimeAsync(350)
 }
@@ -73,6 +76,9 @@ describe('doExec confirm flow', () => {
           history_len: 2, error: null,
           planner_tool_id: 'claude-code', reviewer_tool_id: 'codex',
           executor_panel: 'planner',
+          review_round: 0, max_review_rounds: 3,
+          phase: 'negotiation', updated_at: null, finished_at: null,
+          interrupt_reason: null, resume_available: false,
         })
       await vi.advanceTimersByTimeAsync(350)
       return true

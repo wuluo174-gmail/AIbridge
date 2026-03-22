@@ -81,15 +81,20 @@ Bridge 是一个轻量级 vibe coding 辅助工具，聚焦于 CLI 编排。核�
 ### F9: 会话历史持久化
 
 - **可持久化**:
-  - 已完成会话快照 (task, project_path, history, review_history, execution_result, 终态)
+  - 统一会话账本 (`sessions`, `session_events`, `session_history`, `review_history`)
+  - 会话全生命周期快照 (task, project_path, status, phase, round, execution_result, interrupt_reason, adapter_state_json)
   - 提示词模板配置
   - 最近项目路径
   - CLI 工具注册信息
 - **不可持久化** (纯内存运行态):
-  - stop_flag, active_proc, event_lock
-  - claude_session_id, claude_has_session, codex_has_session
+  - stop_flag, active_proc, active_pgid, event_lock, status_lock
   - exec_baseline_ref, exec_baseline_untracked
-  - **重启后活动会话无法续接**，只能查看已完成的历史
+  - 具体线程 / 锁 / 子进程对象本身
+  - **重启后运行中的进程不会续跑**，但活动会话会标记为 `interrupted`，可基于账本重新打开或恢复
+
+- **说明**:
+  - `adapter_state_json` 属于可持久化逻辑状态，不属于纯内存运行态
+  - 不再区分“活动会话”和“归档会话”两套数据真相；历史视图直接读取统一会话账本
 
 ### F10: 项目管理
 
@@ -109,7 +114,7 @@ Bridge 是一个轻量级 vibe coding 辅助工具，聚焦于 CLI 编排。核�
 **以下每一项都是后续迁移步骤的验收标准。** 每个 Step 完成后必须验证相关项未丢失。
 
 ### NR-1: 状态机完整性
-- [ ] 所有 9 种状态可达: idle, running, consensus, max_rounds, executing, review_pending, review_fix, done, error
+- [ ] 所有 13 种状态可达: idle, running, consensus, max_rounds, executing, review_pending, review_fix, review_max_rounds, paused, interrupted, aborted, done, error
 - [ ] 原子 CAS 状态迁移 (status_lock 保护)
 - [ ] 执行仅从 consensus/max_rounds 触发
 - [ ] review_fix 仅从 review_pending 触发
@@ -120,7 +125,8 @@ Bridge 是一个轻量级 vibe coding 辅助工具，聚焦于 CLI 编排。核�
 - [ ] 事件流隔离 (sess.events + sess.event_lock)
 - [ ] subprocess 隔离 (sess.active_proc)
 - [ ] 日志隔离 (/tmp/bridge-logs/{sid}/)
-- [ ] 每会话独立 claude_session_id
+- [ ] 每会话独立 adapter_state 命名空间
+- [ ] 同工具双角色时使用不同 state_key 隔离会话 (如 `claude-code` / `claude-code:reviewer`)
 
 ### NR-3: 协商引擎
 - [ ] Claude → Codex 交替，每轮一问一答
@@ -134,8 +140,8 @@ Bridge 是一个轻量级 vibe coding 辅助工具，聚焦于 CLI 编排。核�
 ### NR-4: 会话绑定
 - [ ] Claude: --session-id (首次) / --resume (续接)，不用 -c
 - [ ] Codex: resume --last
-- [ ] claude_session_id 创建时生成 (uuid4)，全程绑定
-- [ ] claude_has_session / codex_has_session 标记首次调用后置 True
+- [ ] 对支持 session_resume 的工具，adapter_state[state_key].session_id 创建时生成并全程绑定
+- [ ] 首次成功调用后，adapter_state[state_key].has_session 置为 True
 
 ### NR-5: 用户反馈注入
 - [ ] /api/inject 非 consensus 状态下可注入
@@ -157,11 +163,11 @@ Bridge 是一个轻量级 vibe coding 辅助工具，聚焦于 CLI 编排。核�
 - [ ] /api/review_skip 跳过修复 → done
 - [ ] 每轮修复结果更新 sess.execution_result
 
-### NR-8: Plan 文件归属
-- [ ] 快照 ~/.claude/plans/ before/after (snapshot_plan_files)
-- [ ] 关键词校验防止外部 Claude 污染 (validate_plan_relevance)
-- [ ] plan_file_lock 序列化 plan-mode 调用
-- [ ] 不相关 plan 文件触发 warning 事件
+### NR-8: Planner 输出源
+- [ ] Claude 协商阶段的 canonical 输出来自 headless `stream-json` 的最终 `result` 文本
+- [ ] Planner 输出直接写入 `sess.history[].content`，供 Reviewer / Executor 复用
+- [ ] 不依赖 `~/.claude/plans/`、快照差集、关键词校验或 plan_file_lock
+- [ ] 通过 prompt 约束保证 Planner 输出完整 Markdown 方案文档，而不是结论/选项/澄清请求
 
 ### NR-9: 提示词热更新
 - [ ] 11 个键全覆盖 (详见 PROTOCOL.md §4)
@@ -180,10 +186,10 @@ Bridge 是一个轻量级 vibe coding 辅助工具，聚焦于 CLI 编排。核�
 - [ ] 最近路径 (≤10 条)
 - [ ] 页面刷新恢复 (URL ?sid=xxx + /api/state + /api/history)
 - [ ] 提示词编辑器 modal (11 个字段)
-- [ ] 状态 pill 文本和颜色与 9 种状态一一对应
+- [ ] 状态 pill 文本和颜色与 13 种状态一一对应
 
 ### NR-11: 事件协议
-- [ ] 20 种事件类型全覆盖 (详见 PROTOCOL.md §2.2)
+- [ ] 21 种事件类型全覆盖 (详见 PROTOCOL.md §2.2)
 - [ ] add_event 产出 {id, type, data, ts} 结构
 - [ ] add_history_event 原子追加 history + 发送事件
 - [ ] cli_start 事件发出 (即使前端未处理)
@@ -196,6 +202,6 @@ Bridge 是一个轻量级 vibe coding 辅助工具，聚焦于 CLI 编排。核�
 | 层 | 决策 | 状态 | 说明 |
 |----|------|------|------|
 | 桌面壳 | **Tauri v2** | Step 8A: macOS POC 已实施 | Python via `/bin/zsh -c` 启动，进程组级清理，系统托盘 |
-| 前端 | **Svelte 5 + TypeScript** | 已实施 | frontend/ 独立 Vite 项目；server.py 保留 HTML_UI 冻结快照作为无构建环境降级 |
+| 前端 | **Svelte 5 + TypeScript** | 已实施 | frontend/ 独立 Vite 项目；无 dist 时 server.py 仅返回构建引导页 |
 | 持久化 | **Python sqlite3** | 已实施 (Step 6) | 标准库零依赖 |
 | 移动端 | 待选 (Tauri v2 Mobile / RN / Flutter) | Step 10 范围 | daemon + remote client 架构 |
