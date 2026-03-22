@@ -1,207 +1,272 @@
-# Bridge 需求文档 / Requirements Specification
+# Bridge 需求文档
 
 ## 1. 产品定位
 
-Bridge 是一个轻量级 vibe coding 辅助工具，聚焦于 CLI 编排。核心价值：让多个 AI CLI 工具以对抗式审查的方式协作，产出比单个工具更高质量的代码方案。
+Bridge 是一个 AI CLI 编排器，不是通用 IDE。
 
-- **不是**通用 IDE —— 不提供代码编辑器、文件树、终端等传统 IDE 功能
-- **是** CLI 编排器 —— 管理 CLI 工具的安装、认证、角色分配、执行和审查循环
-- **依赖** CLI 工具自身的开发能力 —— Bridge 只做编排，不自己写代码
+它的职责是：
 
-## 2. 用户角色
+- 组织多个 CLI 工具按固定四角色工作流协商、执行、校验
+- 提供统一账本、统一恢复、统一输入与双模式视图
+- 让专业用户和非专业用户都能在同一事实流上工作
 
-| 角色 | 环境 | 能力 |
-|------|------|------|
-| 桌面端开发者 | macOS (Step 8A POC) / Linux (POSIX 延伸) / Windows (待实现) | 完整功能：协商、执行、审查、历史、配置 |
-| 移动端监控者 | iOS / Android | 远程查看会话状态、发送反馈注入、触发执行/停止；**不运行 CLI** |
+它不负责：
 
-## 3. 功能模块
+- 文件树
+- 代码编辑器
+- 真 PTY 透传
+- 多角色任意图编排
 
-### F1: CLI 工具管理
+但是，和旧版本不同，Bridge v4 明确提供角色终端工作台。
+这不意味着它变成 IDE，而是说明“角色终端”已经是编排体验本身的一部分。
 
-- **安装检测**: 检查 CLI 工具是否已安装 (`which <tool>`)
-- **认证能力矩阵** (非统一接口，按工具区分):
-  - 可检测安装 / 可检测认证 / 可触发认证 / 仅手工配置
-  - 每个工具的认证方式不同 (browser OAuth, API key 环境变量, 配置文件等)
-  - 当前代码唯一的认证相关逻辑是 FileNotFoundError 报错，所有工具的认证检测均为**待验证**
-- **版本检测**: 获取已安装版本号
-- **能力声明**: 每个工具通过 capability matrix 声明自己支持的功能
+## 2. 核心用户
 
-### F2: 角色配置
+### 2.1 专业用户
 
-- 生成者 (Planner) / 评审者 (Reviewer) 角色可配置
-- 任何已安装的 CLI 工具都可以被分配到任一角色
-- 角色分配保存在持久化存储中
-- 当前默认: Claude Code = Planner, Codex = Reviewer
+需要：
 
-### F3: 协商引擎
+- 看见各角色实时过程
+- 直接对当前角色/当前阶段输入约束
+- 用命令驱动暂停、继续、执行、修复
 
-- 对抗式审查循环: Planner 出方案 → Reviewer 审查 → Planner 修订 → ...
-- 可配置最大轮数
-- 共识检测 (APPROVED) + 收口检测 (任务收口成功)
-- 共识后可带理由驳回继续
-- 续接失败自动回退到最后完整轮次
+对应视图：`terminal`
 
-### F4: 执行引擎
+### 2.2 非专业用户
 
-- 获得共识 (APPROVED) 或达到最大轮次后可触发执行
-- 执行前 Git baseline 捕获 (stash create + untracked snapshot)
-- 执行使用 --dangerously-skip-permissions 模式
+需要：
 
-### F5: 执行后审查
+- 像看两个或多个 agent 对话一样理解流程
+- 不必理解终端细节
+- 仍能在关键节点插入约束或控制动作
 
-- 执行完成后自动触发 Reviewer 审查 (带 git diff)
-- "任务收口成功" → done
-- 发现问题 → 等待用户确认修复
-- Claude 修复 → Codex 再评审，最多 3 轮
-- 用户可跳过修复
+对应视图：`scene`
 
-### F6: 实时流式展示
+## 3. 固定工作流模板
 
-- 双面板 (Planner / Reviewer)
-- 每面板 Process tab (实时流) + Result tab (版本化结果)
-- Result tab 版本历史 (R1/R2/R3... 按钮)
-- agent_thinking 时自动切到对应面板
-- MCP stderr 噪音淡化显示
-- Codex 命令输出可折叠
+当前版本固定四个逻辑角色：
 
-### F7: 用户反馈注入
+- `planner`
+- `reviewer`
+- `executor`
+- `validator`
 
-- 协商过程中可随时注入反馈
-- 注入内容同时影响 Planner 修订提示和 Reviewer 审查提示
-- 共识状态下禁止注入 (应使用"继续协商"并附带理由)
+支持三种绑定形态：
 
-### F8: 提示词管理
+1. 单工具包办四角
+2. 双工具对抗分工
+3. 四角色多工具独立分工
 
-- 11 个可配置模板 (详见 PROTOCOL.md §4)
-- 实时热更新 + 持久化
-- 自动检测项目 CLAUDE.md 注入首轮提示
-- 未来: 支持按工具覆盖 (不同 Planner/Reviewer 使用不同提示模板)
+固定模板流程：
 
-### F9: 会话历史持久化
+1. planner 产出方案
+2. reviewer 审查方案
+3. 达成可执行状态后 executor 执行
+4. validator 校验是否收口
+5. 如未收口，executor 修复，validator 复检
 
-- **可持久化**:
-  - 统一会话账本 (`sessions`, `session_events`, `session_history`, `review_history`)
-  - 会话全生命周期快照 (task, project_path, status, phase, round, execution_result, interrupt_reason, adapter_state_json)
-  - 提示词模板配置
-  - 最近项目路径
-  - CLI 工具注册信息
-- **不可持久化** (纯内存运行态):
-  - stop_flag, active_proc, active_pgid, event_lock, status_lock
-  - exec_baseline_ref, exec_baseline_untracked
-  - 具体线程 / 锁 / 子进程对象本身
-  - **重启后运行中的进程不会续跑**，但活动会话会标记为 `interrupted`，可基于账本重新打开或恢复
+## 4. 必须满足的基础约束
 
-- **说明**:
-  - `adapter_state_json` 属于可持久化逻辑状态，不属于纯内存运行态
-  - 不再区分“活动会话”和“归档会话”两套数据真相；历史视图直接读取统一会话账本
+### R1. 数据真相必须统一
 
-### F10: 项目管理
+系统的业务真相只能来自：
 
-- 路径浏览器 (目录导航 + git 仓库检测 + 搜索跳转)
-- 路径自动补全 (≤15 条建议)
-- 最近项目路径 (≤10 条)
+- `sessions`
+- `workflow_roles`
+- `role_lanes`
+- `role_events`
+- `artifacts`
+- `interventions`
 
-### F11: 移动端远程控制
+禁止：
 
-- 架构: 桌面 daemon + 远程 client (非同一 app 跨平台编译)
-- 详见 MOBILE_DESIGN.md
+- 从日志推导 artifact
+- 从 artifact 反推事件
+- 从前端局部状态反推业务状态
 
----
+### R2. 用户输入必须是一等公民
 
-## 4. 现有行为不回归 Checklist (No-Regression)
+用户输入不能再混进 history 尾部连续 user 项。
 
-**以下每一项都是后续迁移步骤的验收标准。** 每个 Step 完成后必须验证相关项未丢失。
+必须：
 
-### NR-1: 状态机完整性
-- [ ] 所有 13 种状态可达: idle, running, consensus, max_rounds, executing, review_pending, review_fix, review_max_rounds, paused, interrupted, aborted, done, error
-- [ ] 原子 CAS 状态迁移 (status_lock 保护)
-- [ ] 执行仅从 consensus/max_rounds 触发
-- [ ] review_fix 仅从 review_pending 触发
-- [ ] UI 按钮可用性与状态严格对应 (L1886-1903)
+- 独立持久化为 `intervention`
+- 有明确生命周期
+- 刷新后仍能恢复
+- 能回答“谁在什么时候输入了什么，被谁消费了”
 
-### NR-2: 多会话隔离
-- [ ] 每个 Tab 独立 SessionState (sessions dict + sessions_lock)
-- [ ] 事件流隔离 (sess.events + sess.event_lock)
-- [ ] subprocess 隔离 (sess.active_proc)
-- [ ] 日志隔离 (/tmp/bridge-logs/{sid}/)
-- [ ] 每会话独立 adapter_state 命名空间
-- [ ] 同工具双角色时使用不同 state_key 隔离会话 (如 `claude-code` / `claude-code:reviewer`)
+### R3. 双模式必须共享同一账本
 
-### NR-3: 协商引擎
-- [ ] Claude → Codex 交替，每轮一问一答
-- [ ] 首轮 first prompt, 后续 revise/review prompt
-- [ ] is_approved() 检测: 首行首词 APPROVED (大小写不敏感)
-- [ ] 共识后带理由继续 (POST /api/continue + message)
-- [ ] max_rounds 后追加轮次继续
-- [ ] 续接失败回退到 last_complete_round (裁剪 history, 恢复 current_round, max_rounds)
-- [ ] 每轮只发送对方最新回复 (不重发全部历史)
+`terminal` 和 `scene` 必须只是不同投影。
 
-### NR-4: 会话绑定
-- [ ] Claude: --session-id (首次) / --resume (续接)，不用 -c
-- [ ] Codex: resume --last
-- [ ] 对支持 session_resume 的工具，adapter_state[state_key].session_id 创建时生成并全程绑定
-- [ ] 首次成功调用后，adapter_state[state_key].has_session 置为 True
+禁止：
 
-### NR-5: 用户反馈注入
-- [ ] /api/inject 非 consensus 状态下可注入
-- [ ] 注入存入 history (role=user)
-- [ ] collect_user_injects() 从 history 末尾收集连续 user 条目
-- [ ] 注入分别进入 Claude 修订提示和 Codex 审查提示
+- 一种模式一套状态树
+- 一种模式一套独立 API
+- 一种模式直接读日志，另一种模式直接读结果
 
-### NR-6: 执行阶段
-- [ ] --dangerously-skip-permissions 执行
-- [ ] Git baseline 捕获 (stash create / HEAD + untracked)
-- [ ] 执行后自动触发 run_first_review
-- [ ] 执行结果存入 sess.execution_result
+### R4. 角色模型必须显式化
 
-### NR-7: 执行后审查/修复
-- [ ] Codex 审查带 git diff (capture_execution_diff, 15KB 截断)
-- [ ] "任务收口成功" 首行检测 → done
-- [ ] 问题 → review_fix 状态, 等待确认
-- [ ] 修复循环最多 max_review_rounds=3
-- [ ] /api/review_skip 跳过修复 → done
-- [ ] 每轮修复结果更新 sess.execution_result
+禁止：
 
-### NR-8: Planner 输出源
-- [ ] Claude 协商阶段的 canonical 输出来自 headless `stream-json` 的最终 `result` 文本
-- [ ] Planner 输出直接写入 `sess.history[].content`，供 Reviewer / Executor 复用
-- [ ] 不依赖 `~/.claude/plans/`、快照差集、关键词校验或 plan_file_lock
-- [ ] 通过 prompt 约束保证 Planner 输出完整 Markdown 方案文档，而不是结论/选项/澄清请求
+- 只存 `planner_tool_id / reviewer_tool_id`
+- 再由后端临时推导 executor/validator
 
-### NR-9: 提示词热更新
-- [ ] 11 个键全覆盖 (详见 PROTOCOL.md §4)
-- [ ] POST /api/prompts 实时更新 + 持久化到 prompts.json
-- [ ] detect_claude_md() 自动读取项目 CLAUDE.md (前 2000 字符)
+必须：
 
-### NR-10: 前端行为
-- [ ] 双面板各有 Process/Result tab
-- [ ] 版本历史 R1/R2/R3... 按钮
-- [ ] 执行结果独立 "执行结果" tab
-- [ ] agent_thinking 自动切 tab
-- [ ] MCP stderr 淡化 (is_mcp 样式)
-- [ ] Codex command_output 可折叠 (collapsible + chunk_boundary 关闭)
-- [ ] 路径浏览器 (目录导航 + git 检测 badge + 搜索)
-- [ ] 路径自动补全 (≤15 条)
-- [ ] 最近路径 (≤10 条)
-- [ ] 页面刷新恢复 (URL ?sid=xxx + /api/state + /api/history)
-- [ ] 提示词编辑器 modal (11 个字段)
-- [ ] 状态 pill 文本和颜色与 13 种状态一一对应
+- 四角色都显式出现在 workflow config 中
+- 同一工具绑定多个角色时仍保持 lane 隔离
 
-### NR-11: 事件协议
-- [ ] 21 种事件类型全覆盖 (详见 PROTOCOL.md §2.2)
-- [ ] add_event 产出 {id, type, data, ts} 结构
-- [ ] add_history_event 原子追加 history + 发送事件
-- [ ] cli_start 事件发出 (即使前端未处理)
-- [ ] agent_result 事件发出 (即使前端 case 为空 break)
+## 5. 功能需求
 
----
+### F1. 工具注册与能力发现
 
-## 5. 候选技术方案与取舍
+系统必须提供：
 
-| 层 | 决策 | 状态 | 说明 |
-|----|------|------|------|
-| 桌面壳 | **Tauri v2** | Step 8A: macOS POC 已实施 | Python via `/bin/zsh -c` 启动，进程组级清理，系统托盘 |
-| 前端 | **Svelte 5 + TypeScript** | 已实施 | frontend/ 独立 Vite 项目；无 dist 时 server.py 仅返回构建引导页 |
-| 持久化 | **Python sqlite3** | 已实施 (Step 6) | 标准库零依赖 |
-| 移动端 | 待选 (Tauri v2 Mobile / RN / Flutter) | Step 10 范围 | daemon + remote client 架构 |
+- 工具探测
+- 版本信息
+- 能力矩阵
+- 是否已安装
+
+工具列表通过 `/api/tools` 统一暴露。
+
+### F2. 工作流配置
+
+系统必须提供：
+
+- `view_mode`
+- `workflow_template`
+- `max_rounds`
+- `max_review_rounds`
+- `roles[]`
+
+配置通过 `/api/workflow_config` 读写。
+
+### F3. 协商引擎
+
+系统必须支持：
+
+- planner/reviewer 多轮协商
+- 共识达成
+- 达到最大协商轮次
+- 带理由继续协商
+
+### F4. 执行引擎
+
+系统必须支持：
+
+- 从 `consensus` / `max_rounds` 进入执行
+- executor 读取最终 `plan` artifact
+- 产生 `execution_summary` artifact
+
+### F5. 校验与修复闭环
+
+系统必须支持：
+
+- validator 读取执行结果和 git diff
+- 产生 `validation_report`
+- 触发 `done` 或 `repairing/review_fix`
+- 达到最大修复轮次后进入 `review_max_rounds`
+
+### F6. 统一输入入口
+
+系统必须通过 `POST /api/input` 统一接收：
+
+- terminal 文本
+- scene 文本
+- slash command
+
+并满足：
+
+- `consensus` 状态下普通文本被拒绝
+- `paused` / `interrupted` / 终态普通文本被拒绝
+- 控制命令仍可走统一入口
+
+### F7. Terminal 模式
+
+系统必须提供：
+
+- 四角色工作区
+- 每个角色自己的过程视图
+- 每个角色自己的输入入口
+- artifact 快速查看
+- 允许对当前会话切换到 terminal，而不是只能创建时选择
+
+### F8. Scene 模式
+
+系统必须提供：
+
+- 基于 artifact 和 intervention 的时间线
+- 基于统一事件流的高信号叙事卡片
+- 友好的底部输入框
+- 与 terminal 相同的控制能力
+- 允许对当前会话切换到 scene，而不是只能创建时选择
+
+### F9. 恢复与历史
+
+系统必须支持：
+
+- 页面刷新恢复
+- 后端重启后恢复会话账本
+- `paused` / `interrupted` 继续推进
+- 刷新恢复时直接依赖 ledger snapshot，而不是从 0 重放全量 SSE
+
+### F10. 文档与边界一致性
+
+代码、协议、需求、架构文档必须一致描述：
+
+- 四角色
+- 双模式
+- 统一账本
+- 非 IDE 边界
+
+## 6. 数据生命周期要求
+
+### 6.1 创建
+
+创建会话时必须同时写入：
+
+- `sessions`
+- `workflow_roles`
+- `role_lanes`
+
+### 6.2 过程
+
+CLI 输出必须先进入 `role_events`，再由投影层渲染。
+
+### 6.3 结果
+
+结构化结果必须显式发布为 `artifact`。
+
+### 6.4 输入
+
+用户输入必须显式写入 `intervention` 或控制动作账本。
+
+### 6.5 恢复
+
+恢复只依赖持久化账本，不依赖旧 UI 状态。
+
+## 7. 验收清单
+
+- [ ] 四角色配置可保存和恢复
+- [ ] 同一工具可绑定多个角色
+- [ ] 协商阶段会产生 `plan` 和 `review`
+- [ ] 执行阶段会产生 `execution_summary`
+- [ ] 校验阶段会产生 `validation_report`
+- [ ] `Process` 只读事件
+- [ ] `Result` 只读 artifact
+- [ ] 用户输入刷新后不丢失
+- [ ] `consensus` 状态下普通文本被拒绝
+- [ ] terminal 模式工作区填满可视区域
+- [ ] scene 模式可回放 artifact/intervention 时间线
+- [ ] 后端重启后活动会话会标记为 `interrupted`
+
+## 8. 非目标
+
+为了避免范围膨胀，当前版本明确不做：
+
+- 任意 N 角色编排图
+- 文件树
+- 代码编辑器
+- 真 PTY 透传
+- 旧协议兼容层

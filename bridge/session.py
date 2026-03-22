@@ -1,153 +1,205 @@
 """
-Bridge Session 管理
-==================
-SessionState 类和事件管理函数。
-
-依赖: bridge.protocol (EVENT_TYPES)
-
-Step 7: adapter_state 泛化会话追踪。
+Bridge session model
+====================
+统一会话、角色 lane、artifact 与 intervention 的运行时真相源。
 """
 
+from __future__ import annotations
+
+import json
 import threading
 import uuid
+from copy import deepcopy
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
-from bridge.protocol import EVENT_TYPES
+from bridge.projections import projection_payload_for_event
+from bridge.protocol import INTERVENTION_STATUSES, STREAM_EVENT_TYPES
+from bridge.workflow import WorkflowConfig, WorkflowRole, workflow_config_to_dict
+
 
 LOG_DIR = Path("/tmp/bridge-logs")
 
-sessions = {}           # session_id → SessionState
+sessions: dict[str, "SessionState"] = {}
 sessions_lock = threading.Lock()
 _persist_hook = None
 
 
+@dataclass
+class RoleLane:
+    lane_id: str
+    role_key: str
+    tool_id: str
+    enabled: bool = True
+    sort_order: int = 0
+    lane_status: str = "idle"
+    transport_kind: str = "bridge-terminal"
+    viewport: dict = field(default_factory=dict)
+    last_seq: int = -1
+    resume_state: dict = field(default_factory=dict)
+
+    @classmethod
+    def from_workflow_role(cls, role: WorkflowRole) -> "RoleLane":
+        return cls(
+            lane_id=f"lane_{role.role_key}_{uuid.uuid4().hex[:8]}",
+            role_key=role.role_key,
+            tool_id=role.tool_id,
+            enabled=role.enabled,
+            sort_order=role.sort_order,
+        )
+
+    def to_wire(self) -> dict:
+        return {
+            "lane_id": self.lane_id,
+            "role_key": self.role_key,
+            "tool_id": self.tool_id,
+            "enabled": self.enabled,
+            "sort_order": self.sort_order,
+            "lane_status": self.lane_status,
+            "transport_kind": self.transport_kind,
+            "viewport": deepcopy(self.viewport),
+            "last_seq": self.last_seq,
+        }
+
+
 class SessionState:
-    """协商会话状态 — 每个浏览器 Tab 独立。
-
-    字段清单:
-        session_id:     str     — uuid hex[:8]
-        task:           str     — 用户任务描述
-        project_path:   str     — 项目路径
-        max_rounds:     int     — 最大协商轮数
-        status:         str     — 状态机当前状态 (见 protocol.STATES)
-        current_round:  int     — 当前轮次
-        history:        list    — 协商历史条目
-        consensus:      bool    — 是否达成共识
-        consensus_round: int    — 共识轮次
-        execution_result: str|None — 执行结果
-        error:          str|None — 错误信息
-        phase:          str     — 当前生命周期阶段 (negotiation/execution/review)
-        updated_at:     str     — 最近更新时间
-        finished_at:    str|None — 终态时间
-        interrupt_reason: str|None — 中断/恢复原因
-        events:         list    — 事件流
-        event_lock:     Lock    — 事件流锁
-        stop_flag:      Event   — 中止标记
-        status_lock:    Lock    — 状态转换专用锁
-        proc_lock:      Lock    — 保护 active_proc + active_pgid 原子读写
-        active_proc:    Popen|None — 当前活跃子进程 (leader)
-        active_pgid:    int|None — CLI 进程组 ID，独立于 leader 生命周期
-        log_dir:        Path    — 日志目录
-        review_round:   int     — 审查轮次
-        max_review_rounds: int  — 最大审查轮数 (默认 3)
-        review_history: list    — 审查历史条目
-        exec_baseline_ref: str|None — Git baseline ref
-        exec_baseline_untracked: set — 执行前 untracked 文件集
-        is_git_repo:    bool    — 项目是否在 git 仓库中
-        planner_tool_id: str    — Planner 工具 ID (Step 7)
-        reviewer_tool_id: str   — Reviewer 工具 ID (Step 7)
-        adapter_state:  dict    — 每工具逻辑会话追踪 {state_key: {...}}，持久化到 adapter_state_json
-
-    不可持久化的纯内存字段:
-        stop_flag, active_proc, active_pgid, proc_lock, event_lock, status_lock,
-        exec_baseline_ref, exec_baseline_untracked, events
-    """
-
-    def __init__(self, session_id, task, project_path, max_rounds):
+    def __init__(self, session_id: str, task: str, project_path: str, workflow: WorkflowConfig):
         self.session_id = session_id
         self.task = task
         self.project_path = project_path
-        self.max_rounds = max_rounds
+        self.workflow_template = workflow.workflow_template
+        self.view_mode = workflow.view_mode
+        self.max_rounds = workflow.max_rounds
+        self.max_review_rounds = workflow.max_review_rounds
         self.status = "running"
-        self.phase = "negotiation"
+        self.active_stage = "planning"
         self.current_round = 0
-        self.history = []
-        self.consensus = False
+        self.current_review_round = 0
         self.consensus_round = 0
-        self.execution_result = None
         self.error = None
-        # 事件流（每会话独立）
-        self.events = []
-        self.event_lock = threading.Lock()
-        # 进程控制
-        self.stop_flag = threading.Event()
-        self.status_lock = threading.Lock()           # 状态转换专用锁
-        self.proc_lock = threading.Lock()             # 保护 active_proc + active_pgid 原子读写
-        self.active_proc = None
-        self.active_pgid = None                       # CLI 进程组 ID，独立于 active_proc 生命周期
-        # 日志目录（每会话独立）
-        self.log_dir = LOG_DIR / session_id
-        self.log_dir.mkdir(parents=True, exist_ok=True)
-        # 执行后审查（Issue 4）
-        self.review_round = 0
-        self.max_review_rounds = 3
-        self.review_history = []
-        self.exec_baseline_ref = None
-        self.exec_baseline_untracked = set()
-        self.is_git_repo = False
-        # 持久化字段：创建时间戳
+        self.interrupt_reason = None
+
         self.created_at = datetime.now().isoformat()
         self.updated_at = self.created_at
         self.finished_at = None
-        self.interrupt_reason = None
 
-        # ── Step 7: 角色配置 + 泛化会话追踪 ──
-        self.planner_tool_id = "claude-code"
-        self.reviewer_tool_id = "codex"
-        self.planner_state_key = self.planner_tool_id
-        self.reviewer_state_key = self.reviewer_tool_id
-        # 默认初始化 adapter_state — 两个内置工具
-        # create_session() 会按最新角色配置重新初始化，但这里先给出稳定默认值，
-        # 这样直接实例化 SessionState 的调用方也拥有完整可恢复状态。
-        _default_claude_sid = str(uuid.uuid4())
-        self.adapter_state = {
-            "claude-code": {"has_session": False, "session_id": _default_claude_sid},
-            "codex": {"has_session": False},
+        self.workflow_config = workflow_config_to_dict(workflow)
+        self.roles: dict[str, RoleLane] = {
+            role.role_key: RoleLane.from_workflow_role(role)
+            for role in workflow.roles
         }
-        self._default_claude_sid = _default_claude_sid
+        self.stream_events: list[dict] = []
+        self.artifacts: list[dict] = []
+        self.interventions: list[dict] = []
 
-    # ── adapter_state 泛化访问器 ──
-
-    def init_adapter_state(self, tool_id, capabilities):
-        """（重新）初始化指定工具的会话状态。"""
-        state = {"has_session": False}
-        if capabilities.get("session_resume"):
-            state["session_id"] = str(uuid.uuid4())
-        self.adapter_state[tool_id] = state
-
-    def get_adapter_has_session(self, state_key):
-        return self.adapter_state.get(state_key, {}).get("has_session", False)
-
-    def set_adapter_has_session(self, state_key, value):
-        self.adapter_state.setdefault(state_key, {})["has_session"] = value
-
-    def get_adapter_session_id(self, state_key):
-        return self.adapter_state.get(state_key, {}).get("session_id")
+        self.event_cond = threading.Condition()
+        self.status_lock = threading.Lock()
+        self.proc_lock = threading.Lock()
+        self.stop_flag = threading.Event()
+        self.active_proc = None
+        self.active_pgid = None
+        self.log_dir = LOG_DIR / session_id
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        self.is_git_repo = False
+        self.exec_baseline_ref = None
+        self.exec_baseline_untracked = set()
 
     @property
-    def resume_available(self):
+    def resume_available(self) -> bool:
         return self.status in {"paused", "interrupted"}
 
-    @property
-    def claude_session_id(self):
-        return self.get_adapter_session_id("claude-code") or self._default_claude_sid
+    def touch(self) -> None:
+        self.updated_at = datetime.now().isoformat()
+        if self.status in {"aborted", "done", "error"}:
+            self.finished_at = self.finished_at or self.updated_at
+        else:
+            self.finished_at = None
 
+    def to_public_state(self) -> dict:
+        return {
+            "session_id": self.session_id,
+            "task": self.task,
+            "project_path": self.project_path,
+            "workflow_template": self.workflow_template,
+            "view_mode": self.view_mode,
+            "status": self.status,
+            "active_stage": self.active_stage,
+            "current_round": self.current_round,
+            "current_review_round": self.current_review_round,
+            "consensus_round": self.consensus_round,
+            "max_rounds": self.max_rounds,
+            "max_review_rounds": self.max_review_rounds,
+            "error": self.error,
+            "interrupt_reason": self.interrupt_reason,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            "finished_at": self.finished_at,
+            "resume_available": self.resume_available,
+        }
 
-def get_session(sid):
-    """按 session_id 查找会话，不存在返回 None。"""
-    with sessions_lock:
-        return sessions.get(sid)
+    @classmethod
+    def from_persisted(
+        cls,
+        row: dict,
+        workflow: dict,
+        role_rows: list[dict],
+        lane_rows: list[dict],
+        event_rows: list[dict],
+        artifact_rows: list[dict],
+        intervention_rows: list[dict],
+    ) -> "SessionState":
+        workflow_obj = WorkflowConfig(
+            view_mode=workflow.get("view_mode", "scene"),
+            workflow_template=workflow.get("workflow_template", "standard"),
+            max_rounds=workflow.get("max_rounds", row.get("max_rounds", 5)),
+            max_review_rounds=workflow.get("max_review_rounds", row.get("max_review_rounds", 3)),
+            roles=tuple(
+                WorkflowRole(
+                    role_key=role["role_key"],
+                    tool_id=role["tool_id"],
+                    enabled=bool(role.get("enabled", True)),
+                    sort_order=int(role.get("sort_order", 0)),
+                )
+                for role in role_rows
+            ),
+        )
+        sess = cls(row["id"], row["task"], row["project_path"], workflow_obj)
+        sess.workflow_config = workflow
+        sess.workflow_template = row.get("workflow_template") or workflow_obj.workflow_template
+        sess.view_mode = row.get("view_mode") or workflow_obj.view_mode
+        sess.status = row.get("status") or "interrupted"
+        sess.active_stage = row.get("active_stage") or "planning"
+        sess.current_round = row.get("current_round", 0)
+        sess.current_review_round = row.get("current_review_round", 0)
+        sess.consensus_round = row.get("consensus_round", 0)
+        sess.max_rounds = row.get("max_rounds", workflow_obj.max_rounds)
+        sess.max_review_rounds = row.get("max_review_rounds", workflow_obj.max_review_rounds)
+        sess.error = row.get("error")
+        sess.interrupt_reason = row.get("interrupt_reason")
+        sess.created_at = row.get("created_at") or sess.created_at
+        sess.updated_at = row.get("updated_at") or sess.updated_at
+        sess.finished_at = row.get("finished_at")
+        sess.roles = {}
+        lane_by_role = {lane["role_key"]: lane for lane in lane_rows}
+        for role in role_rows:
+            lane_row = lane_by_role.get(role["role_key"], {})
+            sess.roles[role["role_key"]] = RoleLane(
+                lane_id=lane_row.get("id", f"lane_{role['role_key']}"),
+                role_key=role["role_key"],
+                tool_id=role["tool_id"],
+                enabled=bool(role.get("enabled", True)),
+                sort_order=int(role.get("sort_order", 0)),
+                lane_status=lane_row.get("lane_status", "idle"),
+                transport_kind=lane_row.get("transport_kind", "bridge-terminal"),
+                viewport=json.loads(lane_row.get("viewport_json") or "{}"),
+                last_seq=int(lane_row.get("last_seq", -1)),
+                resume_state=json.loads(role.get("resume_state_json") or "{}"),
+            )
+        sess.stream_events = list(event_rows)
+        sess.artifacts = list(artifact_rows)
+        sess.interventions = list(intervention_rows)
+        return sess
 
 
 def set_persist_hook(fn):
@@ -155,44 +207,357 @@ def set_persist_hook(fn):
     _persist_hook = fn
 
 
-def _touch_session(sess):
-    sess.updated_at = datetime.now().isoformat()
-    if sess.status in {"aborted", "done", "error"}:
-        sess.finished_at = sess.finished_at or sess.updated_at
-    elif sess.status not in {"idle"}:
-        sess.finished_at = None
+def session_summary(sess: SessionState) -> dict:
+    return {
+        "session_id": sess.session_id,
+        "task": sess.task,
+        "project_path": sess.project_path,
+        "view_mode": sess.view_mode,
+        "status": sess.status,
+        "active_stage": sess.active_stage,
+        "current_round": sess.current_round,
+        "current_review_round": sess.current_review_round,
+        "max_rounds": sess.max_rounds,
+        "max_review_rounds": sess.max_review_rounds,
+        "updated_at": sess.updated_at,
+        "created_at": sess.created_at,
+        "finished_at": sess.finished_at,
+        "interrupt_reason": sess.interrupt_reason,
+    }
 
 
-def _persist_session(sess):
+def lane_snapshot(sess: SessionState, role_key: str) -> dict:
+    lane = sess.roles[role_key]
+    return deepcopy(lane.to_wire())
+
+
+def artifact_snapshot(artifact: dict) -> dict:
+    return deepcopy(artifact)
+
+
+def intervention_snapshot(intervention: dict) -> dict:
+    return deepcopy(intervention)
+
+
+def session_event_payload(sess: SessionState, **extra) -> dict:
+    payload = {
+        "session": sess.to_public_state(),
+        "summary": session_summary(sess),
+    }
+    payload.update(extra)
+    return payload
+
+
+def lane_event_payload(sess: SessionState, role_key: str, **extra) -> dict:
+    payload = {
+        "lane": lane_snapshot(sess, role_key),
+    }
+    payload.update(extra)
+    return payload
+
+
+def event_snapshot(event: dict, *, include_projection: bool = False) -> dict:
+    snapshot = deepcopy(event)
+    if not isinstance(snapshot.get("data"), dict):
+        return snapshot
+    if include_projection:
+        snapshot["data"]["projection"] = projection_payload_for_event(snapshot)
+    else:
+        snapshot["data"].pop("projection", None)
+    return snapshot
+
+
+def set_lane_viewport(
+    sess: SessionState,
+    role_key: str,
+    *,
+    width_px: int,
+    height_px: int,
+    cols: int,
+    rows: int,
+    source: str = "terminal",
+) -> tuple[dict, bool]:
+    lane = sess.roles[role_key]
+    normalized = {
+        "width_px": max(0, int(width_px)),
+        "height_px": max(0, int(height_px)),
+        "cols": max(1, int(cols)),
+        "rows": max(1, int(rows)),
+        "updated_at": datetime.now().isoformat(),
+    }
+    previous = lane.viewport or {}
+    unchanged = (
+        previous.get("width_px") == normalized["width_px"]
+        and previous.get("height_px") == normalized["height_px"]
+        and previous.get("cols") == normalized["cols"]
+        and previous.get("rows") == normalized["rows"]
+    )
+    if unchanged:
+        return lane_snapshot(sess, role_key), False
+
+    lane.viewport = normalized
+    add_event(
+        sess,
+        "lane.viewport_changed",
+        lane_event_payload(
+            sess,
+            role_key,
+            message=f"{normalized['cols']}x{normalized['rows']} ({normalized['width_px']}x{normalized['height_px']})",
+        ),
+        role_key=role_key,
+        source=source,
+    )
+    return lane_snapshot(sess, role_key), True
+
+
+def _persist_session(sess: SessionState) -> None:
     if _persist_hook is None:
         return
     try:
-        _persist_hook(sess)
+        if hasattr(_persist_hook, "save_session_state"):
+            _persist_hook.save_session_state(sess)
+        else:
+            _persist_hook(sess)
     except Exception:
         pass
 
 
-def add_event(sess, etype, data):
-    if etype not in EVENT_TYPES:
-        raise ValueError(f"未声明的事件类型: {etype}，请先在 bridge/protocol.py EVENT_TYPES 中注册")
-    with sess.event_lock:
-        _touch_session(sess)
-        sess.events.append({
-            "id": len(sess.events), "type": etype,
-            "data": data, "ts": datetime.now().isoformat(),
-        })
-    _persist_session(sess)
+def _persist_lane(sess: SessionState, role_key: str) -> None:
+    if _persist_hook is None:
+        return
+    try:
+        if hasattr(_persist_hook, "upsert_lane"):
+            _persist_hook.upsert_lane(sess, role_key)
+        else:
+            _persist_session(sess)
+    except Exception:
+        pass
 
 
-def add_history_event(sess, history_list, entry, event_type):
-    """原子地追加历史记录并发送事件（统一快照锁）。"""
-    if event_type not in EVENT_TYPES:
-        raise ValueError(f"未声明的事件类型: {event_type}，请先在 bridge/protocol.py EVENT_TYPES 中注册")
-    with sess.event_lock:
-        _touch_session(sess)
-        history_list.append(entry)
-        sess.events.append({
-            "id": len(sess.events), "type": event_type,
-            "data": entry, "ts": datetime.now().isoformat(),
-        })
-    _persist_session(sess)
+def _persist_event(
+    sess: SessionState,
+    event: dict,
+    *,
+    artifact: dict | None = None,
+    intervention: dict | None = None,
+) -> None:
+    if _persist_hook is None:
+        return
+    try:
+        if hasattr(_persist_hook, "append_event"):
+            _persist_hook.append_event(sess, event, artifact=artifact, intervention=intervention)
+        else:
+            _persist_session(sess)
+    except Exception:
+        pass
+
+
+def register_session(sess: SessionState) -> None:
+    with sessions_lock:
+        sessions[sess.session_id] = sess
+
+
+def get_session(session_id: str | None) -> SessionState | None:
+    if not session_id:
+        return None
+    with sessions_lock:
+        return sessions.get(session_id)
+
+
+def remove_session(session_id: str) -> None:
+    with sessions_lock:
+        sessions.pop(session_id, None)
+
+
+def add_event(
+    sess: SessionState,
+    event_type: str,
+    data: dict,
+    *,
+    role_key: str | None = None,
+    source: str | None = None,
+    artifact: dict | None = None,
+    intervention: dict | None = None,
+) -> dict:
+    if event_type not in STREAM_EVENT_TYPES:
+        raise ValueError(f"undeclared event type: {event_type}")
+    payload = deepcopy(data)
+    evt = {
+        "id": len(sess.stream_events),
+        "type": event_type,
+        "role_key": role_key,
+        "source": source or (role_key or "system"),
+        "data": payload,
+        "ts": datetime.now().isoformat(),
+    }
+    with sess.event_cond:
+        sess.touch()
+        sess.stream_events.append(evt)
+        if role_key and role_key in sess.roles:
+            sess.roles[role_key].last_seq = evt["id"]
+        sess.event_cond.notify_all()
+    _persist_event(sess, evt, artifact=artifact, intervention=intervention)
+    return evt
+
+
+def publish_artifact(
+    sess: SessionState,
+    *,
+    role_key: str,
+    round_no: int,
+    phase: str,
+    artifact_kind: str,
+    content: str,
+    source_event_seq: int | None = None,
+) -> dict:
+    artifact = {
+        "id": uuid.uuid4().hex,
+        "session_id": sess.session_id,
+        "lane_id": sess.roles[role_key].lane_id,
+        "role_key": role_key,
+        "round": round_no,
+        "phase": phase,
+        "artifact_kind": artifact_kind,
+        "content": content,
+        "source_event_seq": source_event_seq,
+        "created_at": datetime.now().isoformat(),
+    }
+    with sess.event_cond:
+        sess.touch()
+        sess.artifacts.append(artifact)
+        sess.event_cond.notify_all()
+    add_event(
+        sess,
+        "artifact.published",
+        {
+            "artifact": artifact_snapshot(artifact),
+            "artifact_id": artifact["id"],
+            "artifact_kind": artifact_kind,
+            "phase": phase,
+            "round": round_no,
+            "content": content,
+        },
+        role_key=role_key,
+        source="artifact",
+        artifact=artifact,
+    )
+    return artifact
+
+
+def add_intervention(
+    sess: SessionState,
+    *,
+    origin_view: str,
+    origin_role_key: str | None,
+    target_roles: tuple[str, ...],
+    target_scope: str,
+    text: str = "",
+    command: str | None = None,
+    status: str = "queued",
+) -> dict:
+    if status not in INTERVENTION_STATUSES:
+        raise ValueError(f"invalid intervention status: {status}")
+    intervention = {
+        "id": uuid.uuid4().hex,
+        "session_id": sess.session_id,
+        "origin_view": origin_view,
+        "origin_role_key": origin_role_key,
+        "target_roles": list(target_roles),
+        "target_scope": target_scope,
+        "text": text,
+        "command": command,
+        "status": status,
+        "consumed_by_roles": {},
+        "created_at": datetime.now().isoformat(),
+        "updated_at": datetime.now().isoformat(),
+    }
+    with sess.event_cond:
+        sess.touch()
+        sess.interventions.append(intervention)
+        sess.event_cond.notify_all()
+    add_event(
+        sess,
+        "intervention.received",
+        {
+            "intervention": intervention_snapshot(intervention),
+            "intervention_id": intervention["id"],
+            "origin_view": origin_view,
+            "target_roles": intervention["target_roles"],
+            "target_scope": target_scope,
+            "text": text,
+            "command": command,
+            "status": intervention["status"],
+        },
+        role_key=origin_role_key,
+        source="intervention",
+        intervention=intervention,
+    )
+    return intervention
+
+
+def consume_interventions(sess: SessionState, role_key: str, round_no: int) -> list[str]:
+    consumed = []
+    for intervention in sess.interventions:
+        if intervention["status"] not in INTERVENTION_STATUSES or intervention["status"] in {"cancelled", "rejected"}:
+            continue
+        if role_key not in intervention.get("target_roles", []):
+            continue
+        if role_key in intervention["consumed_by_roles"]:
+            continue
+        text = (intervention.get("text") or "").strip()
+        if not text:
+            continue
+        intervention["status"] = "acknowledged"
+        intervention["consumed_by_roles"][role_key] = {"round": round_no, "ts": datetime.now().isoformat()}
+        intervention["updated_at"] = datetime.now().isoformat()
+        if all(r in intervention["consumed_by_roles"] for r in intervention.get("target_roles", [])):
+            intervention["status"] = "consumed"
+        consumed.append(text)
+        add_event(
+            sess,
+            "intervention.consumed",
+            {
+                "intervention": intervention_snapshot(intervention),
+                "intervention_id": intervention["id"],
+                "status": intervention["status"],
+                "round": round_no,
+            },
+            role_key=role_key,
+            source="intervention",
+            intervention=intervention,
+        )
+    return consumed
+
+
+def latest_artifact(sess: SessionState, artifact_kind: str, role_key: str | None = None) -> dict | None:
+    for artifact in reversed(sess.artifacts):
+        if artifact["artifact_kind"] != artifact_kind:
+            continue
+        if role_key and artifact["role_key"] != role_key:
+            continue
+        return artifact
+    return None
+
+
+def last_complete_round(sess: SessionState) -> int:
+    plan_rounds = {artifact["round"] for artifact in sess.artifacts if artifact["artifact_kind"] == "plan"}
+    review_rounds = {artifact["round"] for artifact in sess.artifacts if artifact["artifact_kind"] == "review"}
+    complete = plan_rounds & review_rounds
+    return max(complete) if complete else 0
+
+
+def touch_status(sess: SessionState, *, status: str | None = None, active_stage: str | None = None, error: str | None = None, interrupt_reason: str | None = None) -> None:
+    with sess.status_lock:
+        if status is not None:
+            sess.status = status
+        if active_stage is not None:
+            sess.active_stage = active_stage
+        if error is not None:
+            sess.error = error
+        sess.interrupt_reason = interrupt_reason
+    sess.touch()
+
+
+def add_history_event(sess: SessionState, history_list, entry, event_type):
+    # Legacy compatibility shim for modules not yet migrated.
+    return add_event(sess, event_type, entry, role_key=entry.get("role"))

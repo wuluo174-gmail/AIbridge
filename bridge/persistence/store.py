@@ -1,20 +1,12 @@
 """
-Bridge 持久化存储
-================
-SQLite 持久化层 (Python sqlite3 标准库)。
-
-设计约束:
-  - Python 是唯一写入方
-  - 会话从创建开始即持久化，SQLite 是统一会话账本
-  - 内存态（线程锁、进程句柄）不可持久化，重启后按账本重建可恢复会话
-
-并发模型:
-  - 单连接 + check_same_thread=False
-  - 内部 threading.Lock 保护所有操作（读+写）
-  - WAL journal mode
+Bridge persistence store
+========================
+统一账本的 SQLite 持久化实现。
 """
 
-import json as _json
+from __future__ import annotations
+
+import json
 import sqlite3
 import threading
 from datetime import datetime, timedelta
@@ -24,14 +16,117 @@ from pathlib import Path
 _SCHEMA_FILE = Path(__file__).parent / "schema.sql"
 _DEFAULT_DB_DIR = Path.home() / ".bridge"
 _DEFAULT_DB_PATH = _DEFAULT_DB_DIR / "bridge.db"
-
-GLOBAL_TOOL_ID = "__global__"
-_ACTIVE_STATUSES = {"running", "executing", "review_pending"}
+_DEFAULT_WORKFLOW_KEY = "default_workflow_config"
+_ACTIVE_STATUSES = {"running", "executing", "validating", "repairing"}
+_LEDGER_TABLES = (
+    "role_events",
+    "artifacts",
+    "interventions",
+    "role_lanes",
+    "workflow_roles",
+    "sessions",
+)
+_LEGACY_TABLES = (
+    "session_events",
+    "session_history",
+    "review_history",
+    "role_assignments",
+)
+_RESET_DROP_ORDER = (
+    "role_events",
+    "artifacts",
+    "interventions",
+    "role_lanes",
+    "workflow_roles",
+    "session_events",
+    "session_history",
+    "review_history",
+    "role_assignments",
+    "sessions",
+)
+_EXPECTED_LEDGER_COLUMNS = {
+    "sessions": {
+        "id",
+        "task",
+        "project_path",
+        "workflow_template",
+        "view_mode",
+        "status",
+        "active_stage",
+        "current_round",
+        "current_review_round",
+        "consensus_round",
+        "max_rounds",
+        "max_review_rounds",
+        "error",
+        "interrupt_reason",
+        "created_at",
+        "updated_at",
+        "finished_at",
+    },
+    "workflow_roles": {
+        "id",
+        "session_id",
+        "role_key",
+        "tool_id",
+        "enabled",
+        "sort_order",
+        "resume_state_json",
+        "created_at",
+        "updated_at",
+    },
+    "role_lanes": {
+        "id",
+        "session_id",
+        "role_key",
+        "lane_status",
+        "transport_kind",
+        "viewport_json",
+        "last_seq",
+        "created_at",
+        "updated_at",
+    },
+    "role_events": {
+        "id",
+        "session_id",
+        "lane_id",
+        "role_key",
+        "seq",
+        "source",
+        "kind",
+        "payload_json",
+        "created_at",
+    },
+    "artifacts": {
+        "id",
+        "session_id",
+        "lane_id",
+        "role_key",
+        "round",
+        "phase",
+        "artifact_kind",
+        "content",
+        "source_event_seq",
+        "created_at",
+    },
+    "interventions": {
+        "id",
+        "session_id",
+        "origin_view",
+        "origin_role_key",
+        "target_scope",
+        "target_roles_json",
+        "text",
+        "command",
+        "status",
+        "consumed_by_roles_json",
+        "created_at",
+        "updated_at",
+    },
+}
 
 
 class Store:
-    """SQLite 持久化存储。"""
-
     def __init__(self, db_path=None):
         self._db_path = str(db_path) if db_path else str(_DEFAULT_DB_PATH)
         if self._db_path != ":memory:":
@@ -42,355 +137,552 @@ class Store:
         self._conn.execute("PRAGMA foreign_keys=ON")
         self.init_db()
 
-    # ═════════════════════════════════════════════════════════════════
-    # Schema
-    # ═════════════════════════════════════════════════════════════════
-
     def init_db(self):
-        """使用 schema.sql 建表。"""
         schema_sql = _SCHEMA_FILE.read_text(encoding="utf-8")
         with self._lock:
-            self._conn.executescript(schema_sql)
-        self._ensure_schema_up_to_date()
+            self._reset_legacy_schema_if_needed()
+            self._drop_tables(_LEGACY_TABLES)
+            with self._conn:
+                self._conn.executescript(schema_sql)
 
-    def _add_column_if_missing(self, table, existing, col, ddl):
-        if col not in existing:
-            self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}")
+    def _reset_legacy_schema_if_needed(self):
+        if not self._ledger_schema_needs_reset():
+            return
+        self._drop_tables(_RESET_DROP_ORDER)
 
-    def _ensure_schema_up_to_date(self):
-        """幂等升级旧库 schema，使其与当前代码对齐。"""
-        with self._lock, self._conn:
-            c = self._conn.cursor()
+    def _existing_tables(self):
+        cur = self._conn.cursor()
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        return {row[0] for row in cur.fetchall()}
 
-            c.execute("PRAGMA table_info(cli_tools)")
-            cli_existing = {row[1] for row in c.fetchall()}
-            if "detected_installed" not in cli_existing:
-                if "installed" in cli_existing:
-                    c.execute(
-                        "ALTER TABLE cli_tools RENAME COLUMN installed TO detected_installed"
-                    )
-                    cli_existing.remove("installed")
-                    cli_existing.add("detected_installed")
-                else:
-                    c.execute(
-                        "ALTER TABLE cli_tools ADD COLUMN detected_installed INTEGER DEFAULT 0"
-                    )
-            for col, ddl in {"agent_name": "TEXT", "probe_error": "TEXT"}.items():
-                self._add_column_if_missing("cli_tools", cli_existing, col, ddl)
+    def _table_columns(self, table):
+        cur = self._conn.cursor()
+        cur.execute(f"PRAGMA table_info({table})")
+        return {row[1] for row in cur.fetchall()}
 
-            c.execute("PRAGMA table_info(sessions)")
-            session_existing = {row[1] for row in c.fetchall()}
-            if "final_status" in session_existing:
-                # 开发期无历史用户数据，旧 session ledger 直接作废并重建，
-                # 避免继续维护 status/final_status 双真相源。
-                self._reset_legacy_session_ledger()
-                c.execute("PRAGMA table_info(sessions)")
-                session_existing = {row[1] for row in c.fetchall()}
-            session_cols = {
-                "status": "TEXT",
-                "phase": "TEXT DEFAULT 'negotiation'",
-                "error": "TEXT",
-                "review_round": "INTEGER DEFAULT 0",
-                "max_review_rounds": "INTEGER DEFAULT 3",
-                "interrupt_reason": "TEXT",
-                "adapter_state_json": "TEXT DEFAULT '{}'",
-                "updated_at": "TEXT",
-            }
-            for col, ddl in session_cols.items():
-                self._add_column_if_missing("sessions", session_existing, col, ddl)
+    def _ledger_schema_needs_reset(self):
+        existing = self._existing_tables()
+        tracked_existing = existing.intersection(_EXPECTED_LEDGER_COLUMNS)
+        if not tracked_existing:
+            return False
+        if tracked_existing != set(_EXPECTED_LEDGER_COLUMNS):
+            return True
+        for table, expected in _EXPECTED_LEDGER_COLUMNS.items():
+            if not expected.issubset(self._table_columns(table)):
+                return True
+        return False
 
-            self._conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS session_events (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    session_id TEXT NOT NULL REFERENCES sessions(id),
-                    event_index INTEGER NOT NULL,
-                    type TEXT NOT NULL,
-                    data_json TEXT NOT NULL,
-                    timestamp TEXT NOT NULL,
-                    UNIQUE(session_id, event_index)
-                )
-                """
-            )
-            self._conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_session_events_sid "
-                "ON session_events(session_id)"
-            )
-            self._conn.execute(
-                "CREATE UNIQUE INDEX IF NOT EXISTS idx_role_assignments_name "
-                "ON role_assignments(name)"
-            )
-
-            self._conn.execute(
-                "UPDATE sessions SET status = COALESCE(status, 'done') "
-                "WHERE status IS NULL OR status = ''"
-            )
-            self._conn.execute(
-                """
-                UPDATE sessions
-                SET phase = CASE
-                    WHEN status LIKE 'review_%' THEN 'review'
-                    WHEN status = 'executing' THEN 'execution'
-                    ELSE COALESCE(phase, 'negotiation')
-                END
-                WHERE phase IS NULL OR phase = ''
-                """
-            )
-            self._conn.execute(
-                """
-                UPDATE sessions
-                SET updated_at = COALESCE(updated_at, finished_at, created_at)
-                WHERE updated_at IS NULL OR updated_at = ''
-                """
-            )
-
-    def _reset_legacy_session_ledger(self):
-        """删除开发期旧会话账本，按当前 schema 重建。
-
-        旧模型把 status/final_status 作为双状态源，还和历史表通过外键耦合。
-        在无历史用户数据前提下，直接清空旧会话账本比继续维护复杂迁移更可靠。
-        """
-        self._conn.execute("DROP TABLE IF EXISTS session_events")
-        self._conn.execute("DROP TABLE IF EXISTS review_history")
-        self._conn.execute("DROP TABLE IF EXISTS session_history")
-        self._conn.execute("DROP TABLE IF EXISTS sessions")
-        self._conn.executescript(_SCHEMA_FILE.read_text(encoding="utf-8"))
-
-    # ═════════════════════════════════════════════════════════════════
-    # Sessions
-    # ═════════════════════════════════════════════════════════════════
-
-    @staticmethod
-    def _bool_to_int(value):
-        return 1 if value else 0
+    def _drop_tables(self, tables):
+        existing = self._existing_tables()
+        targets = [table for table in tables if table in existing]
+        if not targets:
+            return
+        self._conn.commit()
+        fk_enabled = bool(self._conn.execute("PRAGMA foreign_keys").fetchone()[0])
+        try:
+            if fk_enabled:
+                self._conn.execute("PRAGMA foreign_keys=OFF")
+            with self._conn:
+                for table in targets:
+                    self._conn.execute(f'DROP TABLE IF EXISTS "{table}"')
+        finally:
+            if fk_enabled:
+                self._conn.execute("PRAGMA foreign_keys=ON")
 
     @staticmethod
     def _row_dict(cursor, row):
-        cols = [d[0] for d in cursor.description]
-        return dict(zip(cols, row))
+        return {cursor.description[i][0]: value for i, value in enumerate(row)}
 
     @staticmethod
-    def _session_summary(row):
-        d = dict(row)
-        d["session_id"] = d.pop("id")
-        d["round"] = d.pop("current_round")
-        d["consensus"] = bool(d["consensus"])
-        d["resume_available"] = d["status"] in {"paused", "interrupted"}
-        return d
+    def _event_payload_for_storage(event):
+        payload = dict(event.get("data", {}))
+        if isinstance(payload.get("projection"), dict):
+            payload.pop("projection", None)
+        return json.dumps(payload, ensure_ascii=False)
 
-    def save_session(self, sess):
-        """保存会话快照（创建即写入，生命周期内幂等覆盖）。"""
-        now = datetime.now().isoformat()
-        updated_at = getattr(sess, "updated_at", now) or now
-        status = getattr(sess, "status", "running")
-        finished_at = getattr(sess, "finished_at", None)
-        if status in {"aborted", "done", "error"}:
-            finished_at = finished_at or now
-        else:
-            finished_at = None
+    def _upsert_session_row(self, sess):
+        self._conn.execute(
+            """
+            INSERT INTO sessions
+            (id, task, project_path, workflow_template, view_mode, status,
+             active_stage, current_round, current_review_round, consensus_round,
+             max_rounds, max_review_rounds, error, interrupt_reason,
+             created_at, updated_at, finished_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                task=excluded.task,
+                project_path=excluded.project_path,
+                workflow_template=excluded.workflow_template,
+                view_mode=excluded.view_mode,
+                status=excluded.status,
+                active_stage=excluded.active_stage,
+                current_round=excluded.current_round,
+                current_review_round=excluded.current_review_round,
+                consensus_round=excluded.consensus_round,
+                max_rounds=excluded.max_rounds,
+                max_review_rounds=excluded.max_review_rounds,
+                error=excluded.error,
+                interrupt_reason=excluded.interrupt_reason,
+                created_at=excluded.created_at,
+                updated_at=excluded.updated_at,
+                finished_at=excluded.finished_at
+            """,
+            (
+                sess.session_id,
+                sess.task,
+                sess.project_path,
+                sess.workflow_template,
+                sess.view_mode,
+                sess.status,
+                sess.active_stage,
+                sess.current_round,
+                sess.current_review_round,
+                sess.consensus_round,
+                sess.max_rounds,
+                sess.max_review_rounds,
+                sess.error,
+                sess.interrupt_reason,
+                sess.created_at,
+                sess.updated_at,
+                sess.finished_at,
+            ),
+        )
 
-        adapter_state = getattr(sess, "adapter_state", {}) or {}
-        phase = getattr(sess, "phase", "negotiation") or "negotiation"
-        review_round = getattr(sess, "review_round", 0)
-        max_review_rounds = getattr(sess, "max_review_rounds", 3)
-        interrupt_reason = getattr(sess, "interrupt_reason", None)
+    def _upsert_role(self, sess, role_key, lane, now=None):
+        now = now or datetime.now().isoformat()
+        self._conn.execute(
+            """
+            INSERT INTO workflow_roles
+            (session_id, role_key, tool_id, enabled, sort_order, resume_state_json, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(session_id, role_key) DO UPDATE SET
+                tool_id=excluded.tool_id,
+                enabled=excluded.enabled,
+                sort_order=excluded.sort_order,
+                resume_state_json=excluded.resume_state_json,
+                updated_at=excluded.updated_at
+            """,
+            (
+                sess.session_id,
+                role_key,
+                lane.tool_id,
+                1 if lane.enabled else 0,
+                lane.sort_order,
+                json.dumps(lane.resume_state, ensure_ascii=False),
+                now,
+                now,
+            ),
+        )
+        self._conn.execute(
+            """
+            INSERT INTO role_lanes
+            (id, session_id, role_key, lane_status, transport_kind, viewport_json, last_seq, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                lane_status=excluded.lane_status,
+                transport_kind=excluded.transport_kind,
+                viewport_json=excluded.viewport_json,
+                last_seq=excluded.last_seq,
+                updated_at=excluded.updated_at
+            """,
+            (
+                lane.lane_id,
+                sess.session_id,
+                role_key,
+                lane.lane_status,
+                lane.transport_kind,
+                json.dumps(lane.viewport, ensure_ascii=False),
+                lane.last_seq,
+                now,
+                now,
+            ),
+        )
 
+    def _upsert_artifact_row(self, sess, artifact):
+        self._conn.execute(
+            """
+            INSERT INTO artifacts
+            (id, session_id, lane_id, role_key, round, phase, artifact_kind, content, source_event_seq, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                lane_id=excluded.lane_id,
+                role_key=excluded.role_key,
+                round=excluded.round,
+                phase=excluded.phase,
+                artifact_kind=excluded.artifact_kind,
+                content=excluded.content,
+                source_event_seq=excluded.source_event_seq,
+                created_at=excluded.created_at
+            """,
+            (
+                artifact["id"],
+                sess.session_id,
+                artifact["lane_id"],
+                artifact["role_key"],
+                artifact["round"],
+                artifact["phase"],
+                artifact["artifact_kind"],
+                artifact["content"],
+                artifact.get("source_event_seq"),
+                artifact["created_at"],
+            ),
+        )
+
+    def _upsert_intervention_row(self, sess, intervention):
+        self._conn.execute(
+            """
+            INSERT INTO interventions
+            (id, session_id, origin_view, origin_role_key, target_scope, target_roles_json,
+             text, command, status, consumed_by_roles_json, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                origin_view=excluded.origin_view,
+                origin_role_key=excluded.origin_role_key,
+                target_scope=excluded.target_scope,
+                target_roles_json=excluded.target_roles_json,
+                text=excluded.text,
+                command=excluded.command,
+                status=excluded.status,
+                consumed_by_roles_json=excluded.consumed_by_roles_json,
+                created_at=excluded.created_at,
+                updated_at=excluded.updated_at
+            """,
+            (
+                intervention["id"],
+                sess.session_id,
+                intervention["origin_view"],
+                intervention.get("origin_role_key"),
+                intervention["target_scope"],
+                json.dumps(intervention.get("target_roles", []), ensure_ascii=False),
+                intervention.get("text", ""),
+                intervention.get("command"),
+                intervention["status"],
+                json.dumps(intervention.get("consumed_by_roles", {}), ensure_ascii=False),
+                intervention["created_at"],
+                intervention["updated_at"],
+            ),
+        )
+
+    def save_session_state(self, sess):
         with self._lock, self._conn:
-            c = self._conn.cursor()
-            c.execute(
+            self._upsert_session_row(sess)
+            now = datetime.now().isoformat()
+            for role_key, lane in sess.roles.items():
+                self._upsert_role(sess, role_key, lane, now)
+
+    def upsert_lane(self, sess, role_key):
+        with self._lock, self._conn:
+            self._upsert_session_row(sess)
+            lane = sess.roles[role_key]
+            self._upsert_role(sess, role_key, lane)
+
+    def append_event(self, sess, event, *, artifact=None, intervention=None):
+        with self._lock, self._conn:
+            self._upsert_session_row(sess)
+            lane_id = None
+            if event.get("role_key") and event["role_key"] in sess.roles:
+                lane = sess.roles[event["role_key"]]
+                lane_id = lane.lane_id
+                self._upsert_role(sess, event["role_key"], lane)
+            if artifact is not None:
+                self._upsert_artifact_row(sess, artifact)
+            if intervention is not None:
+                self._upsert_intervention_row(sess, intervention)
+            self._conn.execute(
                 """
-                INSERT INTO sessions
-                (id, task, project_path, max_rounds, status, phase,
-                 current_round, consensus, consensus_round,
-                 planner_tool_id, reviewer_tool_id,
-                 execution_result, error, review_round, max_review_rounds,
-                 interrupt_reason, adapter_state_json,
-                 created_at, updated_at, finished_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(id) DO UPDATE SET
-                    task=excluded.task,
-                    project_path=excluded.project_path,
-                    max_rounds=excluded.max_rounds,
-                    status=excluded.status,
-                    phase=excluded.phase,
-                    current_round=excluded.current_round,
-                    consensus=excluded.consensus,
-                    consensus_round=excluded.consensus_round,
-                    planner_tool_id=excluded.planner_tool_id,
-                    reviewer_tool_id=excluded.reviewer_tool_id,
-                    execution_result=excluded.execution_result,
-                    error=excluded.error,
-                    review_round=excluded.review_round,
-                    max_review_rounds=excluded.max_review_rounds,
-                    interrupt_reason=excluded.interrupt_reason,
-                    adapter_state_json=excluded.adapter_state_json,
-                    created_at=excluded.created_at,
-                    updated_at=excluded.updated_at,
-                    finished_at=excluded.finished_at
+                INSERT INTO role_events
+                (session_id, lane_id, role_key, seq, source, kind, payload_json, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(session_id, seq) DO UPDATE SET
+                    lane_id=excluded.lane_id,
+                    role_key=excluded.role_key,
+                    source=excluded.source,
+                    kind=excluded.kind,
+                    payload_json=excluded.payload_json,
+                    created_at=excluded.created_at
                 """,
                 (
                     sess.session_id,
-                    sess.task,
-                    sess.project_path,
-                    sess.max_rounds,
-                    status,
-                    phase,
-                    sess.current_round,
-                    self._bool_to_int(sess.consensus),
-                    sess.consensus_round,
-                    getattr(sess, "planner_tool_id", "claude-code"),
-                    getattr(sess, "reviewer_tool_id", "codex"),
-                    sess.execution_result,
-                    sess.error,
-                    review_round,
-                    max_review_rounds,
-                    interrupt_reason,
-                    _json.dumps(adapter_state, ensure_ascii=False),
-                    sess.created_at,
-                    updated_at,
-                    finished_at,
+                    lane_id,
+                    event.get("role_key"),
+                    event["id"],
+                    event.get("source", "system"),
+                    event["type"],
+                    self._event_payload_for_storage(event),
+                    event["ts"],
                 ),
             )
 
-            c.execute("DELETE FROM session_history WHERE session_id = ?", (sess.session_id,))
-            c.execute("DELETE FROM review_history WHERE session_id = ?", (sess.session_id,))
-            for h in sess.history:
-                c.execute(
+    def upsert_artifact(self, sess, artifact):
+        with self._lock, self._conn:
+            self._upsert_session_row(sess)
+            self._upsert_artifact_row(sess, artifact)
+
+    def upsert_intervention(self, sess, intervention):
+        with self._lock, self._conn:
+            self._upsert_session_row(sess)
+            self._upsert_intervention_row(sess, intervention)
+
+    def save_session(self, sess):
+        with self._lock, self._conn:
+            self._upsert_session_row(sess)
+            now = datetime.now().isoformat()
+            for role_key, lane in sess.roles.items():
+                self._upsert_role(sess, role_key, lane, now)
+
+            for event in sess.stream_events:
+                lane_id = None
+                if event.get("role_key") and event["role_key"] in sess.roles:
+                    lane_id = sess.roles[event["role_key"]].lane_id
+                self._conn.execute(
                     """
-                    INSERT INTO session_history
-                    (session_id, round, role, phase, content, timestamp)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                    INSERT INTO role_events
+                    (session_id, lane_id, role_key, seq, source, kind, payload_json, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(session_id, seq) DO UPDATE SET
+                        lane_id=excluded.lane_id,
+                        role_key=excluded.role_key,
+                        source=excluded.source,
+                        kind=excluded.kind,
+                        payload_json=excluded.payload_json,
+                        created_at=excluded.created_at
                     """,
                     (
                         sess.session_id,
-                        h.get("round", 0),
-                        h["role"],
-                        h.get("phase", ""),
-                        h.get("content", ""),
-                        h.get("timestamp", updated_at),
-                    ),
-                )
-            for h in sess.review_history:
-                c.execute(
-                    """
-                    INSERT INTO review_history
-                    (session_id, round, role, phase, content, timestamp)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        sess.session_id,
-                        h.get("round", 0),
-                        h["role"],
-                        h.get("phase", ""),
-                        h.get("content", ""),
-                        h.get("timestamp", updated_at),
-                    ),
-                )
-            for evt in getattr(sess, "events", []):
-                c.execute(
-                    """
-                    INSERT INTO session_events
-                    (session_id, event_index, type, data_json, timestamp)
-                    VALUES (?, ?, ?, ?, ?)
-                    ON CONFLICT(session_id, event_index) DO UPDATE SET
-                        type=excluded.type,
-                        data_json=excluded.data_json,
-                        timestamp=excluded.timestamp
-                    """,
-                    (
-                        sess.session_id,
-                        evt["id"],
-                        evt["type"],
-                        _json.dumps(evt["data"], ensure_ascii=False),
-                        evt["ts"],
+                        lane_id,
+                        event.get("role_key"),
+                        event["id"],
+                        event.get("source", "system"),
+                        event["type"],
+                        self._event_payload_for_storage(event),
+                        event["ts"],
                     ),
                 )
 
-    def get_session(self, session_id):
-        """按 session_id 查单个会话 → dict 或 None。"""
+            for artifact in sess.artifacts:
+                self._conn.execute(
+                    """
+                    INSERT INTO artifacts
+                    (id, session_id, lane_id, role_key, round, phase, artifact_kind, content, source_event_seq, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(id) DO UPDATE SET
+                        lane_id=excluded.lane_id,
+                        role_key=excluded.role_key,
+                        round=excluded.round,
+                        phase=excluded.phase,
+                        artifact_kind=excluded.artifact_kind,
+                        content=excluded.content,
+                        source_event_seq=excluded.source_event_seq,
+                        created_at=excluded.created_at
+                    """,
+                    (
+                        artifact["id"],
+                        sess.session_id,
+                        artifact["lane_id"],
+                        artifact["role_key"],
+                        artifact["round"],
+                        artifact["phase"],
+                        artifact["artifact_kind"],
+                        artifact["content"],
+                        artifact.get("source_event_seq"),
+                        artifact["created_at"],
+                    ),
+                )
+
+            for intervention in sess.interventions:
+                self._conn.execute(
+                    """
+                    INSERT INTO interventions
+                    (id, session_id, origin_view, origin_role_key, target_scope, target_roles_json,
+                     text, command, status, consumed_by_roles_json, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(id) DO UPDATE SET
+                        origin_view=excluded.origin_view,
+                        origin_role_key=excluded.origin_role_key,
+                        target_scope=excluded.target_scope,
+                        target_roles_json=excluded.target_roles_json,
+                        text=excluded.text,
+                        command=excluded.command,
+                        status=excluded.status,
+                        consumed_by_roles_json=excluded.consumed_by_roles_json,
+                        created_at=excluded.created_at,
+                        updated_at=excluded.updated_at
+                    """,
+                    (
+                        intervention["id"],
+                        sess.session_id,
+                        intervention["origin_view"],
+                        intervention.get("origin_role_key"),
+                        intervention["target_scope"],
+                        json.dumps(intervention.get("target_roles", []), ensure_ascii=False),
+                        intervention.get("text", ""),
+                        intervention.get("command"),
+                        intervention["status"],
+                        json.dumps(intervention.get("consumed_by_roles", {}), ensure_ascii=False),
+                        intervention["created_at"],
+                        intervention["updated_at"],
+                    ),
+                )
+
+    def get_session_bundle(self, session_id):
         with self._lock:
             c = self._conn.cursor()
             c.execute("SELECT * FROM sessions WHERE id = ?", (session_id,))
-            row = c.fetchone()
-            if row is None:
+            session_row = c.fetchone()
+            if not session_row:
                 return None
-            return self._row_dict(c, row)
+            session_data = self._row_dict(c, session_row)
+
+            c.execute(
+                """
+                SELECT role_key, tool_id, enabled, sort_order, resume_state_json
+                FROM workflow_roles
+                WHERE session_id = ?
+                ORDER BY sort_order, role_key
+                """,
+                (session_id,),
+            )
+            roles = [self._row_dict(c, row) for row in c.fetchall()]
+
+            c.execute(
+                """
+                SELECT id, role_key, lane_status, transport_kind, last_seq, viewport_json
+                FROM role_lanes
+                WHERE session_id = ?
+                ORDER BY role_key
+                """,
+                (session_id,),
+            )
+            lanes = [self._row_dict(c, row) for row in c.fetchall()]
+
+            c.execute(
+                """
+                SELECT seq, role_key, source, kind, payload_json, created_at
+                FROM role_events
+                WHERE session_id = ?
+                ORDER BY seq
+                """,
+                (session_id,),
+            )
+            events = [
+                {
+                    "id": row[0],
+                    "role_key": row[1],
+                    "source": row[2],
+                    "type": row[3],
+                    "data": json.loads(row[4]) if row[4] else {},
+                    "ts": row[5],
+                }
+                for row in c.fetchall()
+            ]
+
+            c.execute(
+                """
+                SELECT id, lane_id, role_key, round, phase, artifact_kind, content, source_event_seq, created_at
+                FROM artifacts
+                WHERE session_id = ?
+                ORDER BY created_at
+                """,
+                (session_id,),
+            )
+            artifacts = [
+                {
+                    "id": row[0],
+                    "session_id": session_id,
+                    "lane_id": row[1],
+                    "role_key": row[2],
+                    "round": row[3],
+                    "phase": row[4],
+                    "artifact_kind": row[5],
+                    "content": row[6],
+                    "source_event_seq": row[7],
+                    "created_at": row[8],
+                }
+                for row in c.fetchall()
+            ]
+
+            c.execute(
+                """
+                SELECT id, origin_view, origin_role_key, target_scope, target_roles_json,
+                       text, command, status, consumed_by_roles_json, created_at, updated_at
+                FROM interventions
+                WHERE session_id = ?
+                ORDER BY created_at
+                """,
+                (session_id,),
+            )
+            interventions = [
+                {
+                    "id": row[0],
+                    "session_id": session_id,
+                    "origin_view": row[1],
+                    "origin_role_key": row[2],
+                    "target_scope": row[3],
+                    "target_roles": json.loads(row[4]) if row[4] else [],
+                    "text": row[5],
+                    "command": row[6],
+                    "status": row[7],
+                    "consumed_by_roles": json.loads(row[8]) if row[8] else {},
+                    "created_at": row[9],
+                    "updated_at": row[10],
+                }
+                for row in c.fetchall()
+            ]
+
+            return {
+                "session": session_data,
+                "workflow": {
+                    "view_mode": session_data["view_mode"],
+                    "workflow_template": session_data["workflow_template"],
+                    "max_rounds": session_data["max_rounds"],
+                    "max_review_rounds": session_data["max_review_rounds"],
+                },
+                "roles": roles,
+                "lanes": lanes,
+                "events": events,
+                "artifacts": artifacts,
+                "interventions": interventions,
+            }
 
     def list_sessions(self, limit=50, offset=0):
-        """按 updated_at DESC 分页查询统一会话索引。"""
         with self._lock:
             c = self._conn.cursor()
             c.execute(
                 """
-                SELECT id, task, project_path, status, phase,
-                       current_round, max_rounds, consensus, consensus_round,
-                       planner_tool_id, reviewer_tool_id, created_at, updated_at,
-                       finished_at, interrupt_reason
+                SELECT id, task, project_path, view_mode, status, active_stage,
+                       current_round, current_review_round, max_rounds, max_review_rounds,
+                       updated_at, created_at, finished_at, interrupt_reason
                 FROM sessions
                 ORDER BY updated_at DESC, created_at DESC
                 LIMIT ? OFFSET ?
                 """,
                 (limit, offset),
             )
-            return [self._session_summary(self._row_dict(c, row)) for row in c.fetchall()]
-
-    def get_session_history(self, session_id):
-        """查询指定会话的协商历史条目。"""
-        with self._lock:
-            c = self._conn.cursor()
-            c.execute(
-                """
-                SELECT round, role, phase, content, timestamp
-                FROM session_history
-                WHERE session_id = ?
-                ORDER BY id
-                """,
-                (session_id,),
-            )
-            return [self._row_dict(c, row) for row in c.fetchall()]
-
-    def get_session_review_history(self, session_id):
-        """查询指定会话的审查历史条目。"""
-        with self._lock:
-            c = self._conn.cursor()
-            c.execute(
-                """
-                SELECT round, role, phase, content, timestamp
-                FROM review_history
-                WHERE session_id = ?
-                ORDER BY id
-                """,
-                (session_id,),
-            )
-            return [self._row_dict(c, row) for row in c.fetchall()]
-
-    def get_session_events(self, session_id):
-        """查询指定会话的事件流。"""
-        with self._lock:
-            c = self._conn.cursor()
-            c.execute(
-                """
-                SELECT event_index, type, data_json, timestamp
-                FROM session_events
-                WHERE session_id = ?
-                ORDER BY event_index
-                """,
-                (session_id,),
-            )
             rows = []
             for row in c.fetchall():
-                rows.append({
-                    "id": row[0],
-                    "type": row[1],
-                    "data": _json.loads(row[2]) if row[2] else {},
-                    "ts": row[3],
-                })
+                rows.append(
+                    {
+                        "session_id": row[0],
+                        "task": row[1],
+                        "project_path": row[2],
+                        "view_mode": row[3],
+                        "status": row[4],
+                        "active_stage": row[5],
+                        "current_round": row[6],
+                        "current_review_round": row[7],
+                        "max_rounds": row[8],
+                        "max_review_rounds": row[9],
+                        "updated_at": row[10],
+                        "created_at": row[11],
+                        "finished_at": row[12],
+                        "interrupt_reason": row[13],
+                    }
+                )
             return rows
 
     def mark_incomplete_sessions_interrupted(self):
-        """进程重启后，把活动中的会话统一标记为 interrupted。"""
-        now = datetime.now().isoformat()
         with self._lock, self._conn:
+            now = datetime.now().isoformat()
             placeholders = ",".join("?" for _ in _ACTIVE_STATUSES)
             self._conn.execute(
                 f"""
@@ -403,71 +695,12 @@ class Store:
                 (now, *_ACTIVE_STATUSES),
             )
 
-    # ═════════════════════════════════════════════════════════════════
-    # Prompts
-    # ═════════════════════════════════════════════════════════════════
-
-    def save_prompts(self, config):
-        """保存提示词配置到 prompt_templates（使用 __global__ 哨兵值）。"""
-        now = datetime.now().isoformat()
-        with self._lock, self._conn:
-            c = self._conn.cursor()
-            c.execute("DELETE FROM prompt_templates WHERE tool_id = ?", (GLOBAL_TOOL_ID,))
-            for key, value in config.items():
-                c.execute(
-                    """
-                    INSERT INTO prompt_templates
-                    (key, tool_id, value, updated_at)
-                    VALUES (?, ?, ?, ?)
-                    """,
-                    (key, GLOBAL_TOOL_ID, value, now),
-                )
-
-    def load_prompts(self):
-        """加载全局提示词配置 → dict。"""
-        with self._lock:
-            c = self._conn.cursor()
-            c.execute(
-                "SELECT key, value FROM prompt_templates WHERE tool_id = ?",
-                (GLOBAL_TOOL_ID,),
-            )
-            return {row[0]: row[1] for row in c.fetchall()}
-
-    # ═════════════════════════════════════════════════════════════════
-    # Recent Paths
-    # ═════════════════════════════════════════════════════════════════
-
-    def save_recent_paths(self, paths):
-        """保存最近路径列表（单调递减时间戳保 MRU 位序）。"""
-        base = datetime.now()
-        with self._lock, self._conn:
-            c = self._conn.cursor()
-            c.execute("DELETE FROM recent_paths")
-            for i, path in enumerate(paths):
-                ts = (base - timedelta(microseconds=i)).isoformat()
-                c.execute(
-                    "INSERT INTO recent_paths (path, last_used_at) VALUES (?, ?)",
-                    (path, ts),
-                )
-
-    def load_recent_paths(self):
-        """加载最近路径列表（按 last_used_at DESC）。"""
-        with self._lock:
-            c = self._conn.cursor()
-            c.execute("SELECT path FROM recent_paths ORDER BY last_used_at DESC")
-            return [row[0] for row in c.fetchall()]
-
-    # ═════════════════════════════════════════════════════════════════
-    # CLI Tools
-    # ═════════════════════════════════════════════════════════════════
-
     def register_tool(self, tool_id, display_name, capabilities,
                       agent_name=None, detected_installed=False,
                       executable_path=None, version=None,
                       probe_error=None, last_checked_at=None):
-        """注册或更新 CLI 工具信息。"""
         if not isinstance(capabilities, str):
-            capabilities = _json.dumps(capabilities, ensure_ascii=False)
+            capabilities = json.dumps(capabilities, ensure_ascii=False)
         with self._lock, self._conn:
             self._conn.execute(
                 """
@@ -499,91 +732,77 @@ class Store:
             )
 
     def list_tools(self):
-        """列出已注册 CLI 工具。"""
         with self._lock:
             c = self._conn.cursor()
             c.execute(
                 """
-                SELECT id, display_name, agent_name, detected_installed,
-                       executable_path, version, probe_error,
-                       capabilities_json, last_checked_at
+                SELECT id, display_name, agent_name, detected_installed, executable_path,
+                       version, probe_error, capabilities_json, last_checked_at
                 FROM cli_tools
                 ORDER BY id
                 """
             )
-            return [{
-                "id": row[0],
-                "display_name": row[1],
-                "agent_name": row[2],
-                "detected_installed": bool(row[3]),
-                "executable_path": row[4],
-                "version": row[5],
-                "probe_error": row[6],
-                "capabilities": _json.loads(row[7]) if row[7] else {},
-                "last_checked_at": row[8],
-            } for row in c.fetchall()]
+            return [
+                {
+                    "id": row[0],
+                    "display_name": row[1],
+                    "agent_name": row[2],
+                    "detected_installed": bool(row[3]),
+                    "executable_path": row[4],
+                    "version": row[5],
+                    "probe_error": row[6],
+                    "capabilities": json.loads(row[7]) if row[7] else {},
+                    "last_checked_at": row[8],
+                }
+                for row in c.fetchall()
+            ]
 
-    # ═════════════════════════════════════════════════════════════════
-    # Role Config
-    # ═════════════════════════════════════════════════════════════════
-
-    def save_role_config(self, planner_tool_id, reviewer_tool_id):
-        """保存活跃角色配置（单活跃模型：写入即覆盖）。"""
+    def save_prompts(self, config):
+        now = datetime.now().isoformat()
         with self._lock, self._conn:
-            self._conn.execute(
-                """
-                INSERT INTO role_assignments
-                (name, planner_tool_id, reviewer_tool_id, is_active)
-                VALUES ('default', ?, ?, 1)
-                ON CONFLICT(name) DO UPDATE SET
-                    planner_tool_id=excluded.planner_tool_id,
-                    reviewer_tool_id=excluded.reviewer_tool_id,
-                    is_active=1
-                """,
-                (planner_tool_id, reviewer_tool_id),
-            )
+            self._conn.execute("DELETE FROM prompt_templates")
+            for key, value in config.items():
+                self._conn.execute(
+                    "INSERT INTO prompt_templates (key, value, updated_at) VALUES (?, ?, ?)",
+                    (key, value, now),
+                )
 
-    def load_role_config(self):
-        """加载活跃角色配置 → dict 或 None。"""
+    def load_prompts(self):
         with self._lock:
             c = self._conn.cursor()
-            c.execute(
-                """
-                SELECT planner_tool_id, reviewer_tool_id
-                FROM role_assignments
-                WHERE is_active = 1
-                LIMIT 1
-                """
-            )
-            row = c.fetchone()
-            if row:
-                return {"planner_tool_id": row[0], "reviewer_tool_id": row[1]}
-            return None
+            c.execute("SELECT key, value FROM prompt_templates")
+            return {row[0]: row[1] for row in c.fetchall()}
 
-    # ═════════════════════════════════════════════════════════════════
-    # Migration Markers (_meta)
-    # ═════════════════════════════════════════════════════════════════
+    def save_recent_paths(self, paths):
+        base = datetime.now()
+        with self._lock, self._conn:
+            self._conn.execute("DELETE FROM recent_paths")
+            for index, path in enumerate(paths):
+                ts = (base - timedelta(microseconds=index)).isoformat()
+                self._conn.execute(
+                    "INSERT INTO recent_paths (path, last_used_at) VALUES (?, ?)",
+                    (path, ts),
+                )
 
-    def is_migration_complete(self, domain):
-        """检查指定域的 JSON→SQLite 迁移是否已完成。"""
+    def load_recent_paths(self):
         with self._lock:
             c = self._conn.cursor()
-            c.execute("SELECT value FROM _meta WHERE key = ?", (f"{domain}_migrated",))
-            row = c.fetchone()
-            return row is not None and row[0] == "true"
+            c.execute("SELECT path FROM recent_paths ORDER BY last_used_at DESC")
+            return [row[0] for row in c.fetchall()]
 
-    def mark_migration_complete(self, domain):
-        """标记指定域的迁移已完成。"""
+    def save_workflow_config(self, config: dict):
         with self._lock, self._conn:
             self._conn.execute(
                 "INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)",
-                (f"{domain}_migrated", "true"),
+                (_DEFAULT_WORKFLOW_KEY, json.dumps(config, ensure_ascii=False)),
             )
 
-    # ═════════════════════════════════════════════════════════════════
-    # Lifecycle
-    # ═════════════════════════════════════════════════════════════════
+    def load_workflow_config(self):
+        with self._lock:
+            c = self._conn.cursor()
+            c.execute("SELECT value FROM _meta WHERE key = ?", (_DEFAULT_WORKFLOW_KEY,))
+            row = c.fetchone()
+            return json.loads(row[0]) if row and row[0] else None
 
     def close(self):
-        """关闭数据库连接。"""
         self._conn.close()

@@ -216,18 +216,6 @@ def build_claude_first_prompt(task, cwd, planner_name="Claude Code",
     return _join_prompt_sections(context, body, _PLANNER_FIRST_OUTPUT_CONTRACT)
 
 
-def collect_user_injects(history):
-    """从 history 末尾收集连续 user 注入。"""
-    injects = []
-    for h in reversed(history):
-        if h["role"] == "user":
-            injects.append(h["content"])
-        else:
-            break
-    injects.reverse()
-    return injects
-
-
 def build_claude_revise_prompt(codex_feedback, user_injects=None, cwd=None,
                                _detect_context=None, _adapter=None):
     """构建 Planner 修订提示。"""

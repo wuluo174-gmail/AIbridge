@@ -1,252 +1,303 @@
-# Bridge 架构设计 / Architecture Design
+# Bridge 架构设计
 
 ## 1. 架构原则
 
-1. **Python 是唯一业务真相源** — 编排、状态、持久化、CLI 调用全在 Python 内。壳层只做 UI 渲染和 IPC 透传。
-2. **先固化协议，再拆内核，最后换壳** — 顺序不可调换。
-3. **CLIAdapter 只在 Python 内实现** — 前端消费只读元数据 (名称、能力矩阵)，不维护适配逻辑。
-4. **移动端 = 桌面 daemon + 远程 client** — 独立设计，非同一 app 跨平台编译。
-5. **技术选型推迟** — 候选方案 + 取舍分析，待内核稳定后确定。
-6. **bridge.py 不复制** — 唯一 canonical 入口，原地模块化拆分。
-7. **可执行验证优于文档验证** — contract tests 保障协议不漂移。
+### 1.1 Python 后端是唯一业务真相源
 
----
+- 编排在 Python
+- 持久化在 Python
+- 角色运行态在 Python
+- CLI 输出归一化在 Python
+- 前端只持有视图态，不持有业务真相
 
-## 2. 仓库结构
+### 1.2 先改数据结构，再改视图
 
-```
-bridge/                          ← Python 后端模块
-├── protocol.py                    事件类型 + 协议常量
-├── adapters/                      CLI 适配器 (claude, codex)
-├── orchestration/                 编排引擎 + 提示词构建
-├── persistence/                   SQLite store + schema
-├── server.py                      HTTP Server + no-dist bootstrap 页
-└── session.py                     SessionState + 事件管理
+Bridge v4 的核心不是“换一个布局”，而是纠正核心对象定义：
 
-frontend/                        ← Svelte 5 + TypeScript 前端 (Vite 构建)
-├── src/
-│   ├── components/                11 个 Svelte 组件
-│   ├── lib/                       store, event-handler, hydrator, types, api
-│   └── App.svelte                 根组件
-└── dist/                          构建产物 (gitignored，server.py 优先伺服)
+- 旧模型：`logs / versions / executionResult / injectValue`
+- 新模型：`session / role lane / event / artifact / intervention / projection`
 
-src-tauri/                       ← Tauri v2 桌面壳 (Rust)
-├── src/main.rs                    进程管理 + webview 导航
-└── tauri.conf.json                构建/dev 配置
+只有先把账本改对，终端模式和场景模式才能自然长出来。
 
-bridge.py                        ← 薄 facade + main() 入口
-tests/test_contract.py           ← 合同测试 (197 cases)
-```
+### 1.3 Process 与 Result 必须分源
 
-### 数据流
+- `Process` 只读 `role_events`
+- `Result` 只读 `artifacts`
+- 前端实时更新依赖 `history snapshot + SSE 增量事件`，而不是定时轮询后端状态接口
+- 终端/场景投影语义由后端生成并随 `history + SSE` 下发，前端只做渲染与增量合并
+- projection 不落为 ledger 真相；账本持久化原始事件事实，projection 在读取和实时流阶段生成
 
-```
-用户输入 ──POST /api/start──► SessionState (内存会话)
-                                    │
-                                    ├── _persist_session() ──► SQLite 会话账本
-                                    │                           ├ sessions
-                                    │                           ├ session_events
-                                    │                           ├ session_history
-                                    │                           └ review_history
-                                    │
-                              ┌─────▼─────┐
-                              │ 编排引擎    │
-                              │ (线程)     │
-                              └─────┬─────┘
-                                    │
-                         ┌──────────┼──────────┐
-                         ▼                     ▼
-                   call_claude_streaming  call_codex_streaming
-                         │                     │
-                         ▼                     ▼
-                   add_event / add_history_event
-                         │
-                         ├── sess.events[] ──► GET /api/events
-                         └── SQLite 统一账本 ─► GET /api/state /history /sessions
-                                                   │
-                                                   ▼
-                                              前端 hydrate / handle(e)
+不能再靠日志反推结果，也不能再靠 history 拼装过程。
+
+## 2. 分层设计
+
+```text
+┌────────────────────────────────────────────────────┐
+│ Frontend View                                      │
+│ terminal mode / scene mode                         │
+└──────────────────────▲─────────────────────────────┘
+                       │
+┌──────────────────────┴─────────────────────────────┐
+│ Projection Layer                                   │
+│ project_terminal() / project_scene() / history     │
+└──────────────────────▲─────────────────────────────┘
+                       │
+┌──────────────────────┴─────────────────────────────┐
+│ Workflow Engine                                    │
+│ planning -> reviewing -> executing -> validating   │
+│                            -> repairing -> done    │
+└──────────────────────▲─────────────────────────────┘
+                       │
+┌──────────────────────┴─────────────────────────────┐
+│ Lane Runtime                                       │
+│ one runtime per role lane                          │
+│ adapter stdout/stderr/result -> role_events        │
+│ result extraction -> artifacts                     │
+└──────────────────────▲─────────────────────────────┘
+                       │
+┌──────────────────────┴─────────────────────────────┐
+│ SQLite Ledger                                      │
+│ sessions / workflow_roles / role_lanes /           │
+│ role_events / artifacts / interventions            │
+└────────────────────────────────────────────────────┘
 ```
 
-### 关键耦合点
+## 3. 统一工作流模板
 
-1. **CLI Wrapper ↔ 编排引擎**: call_claude_streaming 的 canonical 输出就是 CLI `result` 文本，wrapper 保持纯 I/O
-2. **前端 ↔ 事件协议**: handle(e) 的事件分支与 add_event 调用一一对应
-3. **前端 ↔ HTTP API**: 历史查看、恢复、轮询都建立在 /api/state, /api/history, /api/events, /api/sessions 上
-4. **会话绑定 ↔ CLI flags**: adapter_state 决定首次会话与 resume 行为
+当前只实现一个固定模板：
 
----
+1. `planner` 产出方案
+2. `reviewer` 审查方案
+3. 达成共识后 `executor` 执行
+4. `validator` 校验是否收口
+5. 如果未收口，则进入 `executor -> validator` 修复闭环
 
-## 3. 目标架构
+为什么固定四角色而不是任意 N 角色：
 
-```
-┌───────────────────────────────────────────────┐
-│ Python Backend (唯一业务真相源)                  │
-│                                               │
-│  ┌──────────┐  ┌─────────────┐  ┌──────────┐ │
-│  │ Adapters │  │ Orchestration│  │ Protocol │ │
-│  │ ├ claude │  │ ├ negotiation│  │ ├ events │ │
-│  │ ├ codex  │  │ ├ execution  │  │ ├ state  │ │
-│  │ └ (扩展) │  │ ├ review     │  │ └ api    │ │
-│  └────┬─────┘  │ └ session    │  └────┬─────┘ │
-│  subprocess    └──────────────┘  HTTP/IPC     │
-│       │                               │       │
-│  ┌────▼─────┐                  ┌──────▼─────┐ │
-│  │ CLI 工具  │                  │ 壳层(可替换) │ │
-│  │ claude   │                  │ 当前: HTTP  │ │
-│  │ codex    │                  │ 未来: 待选  │ │
-│  └──────────┘                  └────────────┘ │
-│                                               │
-│  ┌──────────────────────────────────────────┐ │
-│  │ Persistence (Python sqlite3)             │ │
-│  │ 统一会话账本 / 提示词 / 最近路径 / 工具注册 │ │
-│  │ ※纯内存运行态不可持久化，逻辑状态可恢复     │ │
-│  └──────────────────────────────────────────┘ │
-└───────────────────────────────────────────────┘
-```
+- 当前目标是消除返工，不是做抽象玩具
+- 四角色已经覆盖双人对抗、多人分工、单工具全包
+- 数据结构仍然是归一化的，将来真要扩展时不需要再改 schema
 
-### 模块边界
+## 4. 核心实体
 
-| 模块 | 职责 | 外部依赖 |
-|------|------|---------|
-| `bridge/session.py` | SessionState 类 + 事件管理 | protocol (EVENT_TYPES) |
-| `bridge/protocol.py` | 事件类型常量 + 状态枚举 | 无 |
-| `bridge/adapters/base.py` | CLIAdapter ABC + run() 进程生命周期 | session (add_event) |
-| `bridge/adapters/claude_adapter.py` | Claude Code CLI 封装 | subprocess |
-| `bridge/adapters/codex_adapter.py` | Codex CLI 封装 | subprocess |
-| `bridge/orchestration/engine.py` | 协商/执行/审查循环 | adapters, session, protocol |
-| `bridge/orchestration/prompts.py` | 提示词构建 | protocol (键常量) |
-| `bridge/persistence/store.py` | SQLite 持久化 | sqlite3 (标准库) |
+## 4.1 Session
 
-### CLIAdapter 抽象
+负责：
 
-```python
-class CLIAdapter(ABC):
-    id: str                    # "claude-code", "codex"
-    display_name: str
-    cli_name: str              # 可执行文件名: "claude", "codex"
-    agent_name: str            # 事件流代理名: "claude", "codex"
-    log_raw_stdout: bool       # Codex=True (记录 raw lines), Claude=False (仅 text chunks)
+- 项目路径
+- 用户任务
+- 会话状态
+- 当前阶段
+- 当前轮次
+- view mode
+- interrupt / error 信息
 
-    @property
-    def capabilities(self) -> dict:
-        """能力矩阵 — 前端只读消费"""
-        ...
+不负责：
 
-    # ── 生命周期 ──
-    def check_installed(self) -> bool: ...          # 具体: shutil.which(cli_name)
-    def run(self, prompt, cwd, sess, **kw) -> str:  # 具体: Template Method (进程生命周期)
+- 存放某个角色的最终输出
+- 存放过程日志
 
-    # ── 抽象钩子 (子类必须实现) ──
-    @abstractmethod
-    def build_command(self, prompt, cwd, **kwargs) -> list[str]: ...
-    @abstractmethod
-    def parse_stream_line(self, line: str) -> dict | None: ...
+## 4.2 WorkflowRole
 
-    # ── 可选钩子 (子类可重写) ──
-    def get_env_overrides(self) -> dict | None: ...       # 默认 None
-    def extract_result(self, stream_display, result_text) -> str: ...  # 默认 result_text or join
-    def format_process_error(self, returncode, log_file) -> str: ...   # 非零退出消息
-    def format_not_found_error(self) -> str: ...           # FileNotFoundError 消息
+角色到工具的绑定关系：
 
-    # ── 协议检测 ──
-    def detect_approval(self, text: str) -> bool: ...
-    def detect_closure(self, text: str) -> bool: ...
+- `role_key`
+- `tool_id`
+- `enabled`
+- `sort_order`
 
-    # ── 共享工具 ──
-    @staticmethod
-    def stderr_reader(proc, agent, log_file, log_lock, sess): ...
-```
+它是配置对象，不是运行态。
 
-### 持久化边界
+## 4.3 RoleLane
 
-| 类别 | 可持久化 | 说明 |
-|------|---------|------|
-| 会话全生命周期快照 | ✓ | 从 start 创建即写入，持续更新 status / phase / updated_at / finished_at |
-| 事件日志 | ✓ | `session_events` 用于状态与历史回放 |
-| 协商/审查历史 | ✓ | `session_history` / `review_history` |
-| 提示词模板 | ✓ | 11 个键 + 未来按工具覆盖 |
-| 最近路径 | ✓ | ≤10 条 |
-| CLI 工具注册 | ✓ | 安装路径、版本、能力快照 |
-| **纯内存运行态** | ✗ | stop_flag, active_proc, active_pgid, event_lock 等。重启后不恢复对象本身，但依据账本重建可恢复会话 |
+角色运行通道：
 
----
+- `lane_id`
+- `lane_status`
+- `transport_kind`
+- `last_seq`
+- `resume_state`
 
-## 4. 候选技术选型与取舍
+`RoleLane` 是终端模式成立的基础，因为“终端”并不是某个 UI 组件，而是角色级运行通道的投影。
 
-### 4.1 桌面壳
+lane 还拥有自己的 viewport 元数据：
 
-| 方案 | 优势 | 劣势 | 适用场景 |
-|------|------|------|---------|
-| **Tauri v2** | 包体小 (5-10MB)，原生 sidecar 管理，v2 支持移动 | Python sidecar 打包复杂，移动端成熟度待验证 | 重视包体和跨平台原生体验 |
-| **Electron** | 生态最成熟，调试工具完善，社区大 | 包体大 (150MB+)，内存占用高 | 重视开发效率和生态 |
-| **保持 HTTP+浏览器** | 零打包成本，当前方案直接可用 | 非原生体验，无系统集成 (通知/托盘等) | 优先快速迭代，暂不关注分发 |
+- `width_px`
+- `height_px`
+- `cols`
+- `rows`
 
-**Step 8A 决策 (macOS POC)**: Tauri v2。Python 后端通过 `/bin/zsh -c` 启动（复制 `.command` 的 PATH + zshrc 语义）。
-进程管理：`start_new_session=True` 隔离 CLI 进程组，`proc_lock` 保护 pgid 原子读写，
-二段式清理 (SIGTERM → 3s → SIGKILL)。Tauri webview 加载 `http://localhost:PORT/`。
-Linux 可从此 POC 延伸（同为 POSIX），Windows 为独立后续步骤。
+## 4.4 RoleEvent
 
-### 4.2 前端框架
+不可逆事实流，负责记录：
 
-**已决策: Svelte 5 + TypeScript** (Step 9 实施完成)
+- thinking started
+- CLI started
+- stdout/stderr chunk
+- command started
+- command output
+- result emitted
+- intervention consumed
+- session stage / status 变化
 
-- 编译时优化，包体极小，Svelte 5 runes 提供细粒度响应式
-- frontend/ 为独立 Vite 项目，Tauri beforeBuildCommand / beforeDevCommand 自动编译
-- server.py 在无 dist 时只返回构建引导页，不再维护第二套前端快照
+## 4.5 Artifact
 
-### 4.3 持久化
+结构化产物，负责成为下游输入和历史视图的稳定依赖：
 
-| 方案 | 优势 | 劣势 |
-|------|------|------|
-| **Python sqlite3** | 标准库零依赖，查询能力强，单文件可移植 | 并发写入需注意 WAL 模式 |
-| **JSON 文件** | 最简单，当前已使用 (prompts.json, recent_paths.json) | 查询能力弱，大数据量性能差 |
+- `plan`
+- `review`
+- `execution_summary`
+- `validation_report`
+- `consensus_snapshot`
 
-**倾向**: sqlite3 (标准库，零外部依赖，与项目"零依赖"理念一致)
+## 4.6 Intervention
 
-### 4.4 移动端
+用户输入是一等对象，不再作为 `history.role=user` 的补丁。
 
-详见 MOBILE_DESIGN.md。核心决策: 桌面 daemon + 远程 client 架构，技术方案待前面步骤稳定后选。
+它有明确生命周期：
 
----
+- `queued`
+- `acknowledged`
+- `consumed`
+- `cancelled`
+- `rejected`
 
-## 5. 迁移策略
+## 5. 运行时数据流
 
-### 核心约束
+### 5.1 协商阶段
 
-1. `python bridge.py` **必须在每个迁移步骤后仍可完整运行**
-2. 每步只迁移一个模块边界
-3. 每步跑 contract tests 验证不回归
-4. 骨架文件在 Step 2 开始接入运行路径
-
-### 迁移顺序
-
-```
-Step 1: 固化协议 + 骨架 (本次)
-    │
-Step 2: bridge/session.py (SessionState + 事件管理)
-    │
-Step 3: bridge/adapters/ (CLI 适配器)
-    │
-Step 4: bridge/orchestration/engine.py (编排引擎)
-    │
-Step 5: bridge/orchestration/prompts.py + HTTP Server (提示词 + 路径 + Server)
-    │
-Step 6: bridge/persistence/ (SQLite 持久化)
-    │
-Step 7: adapter 扩展 + 角色配置 UI
-    │
-Step 8: 桌面壳选型 + 集成
-    │
-Step 9: 前端框架迁移 ✅ (Svelte 5 + Vite + TypeScript)
-    │
-Step 10: 移动端 daemon + remote client
+```text
+task
+  -> planner prompt
+  -> planner lane runtime
+  -> role_events(stdout/stderr/result)
+  -> artifact(plan)
+  -> reviewer prompt
+  -> reviewer lane runtime
+  -> artifact(review)
+  -> consensus / max_rounds
 ```
 
-### 为什么这个顺序
+### 5.2 执行阶段
 
-- **Session 先拆**: 它是所有模块的基础依赖，且最独立
-- **Adapter 第二**: 依赖 Session (add_event)，被 Engine 依赖
-- **Engine 第三**: 依赖 Adapter + Session，是最大最复杂的模块
-- **Server 最后拆**: 它是"壳层"，依赖所有上层模块，也是将来被替换的部分
-- **桌面壳和前端框架放最后**: 协议固化 + 内核稳定后换壳才有意义
+```text
+artifact(plan)
+  -> executor prompt
+  -> executor lane runtime
+  -> role_events
+  -> artifact(execution_summary)
+```
+
+### 5.3 校验阶段
+
+```text
+artifact(execution_summary) + git diff
+  -> validator prompt
+  -> validator lane runtime
+  -> artifact(validation_report)
+  -> done or repairing
+```
+
+### 5.4 用户输入流
+
+```text
+terminal text / scene text / slash command
+  -> POST /api/input
+  -> intervention ledger or control action
+  -> workflow engine chooses when to consume
+  -> consumed_by_roles recorded
+```
+
+## 6. 双模式投影
+
+## 6.1 Terminal 模式
+
+面向专业用户。
+
+特点：
+
+- 四角色终端工作区
+- 桌面默认 `2x2`
+- 小屏退化为 tabs
+- 每个角色独立输入
+- slash command 由 Bridge 命令解释器接管
+
+关键边界：
+
+- 不是通用 IDE
+- 不是把用户键盘直连到底层 CLI 原始 stdin
+
+## 6.2 Scene 模式
+
+面向非专业用户。
+
+特点：
+
+- 同一底层事实流投影为时间线
+- 更像“几个 agent/真人在协商”
+- 底部友好输入框只是统一 `/api/input` 的另一个壳
+
+## 7. 持久化架构
+
+统一账本如下：
+
+- `sessions`
+- `workflow_roles`
+- `role_lanes`
+- `role_events`
+- `artifacts`
+- `interventions`
+
+持久化策略：
+
+- `SessionState` 每次状态变化后持久化
+- 事件、artifact、intervention 都以 append 为主
+- 进程对象和锁不持久化
+- 重启时活动会话统一标记为 `interrupted`
+
+## 8. 恢复机制
+
+恢复只依赖统一账本，不依赖前端补推导：
+
+1. 读 `sessions`
+2. 读 `workflow_roles`
+3. 读 `role_lanes`
+4. 读 `role_events`
+5. 读 `artifacts`
+6. 读 `interventions`
+7. 重建 `SessionState`
+
+前端刷新时只调用：
+
+- `GET /api/session/state`
+- `GET /api/history`
+- `GET /api/stream`
+
+其中：
+
+- `GET /api/history` 直接返回统一账本中的 `events / artifacts / interventions`
+- 前端先用账本恢复，再用 `stream_cursor` 补增量流
+- 不再通过“从 0 开始重放所有 SSE”来重建过程区
+
+## 9. 与旧架构的决裂点
+
+以下设计已经被显式废弃：
+
+- `planner_tool_id / reviewer_tool_id` 二元角色模型
+- `_resolve_execution_roles()` 推导执行角色
+- `session_history / review_history / session_events`
+- `execution_result` 挂在 session 上
+- `/api/inject`
+- `Process / Result` 共享同一份非结构化数据
+
+## 10. 非目标
+
+本轮不做：
+
+- 任意 N 角色可视化编排图
+- 文件树
+- 代码编辑器
+- 真 PTY 透传
+- 旧协议兼容层
+
+Bridge 仍然是编排器，不是通用 IDE。

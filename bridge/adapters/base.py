@@ -210,7 +210,14 @@ class CLIAdapter(ABC):
         return None
 
     def extract_result(self, stream_display: list[str], result_text: str) -> str:
-        """从流数据计算最终输出。默认优先 result_text，否则拼接 stream_display。"""
+        """从流数据中选出应作为 artifact 发布的内容。
+
+        子类应根据 CLI 工具的输出语义 override 此方法：
+        - stream_display: text_delta/stdout 逐行累积的完整流输出
+        - result_text: CLI 工具返回的结构化 result 字段
+
+        默认：优先 result_text，fallback stream_display。
+        """
         return result_text or "".join(stream_display).strip()
 
     def format_process_error(self, returncode: int, log_file) -> str:
@@ -236,7 +243,7 @@ class CLIAdapter(ABC):
     # ── 共享工具 ──
 
     @staticmethod
-    def stderr_reader(proc, agent, log_file, log_lock, sess):
+    def stderr_reader(proc, role_key, log_file, log_lock, sess):
         """后台线程：逐行读取 stderr，推送到过程日志，防止 pipe buffer 填满导致死锁。"""
         MCP_NOISE = ("mcp:", "mcp_", "starting mcp", "mcp server", "mcp startup",
                      "mcp client", "handshaking", "initialize response")
@@ -249,10 +256,13 @@ class CLIAdapter(ABC):
                     log_file.write(f"[stderr] {line}")
                     log_file.flush()
                 is_mcp = any(p in stripped.lower() for p in MCP_NOISE)
-                if is_mcp:
-                    add_event(sess, "agent_stderr", {"agent": agent, "text": stripped, "is_mcp": True})
-                else:
-                    add_event(sess, "agent_chunk", {"agent": agent, "text": stripped + "\n"})
+                add_event(
+                    sess,
+                    "lane.stderr_chunk",
+                    {"text": stripped + "\n", "is_mcp": is_mcp},
+                    role_key=role_key,
+                    source="stderr",
+                )
         except ValueError:
             pass  # pipe closed
 
@@ -264,11 +274,17 @@ class CLIAdapter(ABC):
         agent_label: 覆盖事件中的 agent 名称。高层 role caller 传 "planner"/"reviewer"
                      控制前端面板路由。低层直接调用不传，使用 self.agent_name。
         """
-        agent = agent_label or self.agent_name
-        log_tag = log_tag or agent
+        role_key = kwargs.pop("role_key", None) or agent_label or self.agent_name
+        log_tag = log_tag or role_key
         cmd = self.build_command(prompt, cwd, **kwargs)
         log_file = sess.log_dir / f"{log_tag}.log"
-        add_event(sess, "cli_start", {"agent": agent, "round": sess.current_round})
+        add_event(
+            sess,
+            "lane.cli_started",
+            {"round": sess.current_round or sess.current_review_round, "command": cmd},
+            role_key=role_key,
+            source=self.id,
+        )
 
         try:
             env = dict(os.environ)
@@ -292,14 +308,14 @@ class CLIAdapter(ABC):
             result_text = ""
 
             with open(log_file, "a", encoding="utf-8") as lf:
-                header = f"\n{'═'*60}\n[Round {sess.current_round}] {agent.capitalize()} — {datetime.now().strftime('%H:%M:%S')}\n{'═'*60}\n"
+                header = f"\n{'═'*60}\n[Round {sess.current_round or sess.current_review_round}] {role_key.capitalize()} — {datetime.now().strftime('%H:%M:%S')}\n{'═'*60}\n"
                 lf.write(header)
                 lf.flush()
 
                 log_lock = threading.Lock()
                 stderr_t = threading.Thread(
                     target=self.stderr_reader,
-                    args=(proc, agent, lf, log_lock, sess), daemon=True)
+                    args=(proc, role_key, lf, log_lock, sess), daemon=True)
                 stderr_t.start()
 
                 for raw_line in proc.stdout:
@@ -326,7 +342,13 @@ class CLIAdapter(ABC):
                             with log_lock:
                                 lf.write(chunk)
                                 lf.flush()
-                        add_event(sess, "agent_chunk", {"agent": agent, "text": chunk})
+                        add_event(
+                            sess,
+                            "lane.stdout_chunk",
+                            {"text": chunk},
+                            role_key=role_key,
+                            source=self.id,
+                        )
 
                     elif ntype == "block_stop":
                         if stream_display and not stream_display[-1].endswith("\n"):
@@ -335,24 +357,42 @@ class CLIAdapter(ABC):
                                 with log_lock:
                                     lf.write("\n")
                                     lf.flush()
-                            add_event(sess, "agent_chunk", {"agent": agent, "text": "\n"})
+                            add_event(
+                                sess,
+                                "lane.stdout_chunk",
+                                {"text": "\n"},
+                                role_key=role_key,
+                                source=self.id,
+                            )
 
                     elif ntype == "message":
                         text = norm["text"]
                         result_text = text
-                        add_event(sess, "agent_chunk", {"agent": agent, "text": text + "\n"})
+                        add_event(
+                            sess,
+                            "lane.stdout_chunk",
+                            {"text": text + "\n"},
+                            role_key=role_key,
+                            source=self.id,
+                        )
 
                     elif ntype == "command_start":
-                        add_event(sess, "agent_chunk", {
-                            "agent": agent, "text": f"$ {norm['command']}\n",
-                            "chunk_type": "command"})
+                        add_event(
+                            sess,
+                            "lane.command_started",
+                            {"command": norm["command"]},
+                            role_key=role_key,
+                            source=self.id,
+                        )
 
                     elif ntype == "command_output":
-                        add_event(sess, "agent_chunk", {
-                            "agent": agent, "text": norm["output"],
-                            "chunk_type": "command_output"})
-                        add_event(sess, "chunk_boundary", {
-                            "agent": agent, "boundary_type": "command_output"})
+                        add_event(
+                            sess,
+                            "lane.command_output",
+                            {"text": norm["output"]},
+                            role_key=role_key,
+                            source=self.id,
+                        )
 
                     elif ntype == "result":
                         result_text = norm["text"]
@@ -392,7 +432,13 @@ class CLIAdapter(ABC):
                 raise RuntimeError(self.format_process_error(proc.returncode, log_file))
 
             if output:
-                add_event(sess, "agent_result", {"agent": agent, "text": output})
+                add_event(
+                    sess,
+                    "lane.result_emitted",
+                    {"text": output},
+                    role_key=role_key,
+                    source=self.id,
+                )
 
             return output
 

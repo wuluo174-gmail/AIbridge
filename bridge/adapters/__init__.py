@@ -1,31 +1,22 @@
 """
 Bridge CLI Adapters
 ==================
-CLI 工具适配器类导出 + AdapterRegistry + RoleConfig。
-
-Step 3: 类导出和 ADAPTERS 映射。
-Step 7: AdapterRegistry（带 DI 的懒实例化注册表）+ RoleConfig（frozen 角色配置）。
+CLI 工具适配器类导出 + AdapterRegistry。
 """
 
-import dataclasses
 import threading
 
 from .base import CLIAdapter
 from .claude_adapter import ClaudeCodeAdapter
 from .codex_adapter import CodexAdapter
+from .fixture_adapter import FixtureAdapter
 
 # 类映射表 — 保留向后兼容
 ADAPTERS = {
     "claude-code": ClaudeCodeAdapter,
     "codex": CodexAdapter,
+    "fixture-cli": FixtureAdapter,
 }
-
-
-@dataclasses.dataclass(frozen=True)
-class RoleConfig:
-    """角色配置 — frozen 保证线程安全（替换引用而非修改字段）。"""
-    planner_tool_id: str = "claude-code"
-    reviewer_tool_id: str = "codex"
 
 
 class AdapterRegistry:
@@ -34,7 +25,6 @@ class AdapterRegistry:
     - register(): 注册 adapter 类 + DI 依赖，不立即实例化
     - get(): 懒实例化 + 缓存 + 线程安全
     - discover(): 返回所有工具信息（含 agent_name、安装状态、能力矩阵）
-    - resolve_executor(): 返回具有 dangerous_mode 能力的 adapter；若不存在则直接报错
     """
 
     def __init__(self):
@@ -78,14 +68,3 @@ class AdapterRegistry:
     def list_tool_ids(self):
         """返回所有已注册 adapter ID。"""
         return list(self._recipes.keys())
-
-    def resolve_executor(self, role_config):
-        """返回具有 dangerous_mode 能力的 adapter。优先 planner，其次 reviewer。"""
-        for tid in [role_config.planner_tool_id, role_config.reviewer_tool_id]:
-            a = self.get(tid)
-            if a.capabilities.get("dangerous_mode"):
-                return a
-        raise ValueError(
-            "角色配置缺少支持执行模式的工具: "
-            f"{role_config.planner_tool_id}, {role_config.reviewer_tool_id}"
-        )

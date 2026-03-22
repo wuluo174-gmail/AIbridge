@@ -8,11 +8,13 @@ Claude Code 特有功能:
   - --session-id / --resume 会话绑定
   - --permission-mode plan (协商阶段)
   - --dangerously-skip-permissions (执行阶段)
+  - plan mode 产物：.claude/plans/*.md 文件
   - stderr MCP 噪音过滤
 """
 
 import json
 import os
+from pathlib import Path
 
 from .base import CLIAdapter
 
@@ -127,3 +129,48 @@ class ClaudeCodeAdapter(CLIAdapter):
 
     def format_not_found_error(self):
         return "未找到 'claude' 命令。请安装: npm install -g @anthropic-ai/claude-code"
+
+    # ── plan 文件提取 ──
+
+    @staticmethod
+    def _extract_slug(jsonl_path):
+        """从 session JSONL 中提取 slug。"""
+        with open(jsonl_path, encoding="utf-8") as f:
+            for line in f:
+                try:
+                    data = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                slug = data.get("slug")
+                if slug:
+                    return slug
+        return None
+
+    @staticmethod
+    def _read_plan_file(claude_session_id):
+        """session UUID → JSONL slug → ~/.claude/plans/{slug}.md"""
+        home = Path.home()
+        matches = list(home.glob(f".claude/projects/*/{claude_session_id}.jsonl"))
+        if not matches:
+            return None
+        slug = ClaudeCodeAdapter._extract_slug(matches[0])
+        if not slug:
+            return None
+        plan_path = home / ".claude" / "plans" / f"{slug}.md"
+        if not plan_path.is_file():
+            return None
+        return plan_path.read_text(encoding="utf-8").strip()
+
+    def run(self, prompt, cwd, sess, log_tag=None, agent_label=None, **kwargs):
+        bypass_permissions = kwargs.get("bypass_permissions", False)
+        is_plan_mode = not bypass_permissions
+        claude_session_id = kwargs.get("session_id", "")
+
+        stdout_result = super().run(prompt, cwd, sess, log_tag=log_tag, agent_label=agent_label, **kwargs)
+
+        if is_plan_mode and claude_session_id:
+            plan_content = self._read_plan_file(claude_session_id)
+            if plan_content:
+                return plan_content
+
+        return stdout_result

@@ -14,7 +14,8 @@
       "Bash(git commit:*)",
       "Bash(git push:*)",
       "Bash(kill 49257 49256)",
-      "Bash(tmux list-sessions:*)"
+      "Bash(tmux list-sessions:*)",
+      "Bash(python -m pytest tests/test_contract.py -v -k \"AdapterExtractResult\")"
     ]
   }
 }

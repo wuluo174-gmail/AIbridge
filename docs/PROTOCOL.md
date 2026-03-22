@@ -1,241 +1,387 @@
-# Bridge 协议文档 / Protocol Specification
+# Bridge 协议文档
 
-**唯一权威真相源**: [bridge/protocol.py](/Users/809456948qq.com/code/bridge/bridge/protocol.py)
+唯一权威真相源是 [bridge/protocol.py](/Users/809456948qq.com/code/bridge/bridge/protocol.py)。
 
-本文档只做人类可读说明。当本文档与 `bridge/protocol.py` 冲突时，以代码为准。
+本文档解释协议语义、对象关系与接口结构；如果和代码冲突，以代码为准。
 
----
+## 1. 核心对象
 
-## 1. 状态机
+Bridge v4 只承认以下六类一等实体：
 
-### 1.1 状态枚举
+1. `session`
+2. `workflow role`
+3. `role lane`
+4. `role event`
+5. `artifact`
+6. `intervention`
 
-| 状态 | 含义 |
-|------|------|
-| `idle` | 当前标签页没有绑定会话 |
-| `running` | 协商进行中 |
-| `consensus` | 达成共识，等待执行或继续协商 |
-| `max_rounds` | 达到协商轮次上限，等待执行或继续协商 |
-| `executing` | 执行阶段 |
-| `review_pending` | 执行后审查 / 修复后复审进行中 |
-| `review_fix` | 需要用户确认是否修复 |
-| `review_max_rounds` | 审查修复达到上限，等待继续或跳过 |
-| `paused` | 用户主动中断，可恢复 |
-| `interrupted` | 进程/后端异常中断，可恢复 |
-| `aborted` | 用户主动中止，不可恢复 |
-| `done` | 会话完成 |
-| `error` | 会话异常终止 |
+其中：
 
-### 1.2 状态分组
+- `session` 负责整体生命周期
+- `workflow role` 负责角色到工具的绑定
+- `role lane` 负责角色级运行通道
+- `role event` 是唯一过程真相
+- `artifact` 是唯一结构化结果真相
+- `intervention` 是唯一用户输入真相
 
-- `EXECUTABLE_STATES`: `consensus`, `max_rounds`
-- `FIXABLE_STATES`: `review_fix`
-- `CONTINUABLE_STATES`: `consensus`, `max_rounds`
-- `REVIEW_CONTINUABLE_STATES`: `review_max_rounds`
-- `REVIEW_SKIPPABLE_STATES`: `review_fix`, `review_max_rounds`
-- `RESUMABLE_STATES`: `paused`, `interrupted`
-- `TERMINAL_STATES`: `idle`, `aborted`, `done`, `error`
+## 2. 固定角色与模式
 
-### 1.3 生命周期原则
+### 2.1 固定逻辑角色
 
-- 会话从 `POST /api/start` 成功时立即入统一账本。
-- `paused` / `interrupted` 不是终态，而是可恢复检查点。
-- `aborted` 是不可恢复终态。
-- 后端重启时，数据库里仍处于活动态的会话会被统一标记为 `interrupted`。
+- `planner`
+- `reviewer`
+- `executor`
+- `validator`
 
----
+它们是固定工作流模板中的一等角色，不再由 `planner_tool_id / reviewer_tool_id` 临时推导。
 
-## 2. 事件协议
+### 2.2 会话级显示模式
 
-### 2.1 事件结构
+- `terminal`
+- `scene`
+
+模式是会话级的，不是面板级的。
+
+## 3. 会话状态机
+
+### 3.1 会话状态
+
+- `idle`
+- `running`
+- `consensus`
+- `max_rounds`
+- `executing`
+- `validating`
+- `review_fix`
+- `review_max_rounds`
+- `repairing`
+- `paused`
+- `interrupted`
+- `aborted`
+- `done`
+- `error`
+
+### 3.2 活跃阶段
+
+- `planning`
+- `reviewing`
+- `awaiting_execution`
+- `executing`
+- `validating`
+- `repairing`
+- `done`
+
+### 3.3 状态语义
+
+- `running`
+  表示协商阶段正在推进
+- `consensus`
+  表示协商达成共识，等待执行或带理由继续协商
+- `max_rounds`
+  表示协商达到轮次上限，等待执行或继续协商
+- `executing`
+  表示执行者正在执行
+- `validating`
+  表示校验者正在校验
+- `review_fix`
+  表示校验未收口，等待用户决定是否发起修复
+- `review_max_rounds`
+  表示修复闭环达到上限
+- `repairing`
+  表示执行者正在根据校验意见修复
+- `paused` / `interrupted`
+  均可恢复，但来源不同
+
+## 4. 事件协议
+
+### 4.1 事件结构
 
 ```json
 {
-  "id": 0,
-  "type": "round_start",
-  "data": {},
-  "ts": "2026-03-22T12:00:00"
+  "id": 12,
+  "type": "lane.stdout_chunk",
+  "role_key": "planner",
+  "source": "claude-code",
+  "data": {
+    "text": "..."
+  },
+  "ts": "2026-03-22T14:53:30.899669"
 }
 ```
 
-### 2.2 事件类型
+字段定义：
 
-#### 协商阶段
+- `id`
+  会话内单调递增序号，也是 SSE cursor
+- `type`
+  事件类型
+- `role_key`
+  事件所属角色；会话级事件可为 `null`
+- `source`
+  事件来源，通常是 `workflow`、`artifact`、`intervention` 或具体 tool id
+- `data`
+  事件负载；其中 `data.projection` 为后端生成的 canonical projection delta
+- `ts`
+  事件时间戳
 
-- `status_change`
-- `round_start`
-- `agent_thinking`
-- `cli_start`
-- `agent_chunk`
-- `chunk_boundary`
-- `agent_stderr`
-- `agent_result`
-- `agent_response`
-- `consensus_reached`
-- `max_rounds_reached`
-- `warning`
-- `rollback`
-- `error`
+注意：
 
-#### 执行阶段
+- `data.projection` 只用于读取和实时流，不属于持久化 ledger 真相
+- SQLite 中保存的是去掉 projection 的原始事件事实
+- `/api/stream` 对外发送事件时会重新补齐 `data.projection`，因此恢复后的历史事件与新产生的内存事件对外协议一致
 
-- `execution_done`
+### 4.2 事件类型
 
-#### 审查阶段
+- `session.status_changed`
+- `session.stage_changed`
+- `session.view_mode_changed`
+- `lane.status_changed`
+- `lane.viewport_changed`
+- `lane.thinking_started`
+- `lane.cli_started`
+- `lane.stdout_chunk`
+- `lane.stderr_chunk`
+- `lane.command_started`
+- `lane.command_output`
+- `lane.result_emitted`
+- `artifact.published`
+- `intervention.received`
+- `intervention.consumed`
+- `warning.raised`
+- `error.raised`
 
-- `review_start`
-- `review_round_start`
-- `review_response`
-- `review_needs_fix`
-- `review_done`
-- `review_max_rounds_reached`
+### 4.3 事件边界
 
-### 2.3 事件语义
+- `role_events` 是唯一过程真相
+- 会话级事件必须自带 `session` 与 `summary` 快照，前端据此直接更新当前会话和会话列表
+- `lane.status_changed` 必须自带 `lane` 快照，前端据此直接更新角色通道状态
+- `artifact.published` 与 `intervention.*` 必须自带对应对象快照，前端不得再回拉单独接口补全
+- 终端模式与场景模式的增量渲染语义来自 `data.projection`，前端不再自己定义事件到视图的解释规则
+- 前端 `Process` 只读事件流或其投影
+- 任何“从 artifact 反推过程”或“从日志拼接最终结果”的行为都不属于协议
 
-- `agent_response` / `review_response` 是历史与版本视图的核心事件。
-- `status_change` 只表达状态切换，不承担完整历史回放职责。
-- 前端日志是否自动滚到底部，不从事件条数推导，而由视图态 `followTail` 决定。
+## 5. Artifact 协议
 
----
+### 5.1 Artifact 结构
 
-## 3. HTTP API
+```json
+{
+  "id": "artifact_id",
+  "session_id": "sid",
+  "lane_id": "lane_planner_xxx",
+  "role_key": "planner",
+  "round": 1,
+  "phase": "planning",
+  "artifact_kind": "plan",
+  "content": "markdown output",
+  "source_event_seq": 25,
+  "created_at": "2026-03-22T15:00:00"
+}
+```
 
-### 3.1 GET 端点
+### 5.2 Artifact 类型
 
-- `GET /`
-  返回前端页面；优先伺服 `frontend/dist`，否则返回构建引导页。
+- `plan`
+- `review`
+- `execution_summary`
+- `validation_report`
+- `consensus_snapshot`
 
-- `GET /api/events?sid={sid}&since={cursor}`
-  返回 `{events, next}`。
+### 5.3 Artifact 语义
 
-- `GET /api/state?sid={sid}`
-  返回单个会话快照：
-  - `status`
-  - `round`
-  - `max_rounds`
-  - `consensus`
-  - `consensus_round`
-  - `history_len`
-  - `error`
-  - `planner_tool_id`
-  - `reviewer_tool_id`
-  - `executor_panel`
-  - `review_round`
-  - `max_review_rounds`
-  - `phase`
-  - `updated_at`
-  - `finished_at`
-  - `interrupt_reason`
-  - `resume_available`
+- `Result` 视图只能读 artifact
+- 下游角色读取上游结构化输出，也只能读 artifact
+- `execution_result` 不再挂在 session 上
 
-- `GET /api/sessions?limit={n}&offset={n}`
-  返回统一会话索引 `{sessions}`，每项包含：
-  - `session_id`
-  - `task`
-  - `project_path`
-  - `status`
-  - `phase`
-  - `round`
-  - `max_rounds`
-  - `updated_at`
-  - `finished_at`
-  - `interrupt_reason`
-  - `resume_available`
-  - `planner_tool_id`
-  - `reviewer_tool_id`
-  - `consensus`
-  - `consensus_round`
-  - `created_at`
+## 6. Intervention 协议
 
-- `GET /api/history?sid={sid}`
-  返回统一历史：
-  - `entries`
-  - `execution_result`
-  - `review_entries`
-  - `review_round`
-  - `review_status`
-  - `event_cursor`
+### 6.1 Intervention 结构
 
-- `GET /api/browse?path={path}`
-- `GET /api/complete?prefix={prefix}`
+```json
+{
+  "id": "intervention_id",
+  "session_id": "sid",
+  "origin_view": "terminal",
+  "origin_role_key": "planner",
+  "target_roles": ["planner", "reviewer"],
+  "target_scope": "planning",
+  "text": "请补上数据回放策略",
+  "command": null,
+  "status": "queued",
+  "consumed_by_roles": {},
+  "created_at": "2026-03-22T15:10:00",
+  "updated_at": "2026-03-22T15:10:00"
+}
+```
+
+### 6.2 Intervention 生命周期
+
+- `queued`
+- `acknowledged`
+- `consumed`
+- `cancelled`
+- `rejected`
+
+### 6.3 输入规则
+
+- 普通文本输入会创建 `intervention`
+- slash command 也会通过统一 `/api/input` 进入系统，但属于控制动作
+- `consensus` 状态下禁止普通文本输入，必须使用 `/continue <reason>` 或执行
+- `paused` / `interrupted` / 终态会拒绝新的普通文本输入
+
+## 7. HTTP API
+
+## 7.1 GET
+
+- `GET /api/tools`
+  返回已注册工具及能力矩阵
+
+- `GET /api/workflow_config`
+  返回默认工作流配置；带 `sid` 时返回该会话的工作流配置
+
+- `GET /api/session/state?sid=...`
+  返回单个会话快照
+
+- `GET /api/history?sid=...`
+  返回会话恢复所需的账本投影：
+  - `session`
+  - `roles`
+  - `events`
+  - `artifacts`
+  - `interventions`
+  - `projections`
+  - `lane_cursors`
+  - `stream_cursor`
+  前端刷新时先用它恢复，再以 `stream_cursor` 继续订阅增量 SSE；不再轮询 `session/state` 来补账
+
+- `GET /api/sessions`
+  返回会话索引
+
+- `GET /api/stream?sid=...&since=...`
+  SSE 主链路；`since` 为事件 cursor
+
+- `GET /api/browse`
+- `GET /api/complete`
 - `GET /api/recent_paths`
 - `GET /api/prompts`
-- `GET /api/tools`
-- `GET /api/role_config`
 
-### 3.2 POST 端点
+## 7.2 POST
 
-- `POST /api/start`
-  创建会话并立即入账。
+- `POST /api/workflow_config`
+  更新默认工作流配置
 
-- `POST /api/execute`
-  从 `consensus` / `max_rounds` 进入执行。
+- `POST /api/session/start`
+  创建会话并立刻进入统一账本
 
-- `POST /api/pause`
-  将活动会话切到 `paused`，保留恢复能力。
+- `POST /api/session/pause`
+- `POST /api/session/resume`
+- `POST /api/session/stop`
+- `POST /api/session/exec`
+- `POST /api/session/continue`
+- `POST /api/session/review_fix`
+- `POST /api/session/review_skip`
+- `POST /api/session/review_continue`
+- `POST /api/session/view_mode`
 
-- `POST /api/resume`
-  从 `paused` / `interrupted` 恢复。
+- `POST /api/input`
+  统一输入入口，处理：
+  - terminal 文本
+  - scene 文本
+  - slash command
 
-- `POST /api/stop`
-  将会话切到 `aborted`，不可恢复。
+- `POST /api/terminal/resize`
+  终端视图尺寸同步入口；更新 lane 级 viewport 真相并发布 `lane.viewport_changed`
 
-- `POST /api/review_fix`
-- `POST /api/review_skip`
-- `POST /api/review_continue`
 - `POST /api/prompts`
+  更新 prompt 模板
+
+## 7.3 已废弃接口
+
+以下接口已经废弃，不再是协议的一部分：
+
 - `POST /api/inject`
+- `GET /api/events`
+- `GET /api/state`
+- `POST /api/start`
+- `POST /api/execute`
+- `POST /api/pause`
+- `POST /api/resume`
+- `POST /api/stop`
 - `POST /api/continue`
 - `POST /api/role_config`
 
-### 3.3 已移除的旧接口
+## 8. 关键响应结构
 
-以下接口已不再作为公共协议的一部分：
+### 8.1 `GET /api/session/state`
 
-- `GET /api/archived_sessions`
-- `GET /api/archived_session_history`
+```json
+{
+  "session_id": "sid",
+  "task": "task",
+  "project_path": "/path",
+  "workflow_template": "standard",
+  "view_mode": "scene",
+  "status": "running",
+  "active_stage": "planning",
+  "current_round": 1,
+  "current_review_round": 0,
+  "consensus_round": 0,
+  "max_rounds": 5,
+  "max_review_rounds": 3,
+  "error": null,
+  "interrupt_reason": null,
+  "created_at": "...",
+  "updated_at": "...",
+  "finished_at": null,
+  "resume_available": false
+}
+```
 
-原因：项目改为统一会话账本模型，不再区分“活动会话”和“归档会话”两套数据真相。
+### 8.2 `GET /api/workflow_config`
 
----
+```json
+{
+  "view_mode": "scene",
+  "workflow_template": "standard",
+  "max_rounds": 5,
+  "max_review_rounds": 3,
+  "roles": [
+    {"role_key": "planner", "tool_id": "claude-code", "enabled": true, "sort_order": 0},
+    {"role_key": "reviewer", "tool_id": "codex", "enabled": true, "sort_order": 1},
+    {"role_key": "executor", "tool_id": "claude-code", "enabled": true, "sort_order": 2},
+    {"role_key": "validator", "tool_id": "codex", "enabled": true, "sort_order": 3}
+  ]
+}
+```
 
-## 4. 角色与能力
+## 9. 持久化边界
 
-- Planner / Reviewer 允许是同一工具。
-- 角色配置校验基于能力矩阵，不基于工具名互斥。
-- 至少需要一个具备执行能力的工具组合。
-- 执行者由能力解析自动决定，不强绑某个角色名。
-
----
-
-## 5. 持久化边界
-
-### 5.1 SQLite 中持久化
+SQLite 中持久化：
 
 - `sessions`
-- `session_events`
-- `session_history`
-- `review_history`
+- `workflow_roles`
+- `role_lanes`
+- `role_events`
+- `artifacts`
+- `interventions`
 - `cli_tools`
-- `role_assignments`
 - `prompt_templates`
 - `recent_paths`
 - `_meta`
 
-### 5.2 不持久化的纯内存态
+不会直接持久化对象引用或进程对象：
 
-- 线程锁
 - `stop_flag`
 - `active_proc`
 - `active_pgid`
+- 线程锁
 
-这些字段在重启后不恢复原对象，只根据账本重建可继续会话的逻辑状态。
+后端重启后，运行中的会话会被标记为 `interrupted`，再由账本重建逻辑状态。
 
----
+当前恢复策略：
 
-## 6. 设计约束
+- `history` 直接返回已持久化 `events`
+- 前端先用账本恢复过程和结果
+- 再以 `stream_cursor` 作为 SSE cursor 只追增量事件
 
-- 不再维护 archive-only 模型。
-- 不再维护双状态真相源（例如 `status` + `final_status`）。
-- 不再从日志条目数量推导用户滚动意图。
-- 前端所有恢复和历史查看都建立在统一账本之上，而不是 UI 特判。
+刷新恢复不再依赖从 `0` 开始重放全量 SSE。
